@@ -18,6 +18,14 @@ before acting on them at implementation time, not permanent facts.
 Research goal: pick a default provider/model for LifeOS's user-facing
 conversation, while keeping the architecture provider-agnostic.
 
+> **Superseded for v0.1:** the product decision is **OpenAI GPT-5.6
+> Luna** (budget/fast tier, no deep reasoning by default), not the
+> Sonnet-5 default this research recommended — see `LIFEOS_SPEC.md` §3.
+> This section's comparison table, reasoning, and sources remain valid
+> research evidence and still govern the *provider-agnostic abstraction*
+> requirement; only the chosen default model changed, by product
+> decision rather than by new evidence overturning the analysis below.
+
 ### 1a. Identity & economics
 
 | Provider / Model | Tier | Released (recency) | Context window | Input $/1M | Output $/1M | Free tier |
@@ -123,6 +131,12 @@ Research goal: pick a shortlist of small, local (Ollama-hosted) models for
 structured extraction, classification, PII detection/redaction, semantic
 retrieval support, and context selection — **not** the user-facing chat
 model.
+
+> **Decided for v0.1:** the product decision is **Qwen3 4B** — the top
+> candidate this research already shortlisted, not a change of direction.
+> The benchmark plan below is still the correct way to *validate* it (and
+> is unexecuted — nothing has been downloaded or tested); see
+> `LIFEOS_SPEC.md` §4.
 
 ### Hardware reality (measured — see `PROJECT_STATE.md` for full audit)
 

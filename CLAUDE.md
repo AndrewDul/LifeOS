@@ -47,6 +47,18 @@ definition: `docs/LIFEOS_SPEC.md`.
    Vehicles, Home, NeXa integration) must be addable later without
    rewriting the core. Prefer domain capabilities, command/action
    abstractions, and stable service boundaries over a giant monolith.
+7. **Bilingual by design, one system.** LifeOS supports Polish, English,
+   and mixed PL/EN input as a single system that detects and responds in
+   the user's language — never two parallel language modes. Do not
+   unnecessarily translate the user's private memory database; preserve
+   original wording where it matters, keep structured meaning
+   language-independent.
+8. **Cloud LLM never owns state.** The cloud conversational model has no
+   direct database access and cannot directly change goals, money,
+   calendar, memory, or any other LifeOS state. LifeOS Core (local) owns
+   state and actions; the cloud model only requests actions through the
+   guarded action layer and only receives minimum-necessary context
+   through the Privacy Firewall.
 
 ## Documentation policy
 
