@@ -1,0 +1,140 @@
+# =================================================================
+# LifeOS .gitignore — protects secrets, credentials, and private/
+# personal data from ever being committed.
+# =================================================================
+
+# --- Environment / secrets / credentials ---
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.pfx
+*.p12
+*credentials*
+*secret*
+*secrets*
+*token*
+*apikey*
+*api_key*
+*.credentials.json
+service-account*.json
+id_rsa
+id_ed25519
+*.gpg
+*.asc
+
+# --- Databases / local data stores ---
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*-wal
+*-shm
+*.wal
+*.shm
+*.duckdb
+*.duckdb.wal
+
+# --- Encrypted / private user data ---
+*.enc
+*encrypted*
+/data/
+/local-data/
+/user-data/
+
+# --- Local user memory / journals / wellbeing / personal context ---
+/memory/
+*.memory.json
+/journal/
+/journals/
+*journal*.md
+/wellbeing/
+/private-context/
+/ai-context/
+*private-context*
+
+# --- Financial data ---
+/finance/
+/financial/
+*financial*.csv
+*financial*.json
+*ledger*
+*transactions*.csv
+
+# --- Personal exports / backups ---
+*.export
+*.export.json
+/exports/
+/backups/
+*.bak
+*.backup
+*backup*.zip
+*backup*.tar*
+
+# --- Private logs / crash dumps ---
+*.log
+/logs/
+*.dump
+*.dmp
+crash-*.log
+crash-*.txt
+
+# --- Temporary files ---
+*.tmp
+*.temp
+/tmp/
+/temp/
+*~
+.~*
+
+# --- Local model caches (avoid bloating repo with large binaries) ---
+/models/
+/.cache/
+*.gguf
+*.safetensors
+*.onnx
+*.bin.cache
+
+# --- Build artifacts ---
+/dist/
+/build/
+/out/
+*.pyc
+__pycache__/
+/target/
+/.next/
+/.nuxt/
+*.egg-info/
+
+# --- Dependency directories ---
+/node_modules/
+/.venv/
+/venv/
+/env/
+
+# --- OS-specific junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# --- IDE-local files ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# --- Generated secrets / local configuration overrides ---
+*.local.json
+*.local.yaml
+*.local.yml
+config.local.*
+settings.local.json
