@@ -25,9 +25,20 @@ id_ed25519
 *.gpg
 *.asc
 
-# --- Databases / local data stores ---
+# --- Encrypted / private user data ---
+*.enc
+*encrypted*
+data/
+local-data/
+user-data/
+
+# --- Databases (canonical local store) + encryption keys ---
+# Matches at any depth so a future src-tauri/ or apps/desktop/ nested
+# data directory is still protected.
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 *.db
 *.db-wal
 *.db-shm
@@ -38,28 +49,25 @@ id_ed25519
 *.shm
 *.duckdb
 *.duckdb.wal
-
-# --- Encrypted / private user data ---
-*.enc
-*encrypted*
-/data/
-/local-data/
-/user-data/
+*.stronghold
+keys/
+*.dek
+*.kek
 
 # --- Local user memory / journals / wellbeing / personal context ---
-/memory/
+memory/
 *.memory.json
-/journal/
-/journals/
+journal/
+journals/
 *journal*.md
-/wellbeing/
-/private-context/
-/ai-context/
+wellbeing/
+private-context/
+ai-context/
 *private-context*
 
 # --- Financial data ---
-/finance/
-/financial/
+finance/
+financial/
 *financial*.csv
 *financial*.json
 *ledger*
@@ -68,8 +76,8 @@ id_ed25519
 # --- Personal exports / backups ---
 *.export
 *.export.json
-/exports/
-/backups/
+exports/
+backups/
 *.bak
 *.backup
 *backup*.zip
@@ -77,44 +85,54 @@ id_ed25519
 
 # --- Private logs / crash dumps ---
 *.log
-/logs/
+logs/
 *.dump
 *.dmp
+*.pdb
 crash-*.log
 crash-*.txt
 
 # --- Temporary files ---
 *.tmp
 *.temp
-/tmp/
-/temp/
+tmp/
+temp/
 *~
 .~*
 
 # --- Local model caches (avoid bloating repo with large binaries) ---
-/models/
-/.cache/
+models/
+.cache/
 *.gguf
 *.safetensors
 *.onnx
 *.bin.cache
+.ollama/
 
 # --- Build artifacts ---
-/dist/
-/build/
-/out/
+dist/
+build/
+out/
+coverage/
 *.pyc
 __pycache__/
-/target/
-/.next/
-/.nuxt/
+target/
+.next/
+.nuxt/
 *.egg-info/
+# Tauri build/bundle outputs (installers, signed binaries) — regenerated,
+# never hand-authored, and can carry signing artifacts.
+src-tauri/target/
+src-tauri/gen/
+*.msi
+*.dmg
+*.AppImage
 
 # --- Dependency directories ---
-/node_modules/
-/.venv/
-/venv/
-/env/
+node_modules/
+.venv/
+venv/
+env/
 
 # --- OS-specific junk ---
 .DS_Store
