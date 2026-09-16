@@ -145,6 +145,7 @@ $RECYCLE.BIN/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+.claude/
 *.suo
 *.user
 *.userosscache
