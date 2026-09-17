@@ -9,7 +9,7 @@
 
 use super::parse_rfc3339;
 use crate::actions::{Actor, ConfirmationClass, Provenance};
-use crate::domain::{Goal, GoalId, GoalStatus};
+use crate::domain::{Goal, GoalId, LifecycleStatus};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ fn row_to_goal(row: &Row) -> rusqlite::Result<Goal> {
         })?,
         title: row.get("title")?,
         description: row.get("description")?,
-        status: GoalStatus::parse(&status_str).ok_or_else(|| {
+        status: LifecycleStatus::parse(&status_str).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,

@@ -12,7 +12,7 @@
 use super::*;
 use chrono::Utc;
 
-fn base_goal(status: GoalStatus) -> Goal {
+fn base_goal(status: LifecycleStatus) -> Goal {
     Goal {
         id: GoalId::new(),
         title: "Base goal".to_string(),
@@ -133,7 +133,7 @@ fn effective_class_important_change_with_explicit_provenance_stays_important_cha
 
 #[test]
 fn update_goal_rejects_when_no_fields_touched() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
         ..Default::default()
@@ -145,7 +145,7 @@ fn update_goal_rejects_when_no_fields_touched() {
 
 #[test]
 fn update_goal_field_patch_unchanged_alone_is_not_a_touch() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
         description: FieldPatch::Unchanged,
@@ -161,7 +161,7 @@ fn update_goal_field_patch_unchanged_alone_is_not_a_touch() {
 
 #[test]
 fn update_goal_field_patch_clear_does_not_trigger_length_validation() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
         description: FieldPatch::Clear,
@@ -176,7 +176,7 @@ fn update_goal_field_patch_clear_does_not_trigger_length_validation() {
 
 #[test]
 fn update_goal_field_patch_set_triggers_length_validation() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
         description: FieldPatch::Set("x".repeat(DESCRIPTION_MAX_LEN + 1)),
@@ -194,7 +194,7 @@ fn update_goal_field_patch_set_triggers_length_validation() {
 
 #[test]
 fn update_goal_field_patch_set_priority_out_of_bounds_is_rejected() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
         priority_user: FieldPatch::Set(PRIORITY_MIN - 1),
@@ -214,15 +214,15 @@ fn update_goal_field_patch_set_priority_out_of_bounds_is_rejected() {
 //
 // The Goal vertical slice invented a rule - COMPLETED/ABANDONED cannot
 // transition further - that was never part of the frozen Goal status
-// definition. It is removed: every GoalStatus -> GoalStatus transition
+// definition. It is removed: every LifecycleStatus -> LifecycleStatus transition
 // an explicit action requests now passes validation.
 
 #[test]
 fn update_goal_status_transition_from_completed_to_active_is_now_valid() {
-    let existing = base_goal(GoalStatus::Completed);
+    let existing = base_goal(LifecycleStatus::Completed);
     let payload = UpdateGoalPayload {
         id: existing.id,
-        status: Some(GoalStatus::Active),
+        status: Some(LifecycleStatus::Active),
         ..Default::default()
     };
     assert!(
@@ -233,10 +233,10 @@ fn update_goal_status_transition_from_completed_to_active_is_now_valid() {
 
 #[test]
 fn update_goal_status_transition_from_abandoned_to_paused_is_valid() {
-    let existing = base_goal(GoalStatus::Abandoned);
+    let existing = base_goal(LifecycleStatus::Abandoned);
     let payload = UpdateGoalPayload {
         id: existing.id,
-        status: Some(GoalStatus::Paused),
+        status: Some(LifecycleStatus::Paused),
         ..Default::default()
     };
     assert!(validate_update_goal(&existing, &payload).is_ok());
@@ -244,10 +244,10 @@ fn update_goal_status_transition_from_abandoned_to_paused_is_valid() {
 
 #[test]
 fn update_goal_status_no_op_transition_is_valid() {
-    let existing = base_goal(GoalStatus::Active);
+    let existing = base_goal(LifecycleStatus::Active);
     let payload = UpdateGoalPayload {
         id: existing.id,
-        status: Some(GoalStatus::Active),
+        status: Some(LifecycleStatus::Active),
         ..Default::default()
     };
     assert!(validate_update_goal(&existing, &payload).is_ok());

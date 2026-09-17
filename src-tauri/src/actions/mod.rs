@@ -18,7 +18,7 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, GoalStatus, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN,
+    Goal, GoalId, LifecycleStatus, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN,
     DOMAIN_TAG_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
@@ -218,7 +218,7 @@ pub(crate) struct UpdateGoalPayload {
     pub id: GoalId,
     pub title: Option<String>,
     pub description: FieldPatch<String>,
-    pub status: Option<GoalStatus>,
+    pub status: Option<LifecycleStatus>,
     pub target_date: FieldPatch<DateTime<Utc>>,
     pub priority_user: FieldPatch<Priority>,
     pub domain_tag: FieldPatch<String>,
@@ -320,7 +320,7 @@ pub(crate) fn validate_create_goal(
 /// Validates an update against the *existing* goal - `existing` is
 /// taken so a future field could validate against prior state if ever
 /// needed; no status-transition restriction is applied (M2 Goal
-/// hardening, 2026-09-17 - see `domain::GoalStatus`'s doc comment: that
+/// hardening, 2026-09-17 - see `domain::LifecycleStatus`'s doc comment: that
 /// rule was an unapproved invention of the original vertical slice and
 /// has been removed). Returns nothing on success - the caller applies
 /// `payload`'s `Some`/`FieldPatch::Set`/`FieldPatch::Clear` onto
@@ -368,7 +368,7 @@ pub(crate) fn validate_update_goal(
             errors.push(e);
         }
     }
-    // No status-transition check: every GoalStatus -> GoalStatus change
+    // No status-transition check: every LifecycleStatus -> LifecycleStatus change
     // an explicit action requests is allowed and audited, per the
     // hardening correction above.
 

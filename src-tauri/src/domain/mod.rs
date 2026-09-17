@@ -1,5 +1,7 @@
 //! LifeOS domain types (M2 Goal vertical slice, 2026-09-17; Project
-//! vertical slice added 2026-09-17).
+//! vertical slice added 2026-09-17; Project/storage integrity hardening
+//! 2026-09-17 - see that report for the `LifecycleStatus` rename and
+//! the canonical `Project.progress` resolution below).
 //!
 //! Pure data, no I/O, no SQL - matches `LIFEOS_SPEC.md` §5.6's module
 //! boundaries. Only `Goal` and `Project` are implemented so far
@@ -40,44 +42,63 @@ impl std::fmt::Display for GoalId {
     }
 }
 
-/// `LIFEOS_SPEC.md` §5.1 / §C of the architecture-freeze report.
+/// `LIFEOS_SPEC.md` §5.1 / §C of the architecture-freeze report. Shared
+/// by both `Goal.status` and `Project.status` - the freeze defines
+/// Project's status as "the same 4 values as Goal," so this one type
+/// backs both rather than a duplicate `ProjectStatus` enum existing
+/// alongside an original `GoalStatus`.
+///
+/// **Renamed from `GoalStatus` (2026-09-17, M2 Project/storage
+/// integrity hardening).** The Project vertical slice already reused
+/// this type for `Project.status`, which left a Goal-specific name
+/// backing two different entities - purely a Rust identifier rename,
+/// behavior-preserving: the variants, their `as_str()`/`parse()`
+/// mappings, and therefore every `TEXT` value ever written to a
+/// `status` column (`'ACTIVE'`/`'PAUSED'`/`'COMPLETED'`/`'ABANDONED'`)
+/// are all unchanged. No migration was needed or written for this -
+/// nothing in the database's own schema or data references a Rust type
+/// name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum GoalStatus {
+pub(crate) enum LifecycleStatus {
     Active,
     Paused,
     Completed,
     Abandoned,
 }
 
-impl GoalStatus {
+impl LifecycleStatus {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            GoalStatus::Active => "ACTIVE",
-            GoalStatus::Paused => "PAUSED",
-            GoalStatus::Completed => "COMPLETED",
-            GoalStatus::Abandoned => "ABANDONED",
+            LifecycleStatus::Active => "ACTIVE",
+            LifecycleStatus::Paused => "PAUSED",
+            LifecycleStatus::Completed => "COMPLETED",
+            LifecycleStatus::Abandoned => "ABANDONED",
         }
     }
 
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
-            "ACTIVE" => Some(GoalStatus::Active),
-            "PAUSED" => Some(GoalStatus::Paused),
-            "COMPLETED" => Some(GoalStatus::Completed),
-            "ABANDONED" => Some(GoalStatus::Abandoned),
+            "ACTIVE" => Some(LifecycleStatus::Active),
+            "PAUSED" => Some(LifecycleStatus::Paused),
+            "COMPLETED" => Some(LifecycleStatus::Completed),
+            "ABANDONED" => Some(LifecycleStatus::Abandoned),
             _ => None,
         }
     }
 }
 
 // No `can_transition_to`/terminal-state rule here (removed 2026-09-17, M2
-// Goal hardening). The Goal vertical slice invented a rule - COMPLETED
-// and ABANDONED cannot transition out - that was never part of the
-// frozen Goal status definition; a real user may reasonably reopen a
-// completed or abandoned goal. All four statuses are peer states: every
-// explicit user-requested transition between them is allowed and always
+// Goal hardening, before this type was shared with Project). The Goal
+// vertical slice invented a rule - COMPLETED and ABANDONED cannot
+// transition out - that was never part of the frozen Goal status
+// definition; a real user may reasonably reopen a completed or
+// abandoned goal or project. All four statuses are peer states for
+// both entities that use this type: every explicit user-requested
+// transition between them is allowed and, for Goal, always
 // audit-logged (`actions::validate_update_goal` no longer restricts
-// this). Do not reintroduce a terminal-state policy here unless
+// this - Project currently has no analogous status-changing action to
+// restrict, §6 of the M2 Project/storage integrity hardening report).
+// Do not reintroduce a terminal-state policy here unless
 // `LIFEOS_SPEC.md` explicitly freezes one first.
 
 /// Progress is a deterministic bounded integer percentage, 0..=100.
@@ -104,7 +125,7 @@ pub(crate) struct Goal {
     pub id: GoalId,
     pub title: String,
     pub description: Option<String>,
-    pub status: GoalStatus,
+    pub status: LifecycleStatus,
     pub target_date: Option<DateTime<Utc>>,
     pub priority_user: Option<Priority>,
     pub priority_system: Option<Priority>,
@@ -145,7 +166,7 @@ impl std::fmt::Display for ProjectId {
 /// `Project` (M2 Project vertical slice, 2026-09-17). Field set is
 /// exactly the frozen architecture-freeze definition (M2 report §C):
 /// `id`, `title`, `description`, `status` (same 4 values as `Goal` -
-/// reuses `GoalStatus` directly rather than defining a duplicate
+/// reuses `LifecycleStatus` directly rather than defining a duplicate
 /// `ProjectStatus` enum, since the freeze explicitly says "same 4
 /// values as Goal"), `priority` (reuses the shared `Priority`
 /// type/scale, singular - unlike Goal there is no user/system split),
@@ -153,24 +174,32 @@ impl std::fmt::Display for ProjectId {
 /// production M2; NOT the future `GoalRelation` graph, which remains
 /// unimplemented), `created_at`, `updated_at`.
 ///
-/// `progress: Progress` is this struct's one field beyond that frozen
-/// one-line table - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
-/// §3 for the reasoning: the frozen `UpdateProgress` action needs
-/// something concrete to mutate, Goal's own precedent stores progress
-/// directly on the entity, and the separate frozen `ProgressUpdate`
-/// entity (polymorphic GOAL/PROJECT/TASK log) is a different, not-yet-
-/// implemented, time-series concept out of scope for this slice - this
-/// is flagged as an explicit interpretation, not a silently invented
-/// field.
+/// `progress: Progress` is this struct's one field beyond the
+/// architecture-freeze report's terse one-line table - **canonically
+/// resolved (2026-09-17, M2 Project/storage integrity hardening,
+/// `LIFEOS_SPEC.md` §5.1)**, no longer an open interpretation: this is
+/// the CURRENT normalized progress snapshot for the Project (0..=100,
+/// same shared `Progress` type/semantics as `Goal.progress`), mutated
+/// in place by `UpdateProgress`. It is conceptually distinct from the
+/// separate, still-unimplemented, polymorphic `ProgressUpdate` entity
+/// (GOAL/PROJECT/TASK) in the freeze, which is a temporal *history* of
+/// progress observations/changes over time - `ProgressUpdate` does not
+/// replace this field and does not remove the need for a current
+/// snapshot living directly on `Project`, the same way `Goal.progress`
+/// already does. `ProgressUpdate` itself remains out of scope; only
+/// this field's own status changed from "open question" to "frozen."
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Project {
     pub id: ProjectId,
     pub title: String,
     pub description: Option<String>,
-    pub status: GoalStatus,
+    pub status: LifecycleStatus,
     pub priority: Option<Priority>,
     pub goal_id: Option<GoalId>,
     pub progress: Progress,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests;

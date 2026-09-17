@@ -10,7 +10,7 @@ use crate::actions::{
     ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
-use crate::domain::GoalStatus;
+use crate::domain::LifecycleStatus;
 use std::fs;
 use std::io::Read;
 
@@ -212,7 +212,7 @@ fn req5_6_create_goal_succeeds_and_persists_across_reopen() {
                     value.title, "Get first paying client",
                     "[req5] FAIL - title was not trimmed"
                 );
-                assert_eq!(value.status, GoalStatus::Active);
+                assert_eq!(value.status, LifecycleStatus::Active);
                 assert_eq!(value.progress, 0);
                 assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
                 goal_id = value.id;
@@ -322,7 +322,7 @@ fn req9_valid_update_goal_succeeds() {
     let update = UpdateGoalPayload {
         id: created.id,
         progress: Some(40),
-        status: Some(GoalStatus::Active),
+        status: Some(LifecycleStatus::Active),
         ..Default::default()
     };
     match update_goal(&mut conn, ui_explicit(), update) {
@@ -432,7 +432,7 @@ fn req12_get_active_goals_filters_correctly() {
         ui_explicit(),
         UpdateGoalPayload {
             id: b.id,
-            status: Some(GoalStatus::Paused),
+            status: Some(LifecycleStatus::Paused),
             ..Default::default()
         },
     ) {
@@ -656,21 +656,21 @@ fn req_h3_completed_goal_can_be_reopened_and_transition_is_audited() {
         ui_explicit(),
         UpdateGoalPayload {
             id: created.id,
-            status: Some(GoalStatus::Completed),
+            status: Some(LifecycleStatus::Completed),
             ..Default::default()
         },
     ) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
-    assert_eq!(completed.status, GoalStatus::Completed);
+    assert_eq!(completed.status, LifecycleStatus::Completed);
 
     let reopened = match update_goal(
         &mut conn,
         ui_explicit(),
         UpdateGoalPayload {
             id: created.id,
-            status: Some(GoalStatus::Active),
+            status: Some(LifecycleStatus::Active),
             ..Default::default()
         },
     ) {
@@ -679,7 +679,7 @@ fn req_h3_completed_goal_can_be_reopened_and_transition_is_audited() {
             "[hardening h3] FAIL - reopening a COMPLETED goal should now be allowed, got {other:?}"
         ),
     };
-    assert_eq!(reopened.status, GoalStatus::Active);
+    assert_eq!(reopened.status, LifecycleStatus::Active);
 
     let audit_count: i64 = conn
         .query_row(
@@ -967,7 +967,7 @@ fn req_p3_project_without_goal_id_can_be_created() {
     ) {
         ActionOutcome::Success { value, .. } => {
             assert_eq!(value.goal_id, None);
-            assert_eq!(value.status, GoalStatus::Active);
+            assert_eq!(value.status, LifecycleStatus::Active);
             assert_eq!(value.progress, 0);
             println!("[req_p3] PASS - Project created with no goal_id: {value:?}");
         }
@@ -1393,4 +1393,130 @@ fn req_p16_inferred_create_project_requires_confirmation_and_does_not_write() {
             panic!("[req_p16] FAIL - expected Success on confirmed resubmission, got {other:?}")
         }
     }
+}
+
+// =========================================================================
+// M2 Project/storage integrity hardening (2026-09-17) - new evidence
+// below. Evidence for
+// `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
+// =========================================================================
+
+fn foreign_keys_pragma_value(conn: &Connection) -> i64 {
+    conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Requirement 1: `PRAGMA foreign_keys` reads back `1` on a fresh
+/// production connection - not merely "the `PRAGMA` statement was sent
+/// and returned no error," which `enable_foreign_keys` itself already
+/// guards against silently failing (`storage/mod.rs`), but re-proven
+/// here as an integration-level assertion against the real bootstrap
+/// path.
+#[test]
+fn req_i1_foreign_keys_enabled_on_fresh_production_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "integrity1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    assert_eq!(
+        foreign_keys_pragma_value(&conn),
+        1,
+        "[req_i1] FAIL - foreign_keys not enabled on a fresh production connection"
+    );
+    println!("[req_i1] PASS - PRAGMA foreign_keys = 1 on a fresh production connection");
+}
+
+/// Requirement 2: `foreign_keys` is a per-connection SQLite setting,
+/// not persisted in the database file - a full close + reopen must set
+/// it again, and does, since every real connection goes through the
+/// same `open_encrypted` primitive.
+#[test]
+fn req_i2_foreign_keys_enabled_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "integrity2.db");
+    {
+        let _conn = bootstrap_db_at(&path, &key).unwrap();
+    }
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    assert_eq!(
+        foreign_keys_pragma_value(&conn),
+        1,
+        "[req_i2] FAIL - foreign_keys not enabled after a full connection close/reopen"
+    );
+    println!("[req_i2] PASS - PRAGMA foreign_keys = 1 after a full connection close/reopen");
+}
+
+/// Requirement 3 (and Project/storage hardening report §3.B):
+/// intentionally bypasses `CreateProject`'s application-level
+/// `ReferencedGoalNotFound` pre-check entirely - a direct, raw SQL
+/// `INSERT` naming a `goal_id` that does not exist - to prove the
+/// database itself, not just Core's validation layer, rejects invalid
+/// state now that `PRAGMA foreign_keys = ON` is enforced. This raw SQL
+/// stays local to this test (never exposed as a repository/production
+/// function) - the point is to bypass the normal path, not to add a
+/// new one.
+#[test]
+fn req_i3_invalid_direct_project_goal_id_rejected_by_sqlite_fk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "integrity3.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new().to_string();
+    let project_id = crate::domain::ProjectId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO projects (id, title, description, status, priority, goal_id, progress, created_at, updated_at)
+         VALUES (?1, 'Bypasses CreateProject validation', NULL, 'ACTIVE', NULL, ?2, 0, '2026-09-17T00:00:00Z', '2026-09-17T00:00:00Z')",
+        rusqlite::params![project_id, fake_goal_id],
+    );
+
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "[req_i3] FAIL - expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_i3] PASS - direct raw SQL insert with a nonexistent goal_id was rejected by SQLite's own FK enforcement: {err:?}"
+            );
+        }
+        other => panic!("[req_i3] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+
+    assert_eq!(
+        project_row_count(&conn),
+        0,
+        "[req_i3] FAIL - a project row was inserted despite the FK violation"
+    );
+}
+
+/// Requirement 4: the same direct, raw-SQL insert path succeeds when
+/// `goal_id` references a real, existing `Goal` - proving the FK
+/// constraint distinguishes valid from invalid references rather than
+/// just rejecting everything.
+#[test]
+fn req_i4_valid_direct_project_goal_id_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "integrity4.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Real goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let project_id = crate::domain::ProjectId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO projects (id, title, description, status, priority, goal_id, progress, created_at, updated_at)
+         VALUES (?1, 'Direct insert, valid goal', NULL, 'ACTIVE', NULL, ?2, 0, '2026-09-17T00:00:00Z', '2026-09-17T00:00:00Z')",
+        rusqlite::params![project_id, goal.id.to_string()],
+    );
+
+    assert!(
+        result.is_ok(),
+        "[req_i4] FAIL - direct insert with a valid, existing goal_id was rejected: {result:?}"
+    );
+    assert_eq!(project_row_count(&conn), 1);
+    println!("[req_i4] PASS - direct raw SQL insert with a valid, existing goal_id succeeded");
 }

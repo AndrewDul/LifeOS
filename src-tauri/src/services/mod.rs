@@ -23,7 +23,7 @@ use crate::actions::{
     ValidationError,
 };
 use crate::core_error::CoreError;
-use crate::domain::{Goal, GoalId, GoalStatus, Project, ProjectId};
+use crate::domain::{Goal, GoalId, LifecycleStatus, Project, ProjectId};
 use crate::security;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -167,7 +167,7 @@ pub(crate) fn create_goal(
         id: GoalId::new(),
         title: normalized_title,
         description: payload.description,
-        status: GoalStatus::Active,
+        status: LifecycleStatus::Active,
         target_date: payload.target_date,
         priority_user: payload.priority_user,
         priority_system: None,
@@ -336,11 +336,14 @@ pub(crate) fn get_goal(conn: &Connection, id: GoalId) -> Result<Option<Goal>, ru
 /// table, which explicitly lists `CreateProject` under `EXPLICIT_ADD`.
 /// If `payload.goal_id` is supplied, it must reference an existing
 /// `Goal` - checked here (a database read) BEFORE persistence, reported
-/// through the same `ValidationFailed` channel as structural checks, not
-/// left to the SQL foreign-key constraint to catch (that constraint is
-/// declared in the V2 migration for documentation/defense-in-depth, but
-/// is not relied on as the primary mechanism - see the migration's own
-/// comment).
+/// through the same friendly, typed `ValidationFailed` channel as
+/// structural checks, rather than surfacing a raw SQL foreign-key
+/// failure to the caller. The FK constraint itself **is** genuinely
+/// enforced at the database level too as of the M2 Project/storage
+/// integrity hardening pass (2026-09-17) - `PRAGMA foreign_keys = ON`
+/// is set on every connection (`storage::open_encrypted`) - so this
+/// check is deliberately the first, friendlier line of defense, not the
+/// only one.
 pub(crate) fn create_project(
     conn: &mut Connection,
     meta: ActionMeta,
@@ -375,7 +378,7 @@ pub(crate) fn create_project(
         id: ProjectId::new(),
         title: normalized_title,
         description: payload.description,
-        status: GoalStatus::Active,
+        status: LifecycleStatus::Active,
         priority: payload.priority,
         goal_id: payload.goal_id,
         progress: 0,

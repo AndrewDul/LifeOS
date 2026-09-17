@@ -386,6 +386,46 @@ only, not `AddMilestone`/`AddTask`); every other entity in this list,
 `GoalRelation` included, is schema-frozen only — see §5.2's correction
 and `PROJECT_STATE.md` §9 for which one is next.
 
+**`Project.progress` — canonically resolved (2026-09-17, M2 Project/
+storage integrity hardening report).** The Project vertical slice had
+added a `progress` field to `Project` as a flagged, open interpretation
+- the architecture-freeze report's one-line Project field table did not
+list it explicitly, unlike Goal's own row. This is now frozen, not an
+open question:
+
+- `Project.progress` = the **current** normalized Project progress
+  snapshot, an integer `0..=100`, the same shared `Progress` type/scale
+  `Goal.progress` already uses. It is mutated in place by
+  `UpdateProgress`, exactly as implemented.
+- The separate, still-unimplemented `ProgressUpdate` entity (§5.1's
+  table, above: `subject_type`/`subject_id`/`value`/`note`/
+  `recorded_at`) is a **temporal history** of progress observations/
+  changes over time — e.g. `2026-09-10 → 40%`, `2026-09-15 → 55%`,
+  `2026-09-17 → 65%` — not a replacement for the current-state field
+  above, and does not remove the need for `Project.progress` to exist.
+  Both can coexist the same way a "current value" column and a
+  "changelog" table coexist in any ordinary schema.
+- `ProgressUpdate` itself remains unimplemented — this resolves only
+  what `Project.progress` means, not when/whether `ProgressUpdate` gets
+  built.
+
+**OPEN M2 ACTION-SET GAP (2026-09-17, M2 Project/storage integrity
+hardening report §10) — explicitly NOT resolved this run.** `Project`
+stores `title`/`description`/`status`/`priority`/`goal_id` in addition
+to `progress`, but the frozen Project action set (§5.4, below) is only
+`CreateProject`/`AddMilestone`/`AddTask`/`UpdateProgress` — there is
+**no frozen action for editing** `title`/`description`/`status`/
+`priority`/`goal_id` after creation. Before M3/UI wiring needs to let a
+user actually edit a project, this requires a deliberate architecture
+decision — most plausibly either one `UpdateProject` action (mirroring
+`UpdateGoal`'s shape) or several narrower ones (e.g. `RenameProject`,
+`ChangeProjectPriority`, `RelinkProjectGoal`) — and that decision must
+be made consciously in this section, the same way the Project action
+set itself was, not invented inside a future implementation slice the
+way the Goal vertical slice's terminal-status rule was (and had to be
+removed). No code changes accompany this entry; it exists so the gap is
+visible before it becomes a silent implementation choice.
+
 Deliberately **not** modeled yet (future milestones, not a frozen
 schema): `UserProfile`/settings, `Transaction`/`IncomeSource`/`Budget`
 (Money, M8), `JournalEntry` (folds into the Personal Knowledge Layer,
@@ -1057,3 +1097,9 @@ These are genuinely unresolved and should not be treated as decided:
 - Exact bilingual detection/normalisation mechanism (which layer decides
   the response language, how mixed-language utterances are handled) —
   design target stated in §1.3, mechanism not yet designed.
+- **OPEN M2 ACTION-SET GAP (2026-09-17):** no frozen action exists to
+  edit a `Project`'s `title`/`description`/`status`/`priority`/`goal_id`
+  after creation (the frozen set is only `CreateProject`/
+  `AddMilestone`/`AddTask`/`UpdateProgress`) — full detail and the
+  decision this needs (one `UpdateProject` vs. several narrower
+  actions) in §5.1.

@@ -12,7 +12,7 @@
 
 use super::{actor_str, confirmation_class_str, parse_rfc3339, provenance_str};
 use crate::actions::{Actor, ConfirmationClass, Provenance};
-use crate::domain::{GoalId, GoalStatus, Progress, Project, ProjectId};
+use crate::domain::{GoalId, LifecycleStatus, Progress, Project, ProjectId};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ fn row_to_project(row: &Row) -> rusqlite::Result<Project> {
         })?,
         title: row.get("title")?,
         description: row.get("description")?,
-        status: GoalStatus::parse(&status_str).ok_or_else(|| {
+        status: LifecycleStatus::parse(&status_str).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
@@ -115,9 +115,18 @@ pub(in crate::services) fn get_project(
 /// Used by `services::create_project` to validate a supplied `goal_id`
 /// references a real `Goal` *before* persistence - deliberately a plain
 /// existence check, not relying solely on the `projects.goal_id`
-/// foreign-key constraint (which is not even enforced at runtime unless
-/// `PRAGMA foreign_keys = ON` is set - unchanged, not set, this run; see
-/// the Project vertical-slice report §5).
+/// foreign-key constraint for this. **Both layers are real now**
+/// (M2 Project/storage integrity hardening, 2026-09-17): the FK
+/// constraint itself is genuinely enforced at runtime as of this
+/// hardening pass (`storage::enable_foreign_keys`, set on every
+/// connection `open_encrypted` produces), proven by
+/// `services::tests::req_i3_invalid_direct_project_goal_id_rejected_by_sqlite_fk`.
+/// This function stays, deliberately, as the *first* line of defense -
+/// it produces a friendly, typed `ValidationError::ReferencedGoalNotFound`
+/// through the normal action-outcome channel, rather than surfacing a
+/// raw SQL constraint failure to a caller that only ever goes through
+/// `create_project` normally. See the Project/storage hardening report
+/// §5 for the full reasoning on keeping both.
 pub(in crate::services) fn goal_exists(conn: &Connection, id: GoalId) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT count(*) FROM goals WHERE id = ?1",

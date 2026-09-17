@@ -82,11 +82,44 @@ pub(super) fn confirmation_class_str(class: ConfirmationClass) -> &'static str {
 /// Opens (creating if absent) an encrypted database at `path` using a
 /// raw 256-bit hex key (`PRAGMA key = "x'<64 hex chars>'"` - the raw-key
 /// form, avoiding SQLCipher's PBKDF2 derivation since our key is already
-/// a random 256-bit master key, not a human password).
+/// a random 256-bit master key, not a human password). Also enables
+/// SQLite foreign-key constraint enforcement (`enable_foreign_keys`,
+/// below) - this is the single connection-opening primitive every real
+/// production connection, version-targeted migration test connection
+/// (`services::bootstrap_db_at_version`), and the storage spike's test
+/// connections all go through, so none of them can silently diverge
+/// from production FK behavior (M2 Project/storage integrity
+/// hardening, 2026-09-17 - previously `projects.goal_id REFERENCES
+/// goals(id)` was declared in the V2 migration but never actually
+/// enforced at runtime, since this pragma was never set anywhere).
 pub(super) fn open_encrypted(path: &Path, key_hex: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "key", format!("x'{key_hex}'"))?;
+    enable_foreign_keys(&conn)?;
     Ok(conn)
+}
+
+/// `PRAGMA foreign_keys = ON` is a per-connection setting SQLite does
+/// not persist in the database file itself - every new connection must
+/// set it again, and unlike most pragmas a silently-ignored
+/// `foreign_keys` change is a real, documented SQLite footgun (e.g. it
+/// is a no-op while a transaction is active). This reads the pragma
+/// back immediately and returns a typed error rather than assuming the
+/// `PRAGMA` succeeded - "do not silently ignore failure" (M2
+/// Project/storage integrity hardening brief). Proven for real, not
+/// just asserted - see
+/// `services::tests::req_i1_foreign_keys_enabled_on_fresh_production_connection`
+/// and `..req_i2_foreign_keys_enabled_after_reopen`.
+fn enable_foreign_keys(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if enabled != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some("PRAGMA foreign_keys = ON did not take effect on this connection".to_string()),
+        ));
+    }
+    Ok(())
 }
 
 /// SQLCipher only verifies the key lazily on first real read of the
