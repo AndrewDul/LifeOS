@@ -874,13 +874,20 @@ pub(crate) fn get_milestones_for_project(
 /// architecture-freeze report §F's confirmation table / the M2 Project
 /// Child Action Freeze report. Validation order is pure-first
 /// (`validate_add_task` - title only) before any database read; then
-/// `project_id` existence (if supplied), then `goal_id` existence (if
-/// supplied) - each independently, a real database read, neither ever
-/// skipped because the other was checked (Task vertical-slice report
-/// §10 - a Task's Project and Goal need not have any relationship to
-/// each other). `status` is never taken from the payload - a new Task
-/// always starts `TODO`; `recurring_rule_id` is never taken from the
-/// payload either - it always starts `None` (report §2C).
+/// `project_id` existence (if supplied) AND `goal_id` existence (if
+/// supplied) are both checked - each independently, a real database
+/// read, neither ever skipped because the other was checked or failed
+/// (Task vertical-slice report §10 - a Task's Project and Goal need not
+/// have any relationship to each other). If both are supplied and both
+/// are invalid, both `ValidationError`s are returned together, in
+/// stable `ReferencedProjectNotFound`-then-`ReferencedGoalNotFound`
+/// order (M2 Task parent-validation hardening pass, 2026-09-17 -
+/// corrects an earlier short-circuit that returned only the first
+/// missing reference). A real storage error from either lookup still
+/// aborts immediately as a `StorageError`, never silently downgraded to
+/// a validation failure. `status` is never taken from the payload - a
+/// new Task always starts `TODO`; `recurring_rule_id` is never taken
+/// from the payload either - it always starts `None` (report §2C).
 pub(crate) fn add_task(
     conn: &mut Connection,
     meta: ActionMeta,
@@ -891,27 +898,23 @@ pub(crate) fn add_task(
         Err(errors) => return ActionOutcome::ValidationFailed(errors),
     };
 
+    let mut reference_errors: Vec<ValidationError> = Vec::new();
     if let Some(project_id) = payload.project_id {
         match storage::project_repo::project_exists(conn, project_id) {
             Ok(true) => {}
-            Ok(false) => {
-                return ActionOutcome::ValidationFailed(vec![
-                    ValidationError::ReferencedProjectNotFound,
-                ]);
-            }
+            Ok(false) => reference_errors.push(ValidationError::ReferencedProjectNotFound),
             Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
         }
     }
     if let Some(goal_id) = payload.goal_id {
         match storage::goal_repo::goal_exists(conn, goal_id) {
             Ok(true) => {}
-            Ok(false) => {
-                return ActionOutcome::ValidationFailed(vec![
-                    ValidationError::ReferencedGoalNotFound,
-                ]);
-            }
+            Ok(false) => reference_errors.push(ValidationError::ReferencedGoalNotFound),
             Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
         }
+    }
+    if !reference_errors.is_empty() {
+        return ActionOutcome::ValidationFailed(reference_errors);
     }
 
     let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
@@ -971,10 +974,16 @@ pub(crate) fn add_task(
 /// `IMPORTANT_CHANGE` like `UpdateGoal` (do not invent a stricter floor
 /// than frozen). If `payload.project_id`/`payload.goal_id` is
 /// `FieldPatch::Set(x)`, `x` must reference a real, existing Project/
-/// Goal - checked independently, same reasoning as `add_task` above.
-/// `FieldPatch::Clear`/`Unchanged` need no existence check.
-/// `recurring_rule_id` is never touched - `UpdateTaskPayload` has no
-/// such field.
+/// Goal - checked independently, same reasoning as `add_task` above; if
+/// both are `Set` to a nonexistent target, both `ValidationError`s are
+/// returned together in stable `ReferencedProjectNotFound`-then-
+/// `ReferencedGoalNotFound` order, with zero mutation (M2 Task
+/// parent-validation hardening pass, 2026-09-17 - corrects an earlier
+/// short-circuit that returned only the first missing reference).
+/// `FieldPatch::Clear`/`Unchanged` need no existence check. A real
+/// storage error from either lookup still aborts immediately as a
+/// `StorageError`. `recurring_rule_id` is never touched -
+/// `UpdateTaskPayload` has no such field.
 pub(crate) fn update_task(
     conn: &mut Connection,
     meta: ActionMeta,
@@ -990,27 +999,23 @@ pub(crate) fn update_task(
         return ActionOutcome::ValidationFailed(errors);
     }
 
+    let mut reference_errors: Vec<ValidationError> = Vec::new();
     if let FieldPatch::Set(project_id) = payload.project_id {
         match storage::project_repo::project_exists(conn, project_id) {
             Ok(true) => {}
-            Ok(false) => {
-                return ActionOutcome::ValidationFailed(vec![
-                    ValidationError::ReferencedProjectNotFound,
-                ]);
-            }
+            Ok(false) => reference_errors.push(ValidationError::ReferencedProjectNotFound),
             Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
         }
     }
     if let FieldPatch::Set(goal_id) = payload.goal_id {
         match storage::goal_repo::goal_exists(conn, goal_id) {
             Ok(true) => {}
-            Ok(false) => {
-                return ActionOutcome::ValidationFailed(vec![
-                    ValidationError::ReferencedGoalNotFound,
-                ]);
-            }
+            Ok(false) => reference_errors.push(ValidationError::ReferencedGoalNotFound),
             Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
         }
+    }
+    if !reference_errors.is_empty() {
+        return ActionOutcome::ValidationFailed(reference_errors);
     }
 
     let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);

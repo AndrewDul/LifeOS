@@ -5,14 +5,17 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 Task vertical slice — the fifth real domain
-entity, and the first entity with two independent, both-nullable parent
-references: `AddTask`/`UpdateTask` implemented end to end;
-`recurring_rule_id` deliberately deferred (typed placeholder,
-database-enforced NULL-only). On top of the same day's Goal vertical
-slice/storage hardening, Goal hardening pass, Project vertical slice,
-Project/storage integrity hardening, GoalRelation vertical slice,
-Project Child Action Freeze pass, and Milestone vertical slice).
+Last updated: 2026-09-17 (M2 Task parent-validation hardening — a
+small, focused correctness fix: `add_task`/`update_task` now
+independently validate BOTH `project_id`/`goal_id` whenever both are
+supplied, instead of short-circuiting on the first missing reference;
+both errors are returned together in stable order when both are
+invalid. No new entity/action; the Task vertical-slice report's own
+overclaim on this point is corrected via an addendum, not silently
+rewritten. On top of the same day's Goal vertical slice/storage
+hardening, Goal hardening pass, Project vertical slice, Project/storage
+integrity hardening, GoalRelation vertical slice, Project Child Action
+Freeze pass, Milestone vertical slice, and Task vertical slice).
 
 ---
 
@@ -30,7 +33,7 @@ Project Child Action Freeze pass, and Milestone vertical slice).
 **M2 now has five real, working, tested domain entities: Goal,
 Project, GoalRelation, Milestone, and Task**, end to end through
 `domain → actions → services → private services/storage → encrypted
-SQLCipher`. Eight runs on 2026-09-17 built this: the Goal vertical slice
+SQLCipher`. Nine runs on 2026-09-17 built this: the Goal vertical slice
 (storage foundation hardening + Goal implemented), a dedicated Goal
 hardening pass (fixed 7 issues before the pattern was reused), the
 **Project vertical slice** (second entity, built directly with the
@@ -51,8 +54,11 @@ directly with the pattern - no separate hardening pass needed), and the
 **Task vertical slice** (fifth entity, the first with two independent
 nullable parent references - `AddTask`/`UpdateTask`, `recurring_rule_id`
 deliberately deferred behind a database-enforced NULL-only `CHECK`,
-built directly with the pattern - no separate hardening pass needed).
-See §4b-§4j. Next step needs an explicit decision - see §9.
+built directly with the pattern), and a ninth, **Task parent-validation
+hardening pass** (`add_task`/`update_task` now independently validate
+both `project_id`/`goal_id` and aggregate both errors in stable order
+when both are invalid - a review finding, not a data-integrity bug; see
+§4k). Next step needs an explicit decision - see §9.
 
 ---
 
@@ -127,7 +133,7 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-194 automated tests prove all of this (9 storage-spike regression, 17
+200 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
@@ -137,9 +143,10 @@ numbered requirements, 17 direct Milestone/`AddMilestone`/
 `UpdateMilestone` action-layer unit, 3 direct `MilestoneStatus` unit, 28
 Task integration covering 52 numbered requirements, 15 direct
 Task/`AddTask`/`UpdateTask` action-layer unit, 3 direct `TaskStatus`
-unit). **Not wired into the running app yet** - no Tauri command layer
-exists, so the UI cannot create/see real goals, projects, relations,
-milestones, or tasks yet.
+unit, 6 new Task parent-validation-hardening integration tests). **Not
+wired into the running app yet** - no Tauri command layer exists, so
+the UI cannot create/see real goals, projects, relations, milestones,
+or tasks yet.
 
 Repository contents as of this run:
 
@@ -162,6 +169,7 @@ LiFeOS/
 │                    REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md
 │                    REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md
 │                    REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md
+│                    REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -218,19 +226,22 @@ LiFeOS/
     │       │                       transaction) - capability API contract's names, no
     │       │                       dedicated capability/module yet (LIFEOS_SPEC.md
     │       │                       §5.6/§10.1)
-    │       ├── tests.rs            110 integration test functions against a real
+    │       ├── tests.rs            116 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
     │       │                       storage integrity, 23 GoalRelation functions covering
     │       │                       26 numbered requirements, 24 Milestone functions
-    │       │                       covering 32 numbered requirements, 28 new Task
-    │       │                       functions covering 52 numbered requirements - incl.
-    │       │                       10 forced-audit-failure/raw-SQL-FK-bypass proofs
-    │       │                       across all 5 entities, a V4-populated-database
-    │       │                       upgrades-to-V5 migration-compatibility test, 7 new
-    │       │                       raw-SQL DB-defense-in-depth proofs for Task's
-    │       │                       FK/CHECK constraints (incl. the temporary
-    │       │                       recurring_rule_id IS NULL CHECK), and 2 new raw
-    │       │                       hard-DELETE RESTRICT proofs for Project/Goal)
+    │       │                       covering 32 numbered requirements, 28 Task functions
+    │       │                       covering 52 numbered requirements - incl. 10
+    │       │                       forced-audit-failure/raw-SQL-FK-bypass proofs across
+    │       │                       all 5 entities, a V4-populated-database upgrades-to-V5
+    │       │                       migration-compatibility test, 7 raw-SQL DB-defense-
+    │       │                       in-depth proofs for Task's FK/CHECK constraints (incl.
+    │       │                       the temporary recurring_rule_id IS NULL CHECK), and 2
+    │       │                       raw hard-DELETE RESTRICT proofs for Project/Goal, plus
+    │       │                       6 new Task parent-validation-hardening functions
+    │       │                       (req_tpv_a-f) proving both project_id/goal_id are
+    │       │                       independently checked and both errors are returned
+    │       │                       together, in stable order, when both are invalid)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
@@ -895,6 +906,41 @@ the pattern (no separate hardening pass needed):
 Full evidence, exact SQL, and every test result:
 `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
 
+### 4k. Task parent-validation hardening (2026-09-17, dedicated follow-up run)
+
+A small, focused correctness fix found during review of §4j - **not** a
+new entity or action:
+
+- **Issue**: the Task vertical-slice report claimed `add_task`/
+  `update_task` check `project_id`/`goal_id` independently, "neither
+  ever skipped just because the other one ran or failed" - but the
+  actual implementation returned immediately on the first missing
+  reference, so when BOTH parents were invalid at once, only
+  `ReferencedProjectNotFound` was ever returned and the `goal_id` check
+  never actually ran. This never allowed an invalid write (a single
+  error was still a correct rejection with zero persistence) - the
+  defect was the report's claim being stronger than the code, not a
+  data-integrity gap.
+- **Fix**: both checks now accumulate into a shared
+  `reference_errors: Vec<ValidationError>` and the function returns
+  only after every applicable check has run. If both are invalid, both
+  errors are returned together in stable, deterministic
+  `ReferencedProjectNotFound`-then-`ReferencedGoalNotFound` order
+  (guaranteed by push order). A real storage error from either lookup
+  still aborts immediately as a typed `StorageError`, never silently
+  downgraded into a validation failure.
+- **Proven with 6 new tests** (`req_tpv_a` through `req_tpv_f`): both
+  parents invalid (AddTask and UpdateTask, both return both errors in
+  order, zero writes/mutation), Project-valid-Goal-invalid, and
+  Project-invalid-Goal-valid (proving the Goal lookup genuinely still
+  runs even when Project already failed) for both actions.
+- **Documentation correction, not a silent rewrite**: a "Correction
+  note" addendum was added to
+  `REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md` §10, explaining the
+  inaccuracy; the original text is preserved above it.
+
+Full evidence: `docs/reports/REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
+
 ### Next implementation step (M2)
 
 With Goal, Project, GoalRelation, Milestone, and Task all now
@@ -977,9 +1023,10 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   18. `docs: freeze Project child mutation actions` — a
       documentation-only commit, zero source-code files changed.
   19. `feat: implement M2 Milestone vertical slice`
-  20. (this run) `feat: implement M2 Task vertical slice` — see this
+  20. `feat: implement M2 Task vertical slice`
+  21. (this run) `fix: validate both Task parent references` — see this
       run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-20 were not
+- Pushed to `origin/main` through commit 7. **Commits 8-21 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -995,7 +1042,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 194 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 200 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -1024,26 +1071,30 @@ Set/Clear-able (and clearable together), `created_at`/`updated_at`
 timestamp behavior proven, all 7 database-level FK/CHECK/RESTRICT
 proofs via raw SQL, and a V4-to-V5 migration-compatibility check (28
 integration test functions covering 52 numbered requirements + 15
-direct action-layer unit + 3 direct `TaskStatus` unit) - all passing
-against temp databases, never the user's real data. **Test count rose
-from 148 to 194 this run** (+46: 28 integration functions, 15 direct
-action-layer unit, 3 domain unit) - all 148 prior tests remain green,
-unmodified.
+direct action-layer unit + 3 direct `TaskStatus` unit), and 6 new tests
+proving `add_task`/`update_task` independently validate BOTH
+`project_id`/`goal_id` when both are supplied, returning both
+`ValidationError`s together in stable order when both are invalid
+(`req_tpv_a` through `req_tpv_f`, §4k) - all passing against temp
+databases, never the user's real data. **Test count rose from 194 to
+200 this run** (+6 integration tests, a pure validation-completeness
+fix with no schema/dependency change) - all 194 prior tests remain
+green, unmodified.
 
 ---
 
 ## 9. Next recommended step
 
-See §4j's "Next implementation step" for the exact reasoning (this
+See §4k's "Next implementation step" for the exact reasoning (this
 duplicates it so it is visible without scrolling past the M2 detail
 section). With Goal/Project/GoalRelation/Milestone/Task all now
-implemented, the two remaining frozen-but-unbuilt items are
-**`UpdateProject`** (fully frozen, implemented-ready - the last
-shovel-ready action on an entity that already exists) and
-**`RecurringRule`** (deliberately deferred, needs its own design/freeze
-pass first, §4j). A net-new entity beyond those (e.g. the Personal
-Knowledge Layer) needs its own planning/freeze pass before
-implementation, the way Milestone/Task both got one.
+implemented (and this run's parent-validation defect fixed), the two
+remaining frozen-but-unbuilt items are **`UpdateProject`** (fully
+frozen, implemented-ready - the last shovel-ready action on an entity
+that already exists) and **`RecurringRule`** (deliberately deferred,
+needs its own design/freeze pass first, §4j). A net-new entity beyond
+those (e.g. the Personal Knowledge Layer) needs its own planning/freeze
+pass before implementation, the way Milestone/Task both got one.
 
 ---
 
@@ -1070,6 +1121,14 @@ implementation, the way Milestone/Task both got one.
   Calendar/Reminder) is not built; the database enforces
   `recurring_rule_id IS NULL` via a temporary `CHECK` that a future
   `RecurringRule`/Calendar migration will need to replace with a real FK.
+- **RESOLVED (2026-09-17, M2 Task parent-validation hardening, §4k
+  above): `add_task`/`update_task` now genuinely validate BOTH
+  `project_id`/`goal_id` independently whenever both are supplied.**
+  The Task vertical-slice report had claimed this was already true;
+  review found the implementation actually short-circuited on the first
+  missing reference. Fixed - both errors are now returned together, in
+  stable order, when both parents are invalid. Never allowed an invalid
+  write either before or after this fix.
 - **`bundled-sqlcipher`'s build-time OpenSSL dependency is real but no
   longer hardcoded** — any machine building this needs
   `scripts/setup-windows-storage-env.ps1` run once (§4a).

@@ -238,6 +238,28 @@ ON DELETE RESTRICT` constraints are independent defense in depth
 storage integrity hardening pass) - proven directly with raw-SQL
 bypasses (`req_t43`/`req_t44`, §14).
 
+> **Correction note (2026-09-17, M2 Task parent-validation hardening
+> pass).** The claim above that "neither is ever skipped just because
+> the other one ran or failed" was **inaccurate as originally written**.
+> The original `services::add_task`/`services::update_task`
+> implementation ran both checks independently *only when the first one
+> passed* - each check returned immediately (`ActionOutcome::
+> ValidationFailed(vec![single_error])`) the moment it found a missing
+> reference, so when BOTH `project_id` and `goal_id` were invalid at
+> once, the `goal_id` check never actually executed and its error was
+> never reported; only `ReferencedProjectNotFound` came back. This never
+> allowed an invalid write (`ReferencedProjectNotFound` alone was still
+> a correct rejection with zero writes) - the defect was that the
+> report's own claim was stronger than the implementation, not that
+> invalid data could reach the database. Fixed in the dedicated
+> hardening pass immediately following this report - see
+> `REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` for the
+> full before/after and new test evidence (`req_tpv_a` through
+> `req_tpv_f`). Both checks now always run when both parents are
+> supplied, and both errors are returned together in stable
+> `ReferencedProjectNotFound`-then-`ReferencedGoalNotFound` order when
+> both are invalid.
+
 ---
 
 ## 11. Confirmation behavior

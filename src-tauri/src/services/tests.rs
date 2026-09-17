@@ -4346,6 +4346,321 @@ fn req_t12_nonexistent_goal_id_rejected_before_write() {
     println!("[req_t12] PASS - nonexistent goal_id rejected before persistence, zero rows written");
 }
 
+// =========================================================================
+// M2 Task parent-validation hardening (2026-09-17) - new evidence below.
+// Evidence for
+// `docs/reports/REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
+// Proves `add_task`/`update_task` check `project_id`/`goal_id`
+// independently and aggregate BOTH errors (stable Project-then-Goal
+// order) when both are invalid, rather than short-circuiting on the
+// first missing reference (the bug this pass fixes).
+// =========================================================================
+
+/// Requirement A: AddTask with BOTH `project_id` and `goal_id`
+/// nonexistent returns BOTH validation errors, in stable
+/// `ReferencedProjectNotFound`-then-`ReferencedGoalNotFound` order, with
+/// zero writes to either `tasks` or `task_audit_log`.
+#[test]
+fn req_tpv_a_add_task_both_parents_invalid_returns_both_errors_in_stable_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    let fake_goal_id = crate::domain::GoalId::new();
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload(
+            "Both parents dangling",
+            None,
+            Some(fake_project_id),
+            Some(fake_goal_id),
+        ),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![
+                    ValidationError::ReferencedProjectNotFound,
+                    ValidationError::ReferencedGoalNotFound,
+                ],
+                "[req_tpv_a] FAIL - expected both errors in stable Project-then-Goal order, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_a] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_tpv_a] FAIL - a task row was written despite both dangling references"
+    );
+    assert_eq!(
+        task_audit_row_count(&conn),
+        0,
+        "[req_tpv_a] FAIL - an audit row was written despite both dangling references"
+    );
+    println!("[req_tpv_a] PASS - AddTask with both parents invalid returned both errors in stable order, zero writes");
+}
+
+/// Requirement B: AddTask with a valid `project_id` but an invalid
+/// `goal_id` still runs the Goal check independently and returns
+/// `ReferencedGoalNotFound`, zero writes.
+#[test]
+fn req_tpv_b_add_task_project_valid_goal_invalid_returns_goal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Valid project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let fake_goal_id = crate::domain::GoalId::new();
+
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload(
+            "Valid project, dangling goal",
+            None,
+            Some(project.id),
+            Some(fake_goal_id),
+        ),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![ValidationError::ReferencedGoalNotFound],
+                "[req_tpv_b] FAIL - expected only ReferencedGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_b] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_tpv_b] FAIL - a task row was written"
+    );
+    println!("[req_tpv_b] PASS - Goal validation still ran independently of the valid Project, zero writes");
+}
+
+/// Requirement C: AddTask with an invalid `project_id` but a valid
+/// `goal_id` still runs the Goal check (it must not be skipped just
+/// because Project failed first) and returns only
+/// `ReferencedProjectNotFound`, zero writes.
+#[test]
+fn req_tpv_c_add_task_project_invalid_goal_valid_returns_only_project_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Valid goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let fake_project_id = crate::domain::ProjectId::new();
+
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload(
+            "Dangling project, valid goal",
+            None,
+            Some(fake_project_id),
+            Some(goal.id),
+        ),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![ValidationError::ReferencedProjectNotFound],
+                "[req_tpv_c] FAIL - expected only ReferencedProjectNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_c] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_tpv_c] FAIL - a task row was written"
+    );
+    println!("[req_tpv_c] PASS - Goal lookup still ran even though Project was invalid, only the Project error was returned, zero writes");
+}
+
+/// Requirement D: UpdateTask with BOTH `project_id`/`goal_id` set to
+/// nonexistent targets returns BOTH errors in stable order, and leaves
+/// the Task - including its timestamps - byte/logically identical, with
+/// no new audit row.
+#[test]
+fn req_tpv_d_update_task_both_parents_invalid_set_returns_both_errors_in_stable_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable task", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+    let audit_count_before = task_audit_row_count(&conn);
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    let fake_goal_id = crate::domain::GoalId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(fake_project_id),
+            goal_id: FieldPatch::Set(fake_goal_id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![
+                    ValidationError::ReferencedProjectNotFound,
+                    ValidationError::ReferencedGoalNotFound,
+                ],
+                "[req_tpv_d] FAIL - expected both errors in stable Project-then-Goal order, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_d] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    let after = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_tpv_d] FAIL - task changed despite both parents being invalid"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "[req_tpv_d] FAIL - updated_at changed despite the rejected update"
+    );
+    assert_eq!(
+        task_audit_row_count(&conn),
+        audit_count_before,
+        "[req_tpv_d] FAIL - an audit row was written despite the rejected update"
+    );
+    println!("[req_tpv_d] PASS - UpdateTask with both Set targets invalid returned both errors in stable order, zero mutation, no new audit row");
+}
+
+/// Requirement E: UpdateTask with a valid `project_id` Set but an
+/// invalid `goal_id` Set still checks Goal independently and returns
+/// only `ReferencedGoalNotFound`, zero mutation.
+#[test]
+fn req_tpv_e_update_task_project_valid_goal_invalid_returns_goal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_e.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Valid project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable task", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(project.id),
+            goal_id: FieldPatch::Set(fake_goal_id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![ValidationError::ReferencedGoalNotFound],
+                "[req_tpv_e] FAIL - expected only ReferencedGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_e] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_tpv_e] FAIL - task changed despite the invalid goal_id"
+    );
+    println!("[req_tpv_e] PASS - Goal checked independently of the valid Project, zero mutation");
+}
+
+/// Requirement F: UpdateTask with an invalid `project_id` Set but a
+/// valid `goal_id` Set still performs both applicable lookups and
+/// returns only `ReferencedProjectNotFound`, zero mutation.
+#[test]
+fn req_tpv_f_update_task_project_invalid_goal_valid_returns_only_project_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "taskpv_f.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Valid goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable task", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(fake_project_id),
+            goal_id: FieldPatch::Set(goal.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert_eq!(
+                errors,
+                vec![ValidationError::ReferencedProjectNotFound],
+                "[req_tpv_f] FAIL - expected only ReferencedProjectNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_tpv_f] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_tpv_f] FAIL - task changed despite the invalid project_id"
+    );
+    println!("[req_tpv_f] PASS - both applicable lookups ran, only the Project error was returned, zero mutation");
+}
+
 /// Requirements 13, 14-21: both valid parents persist correctly, and
 /// every `UpdateTask` patch-semantics case succeeds and persists -
 /// title, `due_at` Set/Clear, `project_id` Set/Clear, `goal_id`
