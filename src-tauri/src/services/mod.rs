@@ -19,8 +19,9 @@ mod storage;
 
 use crate::actions::{
     effective_class, goal_blocks_until_confirmed, ActionMeta, ActionOutcome, ConfirmationClass,
-    CreateGoalPayload, UpdateGoalPayload,
+    CreateGoalPayload, FieldPatch, UpdateGoalPayload,
 };
+use crate::core_error::CoreError;
 use crate::domain::{Goal, GoalId, GoalStatus};
 use crate::security;
 use rusqlite::Connection;
@@ -105,8 +106,25 @@ pub(crate) fn bootstrap_production_db() -> Result<Connection, BootstrapError> {
     bootstrap_db_at(&path, &key_hex)
 }
 
+/// Goal mutation + its audit-log row are one atomic unit (M2 Goal
+/// hardening, 2026-09-17). Previously the audit insert used
+/// `let _ = storage::goal_repo::insert_audit_entry(...)`, silently
+/// discarding a failed audit write while still returning
+/// `ActionOutcome::Success` - the frozen architecture requires a
+/// persisted `IMPORTANT_CHANGE`-and-above (and, in this slice,
+/// `EXPLICIT_ADD`) mutation to have an audit record, so a caller must
+/// never see `Success` when the domain write succeeded but the audit
+/// write failed. Both writes now happen inside one `rusqlite`
+/// transaction: if either fails, the transaction is never committed and
+/// `Transaction`'s `Drop` impl issues the `ROLLBACK` automatically -
+/// proven for real (not just by code inspection) in
+/// `services::tests::req_h1_create_goal_audit_failure_rolls_back_goal_insert`
+/// and `..req_h2_update_goal_audit_failure_rolls_back_goal_update` via a
+/// forced-failure SQLite trigger. This is why `conn` is now
+/// `&mut Connection` - `Connection::transaction()` requires unique
+/// access.
 pub(crate) fn create_goal(
-    conn: &Connection,
+    conn: &mut Connection,
     meta: ActionMeta,
     payload: CreateGoalPayload,
 ) -> ActionOutcome<Goal> {
@@ -137,12 +155,18 @@ pub(crate) fn create_goal(
         updated_at: now,
     };
 
-    if let Err(e) = storage::goal_repo::insert_goal(conn, &goal) {
-        return ActionOutcome::StorageError(e.to_string());
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::goal_repo::insert_goal(&tx, &goal) {
+        // `tx` drops here without a commit - rusqlite rolls it back.
+        return ActionOutcome::StorageError(CoreError::from(e));
     }
 
-    let _ = storage::goal_repo::insert_audit_entry(
-        conn,
+    if let Err(e) = storage::goal_repo::insert_audit_entry(
+        &tx,
         goal.id,
         "CreateGoal",
         meta.actor,
@@ -150,7 +174,15 @@ pub(crate) fn create_goal(
         class,
         None,
         now,
-    );
+    ) {
+        // Audit write failed - roll back the goal insert too, do not
+        // return Success for a partially-recorded mutation.
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
 
     ActionOutcome::Success {
         value: goal,
@@ -159,14 +191,14 @@ pub(crate) fn create_goal(
 }
 
 pub(crate) fn update_goal(
-    conn: &Connection,
+    conn: &mut Connection,
     meta: ActionMeta,
     payload: UpdateGoalPayload,
 ) -> ActionOutcome<Goal> {
     let existing = match storage::goal_repo::get_goal(conn, payload.id) {
         Ok(Some(g)) => g,
         Ok(None) => return ActionOutcome::NotFound,
-        Err(e) => return ActionOutcome::StorageError(e.to_string()),
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
     };
 
     if let Err(errors) = crate::actions::validate_update_goal(&existing, &payload) {
@@ -186,29 +218,45 @@ pub(crate) fn update_goal(
     if let Some(title) = payload.title {
         updated.title = title.trim().to_string();
     }
-    if let Some(description) = payload.description {
-        updated.description = Some(description);
+    match payload.description {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(description) => updated.description = Some(description),
+        FieldPatch::Clear => updated.description = None,
     }
     if let Some(status) = payload.status {
         updated.status = status;
     }
-    if let Some(target_date) = payload.target_date {
-        updated.target_date = Some(target_date);
+    match payload.target_date {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(target_date) => updated.target_date = Some(target_date),
+        FieldPatch::Clear => updated.target_date = None,
     }
-    if let Some(priority_user) = payload.priority_user {
-        updated.priority_user = Some(priority_user);
+    match payload.priority_user {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(priority_user) => updated.priority_user = Some(priority_user),
+        FieldPatch::Clear => updated.priority_user = None,
+    }
+    match payload.domain_tag {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(domain_tag) => updated.domain_tag = Some(domain_tag),
+        FieldPatch::Clear => updated.domain_tag = None,
     }
     if let Some(progress) = payload.progress {
         updated.progress = progress;
     }
     updated.updated_at = meta.requested_at;
 
-    if let Err(e) = storage::goal_repo::update_goal(conn, &updated) {
-        return ActionOutcome::StorageError(e.to_string());
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::goal_repo::update_goal(&tx, &updated) {
+        return ActionOutcome::StorageError(CoreError::from(e));
     }
 
-    let _ = storage::goal_repo::insert_audit_entry(
-        conn,
+    if let Err(e) = storage::goal_repo::insert_audit_entry(
+        &tx,
         updated.id,
         "UpdateGoal",
         meta.actor,
@@ -216,7 +264,13 @@ pub(crate) fn update_goal(
         class,
         previous_snapshot.as_deref(),
         meta.requested_at,
-    );
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
 
     ActionOutcome::Success {
         value: updated,
@@ -224,11 +278,18 @@ pub(crate) fn update_goal(
     }
 }
 
-/// `SAFE_READ` - the frozen v0.1 capability API's `get_active_goals()`
-/// (`LIFEOS_SPEC.md` §10.1). This function (and `get_goal` below) *is*
-/// the capability boundary for this slice - a dedicated `capability`
-/// module is not added until a real Tauri command/NeXa transport exists
-/// to sit behind it (would be a premature, empty pass-through today).
+/// `SAFE_READ` - matches the name of the frozen v0.1 capability API's
+/// `get_active_goals()` (`LIFEOS_SPEC.md` §10.1/§5.6). The capability
+/// API *contract* (these function names/signatures) is frozen; a
+/// dedicated `capability` module that actually sits behind Tauri
+/// commands/cloud-tool handlers/NeXa is **not implemented yet** - it
+/// must exist before any such external caller is wired up, and no
+/// external caller may reach `services` (or `services::storage`)
+/// directly once it does. Today this function (and `get_goal` below)
+/// exists only so `services::tests` can exercise `create_goal`/
+/// `update_goal` without a dedicated capability layer that has nothing
+/// real to front yet - not a claim that the capability boundary itself
+/// is done.
 pub(crate) fn get_active_goals(conn: &Connection) -> Result<Vec<Goal>, rusqlite::Error> {
     storage::goal_repo::get_active_goals(conn)
 }

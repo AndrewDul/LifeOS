@@ -16,11 +16,40 @@
 // Inferred - plus confirmation classes this slice's tests don't reach).
 #![allow(dead_code)]
 
+use crate::core_error::CoreError;
 use crate::domain::{
     Goal, GoalId, GoalStatus, Priority, Progress, DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN,
     PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
+
+/// A tri-state patch for an optional `Goal` field, replacing an
+/// ambiguous nested `Option<Option<T>>` (M2 Goal hardening, 2026-09-17).
+/// `Some(x)`/`None` on a plain `Option<T>` update field cannot express
+/// "explicitly clear this field back to NULL" separately from "leave it
+/// alone" - this can, and does so as an explicit named state rather than
+/// two nested `Option`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FieldPatch<T> {
+    /// Do not touch this field - no database modification.
+    Unchanged,
+    /// Write this value.
+    Set(T),
+    /// Explicitly clear this field to SQL NULL.
+    Clear,
+}
+
+impl<T> Default for FieldPatch<T> {
+    fn default() -> Self {
+        FieldPatch::Unchanged
+    }
+}
+
+impl<T> FieldPatch<T> {
+    fn is_unchanged(&self) -> bool {
+        matches!(self, FieldPatch::Unchanged)
+    }
+}
 
 /// Who requested an action. `LIFEOS_SPEC.md` §5.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,10 +181,6 @@ pub(crate) enum ValidationError {
         max: Priority,
         actual: i64,
     },
-    InvalidStatusTransition {
-        from: GoalStatus,
-        to: GoalStatus,
-    },
     NoFieldsToUpdate,
 }
 
@@ -168,17 +193,21 @@ pub(crate) struct CreateGoalPayload {
     pub domain_tag: Option<String>,
 }
 
-/// `Some(x)` sets the field to `x`; `None` leaves it unchanged. This
-/// slice does not support explicitly clearing an optional field back to
-/// NULL (a deliberate, documented simplification - see the report).
+/// `title`/`status`/`progress` are non-nullable `Goal` fields, so a
+/// plain `Option` still works for them: `Some(x)` sets the field, `None`
+/// leaves it unchanged. `description`/`target_date`/`priority_user`/
+/// `domain_tag` are nullable `Goal` fields and use `FieldPatch` (M2 Goal
+/// hardening, 2026-09-17) so "leave unchanged" and "explicitly clear to
+/// NULL" are distinct, unambiguous states.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UpdateGoalPayload {
     pub id: GoalId,
     pub title: Option<String>,
-    pub description: Option<String>,
+    pub description: FieldPatch<String>,
     pub status: Option<GoalStatus>,
-    pub target_date: Option<DateTime<Utc>>,
-    pub priority_user: Option<Priority>,
+    pub target_date: FieldPatch<DateTime<Utc>>,
+    pub priority_user: FieldPatch<Priority>,
+    pub domain_tag: FieldPatch<String>,
     pub progress: Option<Progress>,
 }
 
@@ -274,20 +303,27 @@ pub(crate) fn validate_create_goal(
     }
 }
 
-/// Validates an update against the *existing* goal (needed for status-
-/// transition and no-op checks). Returns nothing on success - the caller
-/// applies `payload`'s `Some` fields onto `existing`.
+/// Validates an update against the *existing* goal - `existing` is
+/// taken so a future field could validate against prior state if ever
+/// needed; no status-transition restriction is applied (M2 Goal
+/// hardening, 2026-09-17 - see `domain::GoalStatus`'s doc comment: that
+/// rule was an unapproved invention of the original vertical slice and
+/// has been removed). Returns nothing on success - the caller applies
+/// `payload`'s `Some`/`FieldPatch::Set`/`FieldPatch::Clear` onto
+/// `existing`.
 pub(crate) fn validate_update_goal(
     existing: &Goal,
     payload: &UpdateGoalPayload,
 ) -> Result<(), Vec<ValidationError>> {
+    let _ = existing; // reserved for future validation that needs prior state
     let mut errors = Vec::new();
 
     let touches_any_field = payload.title.is_some()
-        || payload.description.is_some()
+        || !payload.description.is_unchanged()
         || payload.status.is_some()
-        || payload.target_date.is_some()
-        || payload.priority_user.is_some()
+        || !payload.target_date.is_unchanged()
+        || !payload.priority_user.is_unchanged()
+        || !payload.domain_tag.is_unchanged()
         || payload.progress.is_some();
     if !touches_any_field {
         errors.push(ValidationError::NoFieldsToUpdate);
@@ -298,13 +334,18 @@ pub(crate) fn validate_update_goal(
             errors.push(e);
         }
     }
-    if let Some(d) = &payload.description {
+    if let FieldPatch::Set(d) = &payload.description {
         if let Err(e) = validate_description(d) {
             errors.push(e);
         }
     }
-    if let Some(p) = payload.priority_user {
-        if let Err(e) = validate_priority(p) {
+    if let FieldPatch::Set(tag) = &payload.domain_tag {
+        if let Err(e) = validate_domain_tag(tag) {
+            errors.push(e);
+        }
+    }
+    if let FieldPatch::Set(p) = &payload.priority_user {
+        if let Err(e) = validate_priority(*p) {
             errors.push(e);
         }
     }
@@ -313,14 +354,9 @@ pub(crate) fn validate_update_goal(
             errors.push(e);
         }
     }
-    if let Some(status) = payload.status {
-        if !existing.status.can_transition_to(status) {
-            errors.push(ValidationError::InvalidStatusTransition {
-                from: existing.status,
-                to: status,
-            });
-        }
-    }
+    // No status-transition check: every GoalStatus -> GoalStatus change
+    // an explicit action requests is allowed and audited, per the
+    // hardening correction above.
 
     if errors.is_empty() {
         Ok(())
@@ -347,8 +383,13 @@ pub(crate) enum ActionOutcome<T> {
     },
     ValidationFailed(Vec<ValidationError>),
     NotFound,
-    /// An unexpected storage-layer failure (e.g. disk I/O) - distinct
-    /// from `ValidationFailed`/`NotFound`, which are expected outcomes
-    /// of otherwise-correct calls.
-    StorageError(String),
+    /// An unexpected storage-layer failure (e.g. disk I/O, a failed
+    /// transaction commit) - distinct from `ValidationFailed`/
+    /// `NotFound`, which are expected outcomes of otherwise-correct
+    /// calls. Typed (M2 Goal hardening, 2026-09-17) - never a bare
+    /// database-driver string; see `crate::core_error`.
+    StorageError(CoreError),
 }
+
+#[cfg(test)]
+mod tests;

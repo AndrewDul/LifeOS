@@ -7,11 +7,17 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 `PROJECT_STATE.md`. Operating rules for working in this repo live in
 `../CLAUDE.md`.
 
-Status: M0/M1 done and accepted; M2 architecture frozen but not
-implemented. See `PROJECT_STATE.md` for exactly what exists; most of this
-document still describes design targets for later milestones, not built
-functionality — §5.1-§5.6 in particular are a frozen *architecture*, not
-yet code.
+Status (2026-09-17): M0/M1 done and accepted. M2's storage foundation is
+proven and hardened for production use, and one real domain entity -
+Goal - is implemented and hardened end to end (validated atomicity,
+typed errors, tri-state patch semantics; see the M2 Goal hardening
+report). The rest of the M2 domain model (Project, Task, Calendar,
+Personal Knowledge, `GoalRelation`, Goal Intelligence, and the rest of
+the frozen action set) is still in progress - not implemented yet. M3 is
+not started. See `PROJECT_STATE.md` for exactly what exists; most of
+this document still describes design targets for later milestones, not
+built functionality — §5.1-§5.6 in particular are a frozen
+*architecture*, only partially code so far (Goal only).
 
 ---
 
@@ -365,6 +371,10 @@ Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
 specifically because the capability API's `log_wellbeing()`, §10.1,
 needed something real to persist — not originally in this list, flagged
 in the M2 report as a deliberate small addition, not scope creep).
+**Implementation status (2026-09-17): only `Goal` is implemented** (with
+its own hardened vertical slice); every other entity in this list,
+`GoalRelation` included, is schema-frozen only — see §5.2's correction
+and `PROJECT_STATE.md` §9 for which one is next.
 
 Deliberately **not** modeled yet (future milestones, not a frozen
 schema): `UserProfile`/settings, `Transaction`/`IncomeSource`/`Budget`
@@ -409,13 +419,22 @@ change must be proposed and confirmed, never silently applied (consistent
 with the "I want to focus less on NeXa this week" example in §2, and with
 the `INFERRED_CHANGE` confirmation class, §5.5).
 
-**Schema frozen at M2**: the `GoalRelation` table and the relation-type
-enum above are part of the M2 domain freeze (M2 report §D), so the
-initial `Goal` schema has relationship edges from the start rather than
-needing a breaking migration later. The *intelligence* — proposing
-priorities, surfacing conflicts, reasoning about dependencies — is still
-implemented starting at M6 (Personal Intelligence, §12); M2 only freezes
-where that reasoning will store its conclusions.
+**Schema frozen, NOT yet implemented (corrected 2026-09-17, M2 Goal
+hardening report).** The `GoalRelation` table and the relation-type enum
+above are part of the M2 domain freeze (M2 report §D) - the *intent* is
+that `Goal` relationship edges never need a breaking migration to add
+later. But the actual production migration shipped with the Goal
+vertical slice (`src-tauri/migrations/V1__create_goals.sql`) deliberately
+implements `Goal` only, not `GoalRelation` - there was no "from the
+start" edge table in that migration, and the earlier wording here
+overclaimed that there was. `GoalRelation` will receive its own
+dedicated vertical slice (its own migration, action(s), and tests)
+before M2 is considered complete, following the same
+`domain → actions → services → services::storage` pattern proven for
+`Goal`. The *intelligence* — proposing priorities, surfacing conflicts,
+reasoning about dependencies — is still implemented starting at M6
+(Personal Intelligence, §12); M2 only freezes where that reasoning will
+eventually store its conclusions.
 
 ### 5.3 Personal Knowledge / Memory
 
@@ -572,6 +591,29 @@ private` result — see
 `capability/` is the thin, stable surface that Tauri commands, the cloud
 LLM's tool-handlers, and (later) NeXa all sit behind — it calls only
 `services`' public functions, never `storage` — see §10.1.
+
+**Implementation status, made explicit (corrected 2026-09-17, M2 Goal
+hardening report §9C).** Two different things were previously blurred
+together under "the capability boundary":
+
+- The capability API **contract** — the frozen set of operation names/
+  signatures (`create_goal`, `update_goal`, `get_active_goals`, ...,
+  §10.1) — is frozen, as design, at M2.
+- A dedicated **`capability/` module that is actual code** sitting
+  behind that contract is **not implemented yet**. Today,
+  `services::create_goal`/`update_goal`/`get_active_goals`/`get_goal`
+  are called directly, but only by `services::tests` - there is no
+  other caller (no Tauri command, no cloud-tool handler, no NeXa
+  transport) to front yet, so adding an empty pass-through `capability/`
+  module this early would itself be premature scaffolding.
+
+The constraint this leaves standing, unweakened: once a real Tauri
+command, cloud-tool handler, or NeXa transport is wired up, it **must**
+go through a real `capability/` module and must **never** call
+`services` (or `services::storage`) directly. `services::tests` calling
+`services` directly is not an exception to that rule being violated
+early - it is a test working around the architecture to exercise it, per
+this repo's testing policy, not a caller the rule is meant to constrain.
 
 ---
 
@@ -842,10 +884,14 @@ NeXa should later be able to call capability operations such as
 manipulating LifeOS database tables.** This is the same guarded action
 layer (§2, §5.4-§5.6) the desktop UI and the cloud LLM already use; a
 NeXa capability boundary is a third caller of that one layer, not a new
-integration point into the database. **Frozen at M2** as concrete Rust
-function signatures in `capability/` (M2 report §I) — what's still
-undecided is only the transport NeXa will eventually use to reach them
-(local socket, embedded HTTP, or otherwise); no NeXa-specific code is
+integration point into the database. **The operation names/signatures
+above are frozen at M2 as the capability API contract** (M2 report §I) -
+this is a design freeze, not a claim that a `capability/` module
+implementing them exists yet in code (corrected 2026-09-17, M2 Goal
+hardening report §9C: it does not - see §5.6's "Implementation status"
+note). What's still undecided, beyond that module simply not being built
+yet, is only the transport NeXa will eventually use to reach it (local
+socket, embedded HTTP, or otherwise); no NeXa-specific code is
 written yet.
 
 ---

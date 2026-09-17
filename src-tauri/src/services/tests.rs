@@ -1,14 +1,15 @@
-//! M2 Goal vertical slice tests (2026-09-17).
+//! M2 Goal vertical slice + hardening test suite (2026-09-17).
 //!
-//! Evidence for `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
-//! Run with:
+//! Evidence for `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
+//! and `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`. Run with:
 //! `cargo test --manifest-path src-tauri/Cargo.toml services::tests -- --nocapture --test-threads=1`
 //! (`--test-threads=1` matters for the keyring-touching test.)
 
 use super::*;
 use crate::actions::{
-    ActionMeta, ActionOutcome, Actor, ConfirmationClass, Provenance, ValidationError,
+    ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
+use crate::core_error::CoreErrorKind;
 use crate::domain::GoalStatus;
 use std::fs;
 use std::io::Read;
@@ -31,6 +32,51 @@ fn temp_db(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, String) 
 
 fn ui_explicit() -> ActionMeta {
     ActionMeta::now(Actor::Ui, Provenance::Explicit)
+}
+
+fn mk_create_payload(title: &str) -> CreateGoalPayload {
+    CreateGoalPayload {
+        title: title.to_string(),
+        description: None,
+        target_date: None,
+        priority_user: None,
+        domain_tag: None,
+    }
+}
+
+/// Installs a `BEFORE INSERT` trigger on `goal_audit_log` that always
+/// fails via `RAISE(FAIL, ...)` - the reproducible forced-audit-failure
+/// mechanism used to prove real SQLite transactional rollback (M2 Goal
+/// hardening report §3), not just code inspection. `RAISE(FAIL, ...)`
+/// (rather than `RAISE(ROLLBACK, ...)`) deliberately does NOT roll back
+/// the transaction itself - it only aborts the failing statement - so a
+/// passing test proves *our* `services::create_goal`/`update_goal` code
+/// performs the rollback (via `Transaction`'s `Drop`), not SQLite doing
+/// it on our behalf.
+fn install_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_audit_failure
+         BEFORE INSERT ON goal_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced audit failure');
+         END;",
+    )
+    .expect("failed to install the forced-audit-failure trigger");
+}
+
+fn remove_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_audit_failure;")
+        .expect("failed to remove the forced-audit-failure trigger");
+}
+
+fn goal_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM goals", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM goal_audit_log", [], |r| r.get(0))
+        .unwrap()
 }
 
 /// Requirement 1 & 2: fresh production database initializes encrypted
@@ -149,7 +195,7 @@ fn req5_6_create_goal_succeeds_and_persists_across_reopen() {
 
     let goal_id;
     {
-        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
         let payload = CreateGoalPayload {
             title: "  Get first paying client  ".to_string(),
             description: Some("DeVDul freelance".to_string()),
@@ -157,7 +203,7 @@ fn req5_6_create_goal_succeeds_and_persists_across_reopen() {
             priority_user: Some(3),
             domain_tag: Some("career".to_string()),
         };
-        match create_goal(&conn, ui_explicit(), payload) {
+        match create_goal(&mut conn, ui_explicit(), payload) {
             ActionOutcome::Success {
                 value,
                 confirmation_class,
@@ -197,17 +243,11 @@ fn req5_6_create_goal_succeeds_and_persists_across_reopen() {
 fn req7_empty_and_whitespace_title_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod7.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
     for bad_title in ["", "   ", "\t\n"] {
-        let payload = CreateGoalPayload {
-            title: bad_title.to_string(),
-            description: None,
-            target_date: None,
-            priority_user: None,
-            domain_tag: None,
-        };
-        match create_goal(&conn, ui_explicit(), payload) {
+        let payload = mk_create_payload(bad_title);
+        match create_goal(&mut conn, ui_explicit(), payload) {
             ActionOutcome::ValidationFailed(errors) => {
                 assert!(
                     errors.contains(&ValidationError::EmptyTitle),
@@ -220,11 +260,9 @@ fn req7_empty_and_whitespace_title_rejected() {
         }
     }
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM goals", [], |r| r.get(0))
-        .unwrap();
     assert_eq!(
-        count, 0,
+        goal_row_count(&conn),
+        0,
         "[req7] FAIL - a row was written despite validation failure"
     );
     println!(
@@ -237,17 +275,13 @@ fn req7_empty_and_whitespace_title_rejected() {
 fn req8_overlong_fields_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod8.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
-    let overlong_title = "x".repeat(201);
     let payload = CreateGoalPayload {
-        title: overlong_title,
-        description: None,
-        target_date: None,
         priority_user: Some(99),
-        domain_tag: None,
+        ..mk_create_payload(&"x".repeat(201))
     };
-    match create_goal(&conn, ui_explicit(), payload) {
+    match create_goal(&mut conn, ui_explicit(), payload) {
         ActionOutcome::ValidationFailed(errors) => {
             assert!(
                 errors
@@ -266,11 +300,9 @@ fn req8_overlong_fields_rejected() {
         other => panic!("[req8] FAIL - expected ValidationFailed, got {other:?}"),
     }
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM goals", [], |r| r.get(0))
-        .unwrap();
     assert_eq!(
-        count, 0,
+        goal_row_count(&conn),
+        0,
         "[req8] FAIL - a row was written despite validation failure"
     );
 }
@@ -280,19 +312,9 @@ fn req8_overlong_fields_rejected() {
 fn req9_valid_update_goal_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod9.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
-    let created = match create_goal(
-        &conn,
-        ui_explicit(),
-        CreateGoalPayload {
-            title: "Ship M2".to_string(),
-            description: None,
-            target_date: None,
-            priority_user: None,
-            domain_tag: None,
-        },
-    ) {
+    let created = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Ship M2")) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
@@ -303,7 +325,7 @@ fn req9_valid_update_goal_succeeds() {
         status: Some(GoalStatus::Active),
         ..Default::default()
     };
-    match update_goal(&conn, ui_explicit(), update) {
+    match update_goal(&mut conn, ui_explicit(), update) {
         ActionOutcome::Success {
             value,
             confirmation_class,
@@ -324,7 +346,7 @@ fn req9_valid_update_goal_succeeds() {
 fn req10_update_nonexistent_goal_returns_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod10.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
     let fake_id = crate::domain::GoalId::new();
     let update = UpdateGoalPayload {
@@ -332,7 +354,7 @@ fn req10_update_nonexistent_goal_returns_not_found() {
         progress: Some(10),
         ..Default::default()
     };
-    match update_goal(&conn, ui_explicit(), update) {
+    match update_goal(&mut conn, ui_explicit(), update) {
         ActionOutcome::NotFound => {
             println!("[req10] PASS - UpdateGoal on a nonexistent id returned structured NotFound")
         }
@@ -341,67 +363,48 @@ fn req10_update_nonexistent_goal_returns_not_found() {
 }
 
 /// Requirement 11: an invalid UpdateGoal makes ZERO DB changes.
+///
+/// Rewritten (M2 hardening, 2026-09-17): the original version of this
+/// test proved an invalid COMPLETED -> ACTIVE *status* transition was
+/// rejected - that whole rule has since been removed as an unapproved
+/// invention (§5 of the hardening brief). The zero-changes guarantee
+/// itself is still real and still required, so this now exercises it
+/// via an out-of-bounds `priority_user`, a validation rule that is
+/// still frozen policy.
 #[test]
 fn req11_invalid_update_makes_zero_changes() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod11.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
-    let created = match create_goal(
-        &conn,
-        ui_explicit(),
-        CreateGoalPayload {
-            title: "Stable title".to_string(),
-            description: None,
-            target_date: None,
-            priority_user: None,
-            domain_tag: None,
-        },
-    ) {
+    let created = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Stable title")) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
+    let before = get_goal(&conn, created.id).unwrap().unwrap();
 
-    // First, mark it COMPLETED (a valid transition)...
-    let complete = UpdateGoalPayload {
-        id: created.id,
-        status: Some(GoalStatus::Completed),
-        ..Default::default()
-    };
-    let completed = match update_goal(&conn, ui_explicit(), complete) {
-        ActionOutcome::Success { value, .. } => value,
-        other => panic!("setup failed: {other:?}"),
-    };
-    assert_eq!(completed.status, GoalStatus::Completed);
-
-    // ...then attempt an invalid transition out of a terminal state.
     let invalid = UpdateGoalPayload {
         id: created.id,
-        status: Some(GoalStatus::Active),
+        priority_user: FieldPatch::Set(99),
         ..Default::default()
     };
-    match update_goal(&conn, ui_explicit(), invalid) {
+    match update_goal(&mut conn, ui_explicit(), invalid) {
         ActionOutcome::ValidationFailed(errors) => {
             assert!(errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::InvalidStatusTransition { .. })));
-            println!("[req11] PASS - invalid COMPLETED -> ACTIVE transition rejected: {errors:?}");
+                .any(|e| matches!(e, ValidationError::PriorityOutOfBounds { .. })));
+            println!("[req11] PASS - out-of-bounds priority_user rejected: {errors:?}");
         }
         other => panic!("[req11] FAIL - expected ValidationFailed, got {other:?}"),
     }
 
-    let fetched = get_goal(&conn, created.id).unwrap().unwrap();
+    let after = get_goal(&conn, created.id).unwrap().unwrap();
     assert_eq!(
-        fetched.status,
-        GoalStatus::Completed,
-        "[req11] FAIL - status changed despite validation failure"
-    );
-    assert_eq!(
-        fetched.updated_at, completed.updated_at,
-        "[req11] FAIL - updated_at changed despite validation failure"
+        before, after,
+        "[req11] FAIL - goal changed despite validation failure"
     );
     println!(
-        "[req11] PASS - zero changes persisted after the invalid update (status still COMPLETED)"
+        "[req11] PASS - zero changes persisted after the invalid update (goal identical to before)"
     );
 }
 
@@ -410,33 +413,32 @@ fn req11_invalid_update_makes_zero_changes() {
 fn req12_get_active_goals_filters_correctly() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "prod12.db");
-    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
-    let mk = |title: &str| CreateGoalPayload {
-        title: title.to_string(),
-        description: None,
-        target_date: None,
-        priority_user: None,
-        domain_tag: None,
-    };
-
-    let a = match create_goal(&conn, ui_explicit(), mk("Active goal")) {
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Active goal")) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
-    let b = match create_goal(&conn, ui_explicit(), mk("Will be paused")) {
+    let b = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Will be paused"),
+    ) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
-    update_goal(
-        &conn,
+    match update_goal(
+        &mut conn,
         ui_explicit(),
         UpdateGoalPayload {
             id: b.id,
             status: Some(GoalStatus::Paused),
             ..Default::default()
         },
-    );
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
 
     let active = get_active_goals(&conn).unwrap();
     assert_eq!(
@@ -524,5 +526,285 @@ fn scan_dir(dir: &std::path::Path, offenders: &mut Vec<String>, patterns: &[&str
                 }
             }
         }
+    }
+}
+
+// =========================================================================
+// M2 Goal hardening (2026-09-17) - new evidence below.
+// =========================================================================
+
+/// Hardening §1/§2 (A): CreateGoal's goal-insert + audit-insert are one
+/// atomic transaction. A forced audit-insert failure must leave ZERO
+/// goal rows behind, and the action must report a typed `StorageError`,
+/// never `Success`.
+#[test]
+fn req_h1_create_goal_audit_failure_rolls_back_goal_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "hardening_h1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    install_audit_failure_trigger(&conn);
+
+    match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Should never persist"),
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[hardening h1] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[hardening h1] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    assert_eq!(
+        goal_row_count(&conn),
+        0,
+        "[hardening h1] FAIL - a goal row survived a rolled-back transaction"
+    );
+    assert_eq!(
+        audit_row_count(&conn),
+        0,
+        "[hardening h1] FAIL - an audit row survived a rolled-back transaction"
+    );
+
+    remove_audit_failure_trigger(&conn);
+
+    // The connection/DB must remain fully usable after the rollback -
+    // proves the transaction was cleanly rolled back, not left in a
+    // broken half-open state.
+    match create_goal(&mut conn, ui_explicit(), mk_create_payload("Now it works")) {
+        ActionOutcome::Success { .. } => {
+            println!("[hardening h1] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[hardening h1] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Hardening §1/§2 (B): UpdateGoal's goal-update + audit-insert are one
+/// atomic transaction. A forced audit-insert failure must leave the
+/// existing goal byte/logically identical to its pre-update state.
+#[test]
+fn req_h2_update_goal_audit_failure_rolls_back_goal_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "hardening_h2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Stable")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_goal(&conn, created.id).unwrap().unwrap();
+
+    install_audit_failure_trigger(&conn);
+
+    let update = UpdateGoalPayload {
+        id: created.id,
+        progress: Some(77),
+        ..Default::default()
+    };
+    match update_goal(&mut conn, ui_explicit(), update) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[hardening h2] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[hardening h2] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_audit_failure_trigger(&conn);
+
+    let after = get_goal(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[hardening h2] FAIL - goal mutated despite a rolled-back transaction"
+    );
+    // Only the one audit row from the initial CreateGoal should exist -
+    // the failed UpdateGoal's attempted row must not have survived.
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM goal_audit_log WHERE goal_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 1,
+        "[hardening h2] FAIL - expected exactly 1 audit row (the original CreateGoal), got {audit_count}"
+    );
+    println!("[hardening h2] PASS - goal left byte/logically identical to its pre-update state, no orphan audit row");
+}
+
+/// Hardening §5: COMPLETED is no longer terminal - a real user may
+/// reopen a completed goal, and the transition remains audited.
+#[test]
+fn req_h3_completed_goal_can_be_reopened_and_transition_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "hardening_h3.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Finish thesis")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let completed = match update_goal(
+        &mut conn,
+        ui_explicit(),
+        UpdateGoalPayload {
+            id: created.id,
+            status: Some(GoalStatus::Completed),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(completed.status, GoalStatus::Completed);
+
+    let reopened = match update_goal(
+        &mut conn,
+        ui_explicit(),
+        UpdateGoalPayload {
+            id: created.id,
+            status: Some(GoalStatus::Active),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!(
+            "[hardening h3] FAIL - reopening a COMPLETED goal should now be allowed, got {other:?}"
+        ),
+    };
+    assert_eq!(reopened.status, GoalStatus::Active);
+
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM goal_audit_log WHERE goal_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 3,
+        "[hardening h3] FAIL - expected 3 audit rows (create, complete, reopen), got {audit_count}"
+    );
+    println!(
+        "[hardening h3] PASS - COMPLETED -> ACTIVE transition succeeded and is audited ({audit_count} rows for this goal)"
+    );
+}
+
+/// Hardening §4: `FieldPatch::Set`/`Clear`/`Unchanged` each behave
+/// exactly as specified against real persisted rows.
+#[test]
+fn req_h4_update_goal_field_patch_set_clear_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "hardening_h4.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        CreateGoalPayload {
+            title: "Patch semantics".to_string(),
+            description: Some("original description".to_string()),
+            target_date: Some(chrono::Utc::now()),
+            priority_user: Some(2),
+            domain_tag: Some("career".to_string()),
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert!(created.description.is_some());
+    assert!(created.priority_user.is_some());
+    assert!(created.domain_tag.is_some());
+    assert!(created.target_date.is_some());
+
+    let update = UpdateGoalPayload {
+        id: created.id,
+        description: FieldPatch::Set("new description".to_string()),
+        priority_user: FieldPatch::Clear,
+        domain_tag: FieldPatch::Unchanged,
+        target_date: FieldPatch::Unchanged,
+        ..Default::default()
+    };
+    let updated = match update_goal(&mut conn, ui_explicit(), update) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[hardening h4] FAIL - expected Success, got {other:?}"),
+    };
+
+    assert_eq!(
+        updated.description.as_deref(),
+        Some("new description"),
+        "[hardening h4] FAIL - Set did not write the new value"
+    );
+    assert_eq!(
+        updated.priority_user, None,
+        "[hardening h4] FAIL - Clear did not null the field"
+    );
+    assert_eq!(
+        updated.domain_tag.as_deref(),
+        Some("career"),
+        "[hardening h4] FAIL - Unchanged modified a field it shouldn't have touched"
+    );
+    assert_eq!(
+        updated.target_date, created.target_date,
+        "[hardening h4] FAIL - Unchanged target_date was modified"
+    );
+
+    // Re-fetch with a fresh read to prove this is really persisted, not
+    // just the in-memory returned value.
+    let refetched = get_goal(&conn, created.id).unwrap().unwrap();
+    assert_eq!(refetched, updated);
+
+    println!("[hardening h4] PASS - FieldPatch::Set/Clear/Unchanged each behaved exactly as specified and persisted correctly");
+}
+
+/// Hardening §6/§8: CreateGoal with `Provenance::Inferred` must return
+/// `ConfirmationRequired` and write NOTHING, proven against a real DB -
+/// not deferred to M5 just because CloudLLM does not exist yet.
+#[test]
+fn req_h5_inferred_create_goal_requires_confirmation_and_does_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "hardening_h5.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload = mk_create_payload("AI-proposed goal");
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match create_goal(&mut conn, meta, payload.clone()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[hardening h5] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        goal_row_count(&conn),
+        0,
+        "[hardening h5] FAIL - a goal was written before confirmation"
+    );
+    println!(
+        "[hardening h5] PASS - Inferred CreateGoal blocked with ConfirmationRequired, zero rows written"
+    );
+
+    // Resubmission with confirmed:true must then succeed and persist.
+    let mut confirmed_meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    confirmed_meta.confirmed = true;
+    match create_goal(&mut conn, confirmed_meta, payload) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(goal_row_count(&conn), 1);
+            println!("[hardening h5] PASS - resubmission with confirmed=true persisted the goal");
+        }
+        other => panic!(
+            "[hardening h5] FAIL - expected Success on confirmed resubmission, got {other:?}"
+        ),
     }
 }

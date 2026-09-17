@@ -66,18 +66,17 @@ impl GoalStatus {
             _ => None,
         }
     }
-
-    /// COMPLETED and ABANDONED are terminal - once a goal reaches either,
-    /// it cannot transition further. Every other transition (including a
-    /// same-status no-op) is allowed. Documented here since this is the
-    /// single source of truth `actions::validate_update_goal` enforces.
-    pub(crate) fn can_transition_to(self, to: GoalStatus) -> bool {
-        if self == to {
-            return true;
-        }
-        !matches!(self, GoalStatus::Completed | GoalStatus::Abandoned)
-    }
 }
+
+// No `can_transition_to`/terminal-state rule here (removed 2026-09-17, M2
+// Goal hardening). The Goal vertical slice invented a rule - COMPLETED
+// and ABANDONED cannot transition out - that was never part of the
+// frozen Goal status definition; a real user may reasonably reopen a
+// completed or abandoned goal. All four statuses are peer states: every
+// explicit user-requested transition between them is allowed and always
+// audit-logged (`actions::validate_update_goal` no longer restricts
+// this). Do not reintroduce a terminal-state policy here unless
+// `LIFEOS_SPEC.md` explicitly freezes one first.
 
 /// Progress is a deterministic bounded integer percentage, 0..=100.
 /// Chosen over a float or an open-ended scale specifically to keep the

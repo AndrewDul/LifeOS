@@ -10,6 +10,7 @@
 // layer or NeXa transport using them), and they must not be reachable
 // as a shortcut around the eventual capability boundary.
 mod actions;
+mod core_error;
 mod domain;
 mod security;
 mod services;
