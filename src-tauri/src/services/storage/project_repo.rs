@@ -112,6 +112,23 @@ pub(in crate::services) fn get_project(
     .optional()
 }
 
+/// Used by `services::add_milestone` to validate a supplied `project_id`
+/// references a real `Project` *before* persistence - same reasoning as
+/// `goal_repo::goal_exists`: a friendly, typed check kept as the first
+/// line of defense alongside the real, enforced `milestones.project_id`
+/// FK constraint (M2 Milestone vertical slice, 2026-09-17).
+pub(in crate::services) fn project_exists(
+    conn: &Connection,
+    id: ProjectId,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM projects WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+}
+
 /// Same minimum audit shape as `goal_repo::insert_audit_entry` - one row
 /// per audited mutation, `previous_snapshot` NULL for a fresh create.
 #[allow(clippy::too_many_arguments)]

@@ -2,12 +2,14 @@
 //! vertical slice added 2026-09-17; Project/storage integrity hardening
 //! 2026-09-17 - see that report for the `LifecycleStatus` rename and
 //! the canonical `Project.progress` resolution; GoalRelation vertical
-//! slice added 2026-09-17 - the first true relationship-graph entity).
+//! slice added 2026-09-17 - the first true relationship-graph entity;
+//! Milestone vertical slice added 2026-09-17 - the fourth entity, the
+//! first required-parent child entity).
 //!
 //! Pure data, no I/O, no SQL - matches `LIFEOS_SPEC.md` §5.6's module
-//! boundaries. `Goal`, `Project`, and `GoalRelation` are implemented so
-//! far (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model has more;
-//! `Milestone`/`Task`/`Fact`/etc. are explicitly out of scope for this
+//! boundaries. `Goal`, `Project`, `GoalRelation`, and `Milestone` are
+//! implemented so far (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model
+//! has more; `Task`/`Fact`/etc. are explicitly out of scope for this
 //! run).
 
 // Not wired into `run()` yet this run (no capability/Tauri-command
@@ -315,6 +317,101 @@ pub(crate) struct GoalRelation {
     pub relation_type: GoalRelationType,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A stable, globally unique Milestone identifier - same UUID v7 design
+/// as `GoalId`/`ProjectId`/`GoalRelationId` (M2 Milestone vertical
+/// slice, 2026-09-17). Its own newtype for the same type-safety reason
+/// every other entity ID is its own type.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct MilestoneId(pub Uuid);
+
+impl MilestoneId {
+    pub(crate) fn new() -> Self {
+        MilestoneId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(MilestoneId)
+    }
+}
+
+impl std::fmt::Display for MilestoneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `Milestone`'s frozen 2-value status enum (architecture-freeze report
+/// §C / `LIFEOS_SPEC.md` §5.1). **Not** `LifecycleStatus` - a genuinely
+/// different value set (`PENDING`/`DONE`, not the four Goal/Project
+/// values), so reusing `LifecycleStatus` here would be the same mistake
+/// the `GoalStatus` rename was created to fix, in reverse (forcing two
+/// genuinely different value sets to share one type, rather than one
+/// genuinely shared value set needlessly duplicated into two types).
+/// No terminal-state rule: `PENDING`/`DONE` are freely reversible peer
+/// states (M2 Project Child Action Freeze report §5 / Milestone
+/// vertical-slice report §13) - do not reintroduce one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MilestoneStatus {
+    Pending,
+    Done,
+}
+
+impl MilestoneStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            MilestoneStatus::Pending => "PENDING",
+            MilestoneStatus::Done => "DONE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "PENDING" => Some(MilestoneStatus::Pending),
+            "DONE" => Some(MilestoneStatus::Done),
+            _ => None,
+        }
+    }
+}
+
+/// A `Milestone`'s deterministic position among its `Project`'s other
+/// milestones. Plain `i64` - no bounded/scaled type like `Progress`/
+/// `Priority`, since no canonical numeric policy for it exists beyond
+/// non-negativity (a position cannot be negative) - see
+/// `ORDER_INDEX_MIN`/the Milestone vertical-slice report §3 for why no
+/// upper bound is invented.
+pub(crate) type OrderIndex = i64;
+pub(crate) const ORDER_INDEX_MIN: OrderIndex = 0;
+
+/// `Milestone` (M2 Milestone vertical slice, 2026-09-17) - the fourth
+/// real M2 domain entity, a required child of `Project`
+/// (`ON DELETE RESTRICT` - see `migrations/V4__create_milestones.sql`).
+/// Field set is EXACTLY the frozen architecture-freeze definition (M2
+/// report §C): `id`, `project_id`, `title`, `target_date` (nullable),
+/// `status`, `order_index`. Deliberately **excludes** `description`/
+/// `progress`/`priority`/`weight`/`blockers`/an AI score/hidden
+/// metadata - none are in the frozen model. **Deliberately excludes
+/// `created_at`/`updated_at` too** - unlike every other entity so far,
+/// the frozen Milestone field table genuinely lists no timestamps at
+/// all (contrast `Task`'s own frozen row, which explicitly lists
+/// `created_at`/`updated_at`); adding them here would be exactly the
+/// kind of silent, undocumented field addition this codebase has
+/// repeatedly avoided (`Project.progress`'s original open-question
+/// status, `GoalRelation`'s explicit exclusion list). If a real need
+/// for a Milestone timestamp ever emerges, it must be frozen in
+/// `LIFEOS_SPEC.md` first, not added here silently - see the Milestone
+/// vertical-slice report §4 for the full reasoning.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Milestone {
+    pub id: MilestoneId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub target_date: Option<DateTime<Utc>>,
+    pub status: MilestoneStatus,
+    pub order_index: OrderIndex,
 }
 
 #[cfg(test)]

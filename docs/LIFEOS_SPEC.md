@@ -9,25 +9,29 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 
 Status (2026-09-17): M0/M1 done and accepted. M2's storage foundation is
 proven and hardened for production use, including genuine SQLite
-foreign-key enforcement. Three real domain entities are implemented:
+foreign-key enforcement. Four real domain entities are implemented:
 **Goal** (implemented, then hardened - validated atomicity, typed
 errors, tri-state patch semantics; see the M2 Goal hardening report),
 **Project** (implemented directly with the hardened pattern -
 `CreateProject`/`UpdateProgress` only, its first direct cross-entity
 foreign key to `Goal` proven; see the M2 Project vertical-slice and
-Project/storage integrity hardening reports), and **GoalRelation**
+Project/storage integrity hardening reports), **GoalRelation**
 (implemented directly with the twice-hardened pattern - `LinkGoals`
 only, the first true relationship-*graph* structure, its frozen
 11-value relation-type enum and direction convention proven; see the M2
-GoalRelation vertical-slice report). The rest of the M2 domain model
+GoalRelation vertical-slice report), and **Milestone** (implemented
+directly with the pattern - `AddMilestone`/`UpdateMilestone` both, the
+first *required-parent* child entity, its `(project_id, order_index)`
+UNIQUE rule resolved and enforced both in Core and the database; see the
+M2 Milestone vertical-slice report). The rest of the M2 domain model
 (Task, Calendar, Personal Knowledge, Goal Intelligence *reasoning* over
 the graph GoalRelation now makes available, and the rest of the frozen
-action set, including Project's own `AddMilestone`/`AddTask`) is still
-in progress - not implemented yet. M3 is not started. See
-`PROJECT_STATE.md` for exactly what exists; most of this document still
-describes design targets for later milestones, not built functionality
-— §5.1-§5.6 in particular are a frozen *architecture*, only partially
-code so far (Goal, Project, and GoalRelation).
+action set, including Project's own `AddTask`) is still in progress -
+not implemented yet. M3 is not started. See `PROJECT_STATE.md` for
+exactly what exists; most of this document still describes design
+targets for later milestones, not built functionality — §5.1-§5.6 in
+particular are a frozen *architecture*, only partially code so far
+(Goal, Project, GoalRelation, and Milestone).
 
 ---
 
@@ -390,15 +394,18 @@ Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
 specifically because the capability API's `log_wellbeing()`, §10.1,
 needed something real to persist — not originally in this list, flagged
 in the M2 report as a deliberate small addition, not scope creep).
-**Implementation status (2026-09-17): `Goal`, `Project`, and
-`GoalRelation` are implemented** (Goal with its own hardened vertical
+**Implementation status (2026-09-17): `Goal`, `Project`, `GoalRelation`,
+and `Milestone` are implemented** (Goal with its own hardened vertical
 slice; Project built directly with that hardened pattern -
 `CreateProject`/`UpdateProgress` only, not `AddMilestone`/`AddTask`;
 GoalRelation built directly with the twice-hardened pattern -
 `LinkGoals` only, its full frozen relation-type enum and direction
-convention); every other entity in this list is schema-frozen only —
-see §5.2 for `GoalRelation`'s detail and correction, and
-`PROJECT_STATE.md` §9 for which entity is next.
+convention; Milestone built directly with the pattern - `AddMilestone`/
+`UpdateMilestone` both, its `(project_id, order_index)` UNIQUE rule
+resolved and enforced both in Core and the database); every other
+entity in this list is schema-frozen only — see §5.2 for `GoalRelation`'s
+detail and correction, §5.1 below for `Milestone`'s detail, and
+`PROJECT_STATE.md` §9 for which entity is next (`Task`).
 
 **`Project.progress` — canonically resolved (2026-09-17, M2 Project/
 storage integrity hardening report).** The Project vertical slice had
@@ -438,29 +445,51 @@ This is a documentation-only freeze — no code implementing
 `UpdateProject` was written this run; it exists so implementation has
 an unambiguous target when Project editing is actually built.
 
-**Project child action set (Milestone, Task) — frozen, not yet
-implemented (2026-09-17, M2 Project Child Action Freeze report).**
-Before `Milestone`/`Task` implementation begins, the same mutation gap
-`UpdateProject` just closed was identified and closed for both
-children, documentation-only, same reasoning:
+**Project child action set (Milestone, Task) — Milestone implemented,
+Task frozen but not yet implemented (2026-09-17, M2 Project Child Action
+Freeze report; Milestone side implemented in the M2 Milestone vertical
+slice, same date).** Before `Milestone`/`Task` implementation began, the
+same mutation gap `UpdateProject` just closed was identified and closed
+for both children, documentation-only, same reasoning. `AddMilestone`/
+`UpdateMilestone` below are now real, tested code, not just a frozen
+target; `AddTask`/`UpdateTask` remain frozen-only:
 
-- **`UpdateMilestone`** (floor `EXPLICIT_ADD`) — `FieldPatch<T>` for
-  `title`/`target_date`/`order_index`, plain `Option<T>` for `status`
+**Patch-semantics correction (2026-09-17, M2 Milestone vertical-slice
+report §2).** The two bullets immediately below originally used
+`FieldPatch<T>` too broadly - for `Milestone.title`/`order_index` and
+`Task.title`, all three **non-nullable** fields, where a `Clear` state
+is meaningless (there is no `NULL` to clear one of those fields to).
+Corrected to the canonical rule this whole pattern has followed since
+`UpdateGoal`: **`FieldPatch<T>` only for a persisted field that is
+itself nullable** (so `Unchanged`/`Set`/`Clear` are all meaningful
+states); every **non-nullable** field uses a plain `Option<T>`
+(`None` = unchanged, `Some(value)` = set) with no `Clear` state to be
+ambiguous about in the first place. Apply this same rule to
+`UpdateProject`'s own fields, above, where relevant (`title`/`status`
+are non-nullable → `Option<T>`; `description`/`priority`/`goal_id` are
+nullable → `FieldPatch<T>`, already correctly stated there).
+
+- **`UpdateMilestone`** (floor `EXPLICIT_ADD`) — `title: Option<String>`
+  and `order_index: Option<i64>` (both non-nullable fields on
+  `Milestone` - `None` leaves unchanged, `Some(value)` sets it, no
+  `Clear` state exists for either); `target_date: FieldPatch<DateTime>`
+  (the one genuinely nullable field); `status: Option<MilestoneStatus>`
   (non-nullable — `PENDING`/`DONE` are peer states, freely reversible;
   no terminal-state rule, matching the correction already applied to
   `Goal.status`/`LifecycleStatus`, never reintroduce one here either).
   This is the only way a `Milestone` created `PENDING` via
   `AddMilestone` can ever become `DONE` (or move back) — without it,
   `AddMilestone` alone leaves no path to completion.
-- **`UpdateTask`** (floor `EXPLICIT_ADD`) — `FieldPatch<T>` for `title`/
-  `due_at`/`project_id`/`goal_id` (the latter two nullable — clearing
-  either is a legitimate "unlink" operation, distinct from leaving it
-  unchanged), plain `Option<T>` for `status`. `TODO`/`IN_PROGRESS`/
-  `DONE`/`CANCELLED` are peer persisted states with **no** frozen
-  transition policy — a task may move directly `TODO -> DONE`, reopen
-  from `DONE`/`CANCELLED`, etc.; do not invent restrictions.
-  `recurring_rule_id` mutation is deliberately out of scope (recurrence
-  behavior itself is not designed yet).
+- **`UpdateTask`** (floor `EXPLICIT_ADD`) — `title: Option<String>`
+  (non-nullable); `due_at`/`project_id`/`goal_id` all
+  `FieldPatch<T>` (all three genuinely nullable — clearing
+  `project_id`/`goal_id` is a legitimate "unlink" operation, distinct
+  from leaving either unchanged); `status: Option<TaskStatus>`
+  (non-nullable). `TODO`/`IN_PROGRESS`/`DONE`/`CANCELLED` are peer
+  persisted states with **no** frozen transition policy — a task may
+  move directly `TODO -> DONE`, reopen from `DONE`/`CANCELLED`, etc.; do
+  not invent restrictions. `recurring_rule_id` mutation is deliberately
+  out of scope (recurrence behavior itself is not designed yet).
 - Both are `EXPLICIT_ADD`, not `IMPORTANT_CHANGE` — `UpdateProgress`
   already established that an *update* action can sit at `EXPLICIT_ADD`
   when the mutation is routine/low-risk; Milestone/Task status changes
@@ -477,15 +506,27 @@ children, documentation-only, same reasoning:
   delete action today, so child work must never silently vanish.
 - **Creation defaults**: `AddMilestone` creates `PENDING`; `AddTask`
   creates `TODO`. Neither `Add*` action doubles as an update action.
-- **`Milestone.order_index` uniqueness within a Project is an OPEN
-  QUESTION**, deliberately left open rather than silently decided — no
-  existing frozen document states whether duplicate `order_index` values
-  within one `Project` are allowed or forbidden. `order_index` is
-  persisted explicitly and used for deterministic sort order; no
-  automatic renumbering/rebalancing is frozen. See §13.
+- **`Milestone.order_index` uniqueness within a Project — RESOLVED
+  (2026-09-17, M2 Milestone vertical-slice report §3): YES, unique.**
+  For a given `Project`, `(project_id, order_index)` must be unique - a
+  `Project` may not have two `Milestone`s occupying the same canonical
+  position. **Different Projects may reuse the same `order_index`
+  values** (Project A's `0, 1, 2` and Project B's `0, 1, 2` are both
+  valid and unrelated). Ambiguity is rejected, not silently tie-broken:
+  `AddMilestone`/`UpdateMilestone` requesting an already-occupied
+  `(project_id, order_index)` return a structured validation error
+  before persistence, and `UNIQUE(project_id, order_index)` enforces it
+  at the database level too. No automatic renumbering/rebalancing is
+  implemented - a future explicit, transactional reorder mechanism can
+  add that later if needed.
 
 Full reasoning for every point above:
-`docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`.
+`docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` (the
+freeze) and
+`docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` (the
+`order_index` uniqueness resolution and the patch-semantics correction
+above, plus the full `AddMilestone`/`UpdateMilestone` implementation
+evidence).
 
 Deliberately **not** modeled yet (future milestones, not a frozen
 schema): `UserProfile`/settings, `Transaction`/`IncomeSource`/`Budget`
@@ -619,11 +660,12 @@ requires judgment). Frozen minimum v0.1 action set (M2 report §E):
   `LinkGoals`, `ChangePriority`
 - **Project** (and its children `Milestone`/`Task`): `CreateProject`,
   `UpdateProject`, `UpdateProgress`, `AddMilestone`, `UpdateMilestone`,
-  `AddTask`, `UpdateTask` — `UpdateProject`/`UpdateMilestone`/
-  `UpdateTask` frozen 2026-09-17 (M2 Project Child Action Freeze
-  report), documentation-only; `UpdateProject` is implemented-ready but
-  not yet coded, `UpdateMilestone`/`UpdateTask` await their entities'
-  own vertical slices (§5.1)
+  `AddTask`, `UpdateTask` — `AddMilestone`/`UpdateMilestone` are
+  **implemented** (2026-09-17, M2 Milestone vertical slice);
+  `UpdateProject`/`UpdateMilestone`/`UpdateTask` were frozen 2026-09-17
+  (M2 Project Child Action Freeze report), documentation-only at the
+  time; `UpdateProject` remains implemented-ready but not yet coded,
+  `AddTask`/`UpdateTask` await `Task`'s own vertical slice (§5.1)
 - **Calendar**: `CreateEvent`, `MoveEvent`, `CancelEvent`, `AddReminder`
 - **Challenge**: `CreateChallenge`, `AddHypothesis`, `TrySolution`,
   `RecordOutcome`
@@ -1212,8 +1254,7 @@ These are genuinely unresolved and should not be treated as decided:
   same gap for `Milestone`/`Task` was closed pre-emptively, before either
   is implemented — `UpdateMilestone`/`UpdateTask`, both floor
   `EXPLICIT_ADD`. Full detail in §5.1.
-- **`Milestone.order_index` uniqueness within a Project** (§5.1) —
-  genuinely undecided: no frozen document states whether duplicate
-  `order_index` values are allowed or forbidden within one Project.
-  Must be resolved before (or during) the `Milestone` vertical slice,
-  not silently defaulted to a `UNIQUE` constraint or silently allowed.
+- **Resolved 2026-09-17 (M2 Milestone vertical-slice report §3):**
+  `Milestone.order_index` uniqueness within a Project (§5.1) — YES,
+  `(project_id, order_index)` must be unique; different Projects may
+  reuse the same values; no automatic renumbering is implemented.

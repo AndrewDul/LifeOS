@@ -10,7 +10,7 @@ use crate::actions::{
     ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
-use crate::domain::{GoalRelationType, LifecycleStatus};
+use crate::domain::{GoalRelationType, LifecycleStatus, MilestoneStatus};
 use std::fs;
 use std::io::Read;
 
@@ -2613,4 +2613,1301 @@ fn req_gr26_raw_hard_delete_of_referenced_goal_is_restricted() {
     println!(
         "[req_gr26] PASS - Goal A remains, and the relation remains - no dangling relation exists"
     );
+}
+
+// =========================================================================
+// M2 Milestone vertical slice (2026-09-17) - new evidence below. Evidence
+// for `docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
+// The fourth real M2 domain entity, and the first required-parent child
+// entity - `milestones.project_id REFERENCES projects(id) ON DELETE
+// RESTRICT`.
+// =========================================================================
+
+fn mk_add_milestone_payload(
+    project_id: crate::domain::ProjectId,
+    title: &str,
+    order_index: crate::domain::OrderIndex,
+) -> AddMilestonePayload {
+    AddMilestonePayload {
+        project_id,
+        title: title.to_string(),
+        target_date: None,
+        order_index,
+    }
+}
+
+fn milestone_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM milestones", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn milestone_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM milestone_audit_log", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Same forced-failure mechanism as `install_audit_failure_trigger`/
+/// `install_project_audit_failure_trigger`/
+/// `install_goal_relation_audit_failure_trigger`, targeting
+/// `milestone_audit_log`.
+fn install_milestone_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_milestone_audit_failure
+         BEFORE INSERT ON milestone_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced milestone audit failure');
+         END;",
+    )
+    .expect("failed to install the forced milestone-audit-failure trigger");
+}
+
+fn remove_milestone_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_milestone_audit_failure;")
+        .expect("failed to remove the forced milestone-audit-failure trigger");
+}
+
+/// Requirement 1: V4 migration creates the Milestone schema.
+#[test]
+fn req_m1_v4_migration_creates_milestone_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for table in ["milestones", "milestone_audit_log"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(exists, "[req_m1] FAIL - missing table {table}");
+    }
+    println!("[req_m1] PASS - V4 migration created milestones + milestone_audit_log");
+}
+
+/// Requirement 2: a fresh V1->V2->V3->V4 database works end to end - a
+/// Goal, a Project linked to it, a GoalRelation, and a Milestone on the
+/// Project all created together in one migration run.
+#[test]
+fn req_m2_fresh_v1_v2_v3_v4_database_works_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project linked to A", Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(goal_a.id, goal_b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "First milestone", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.project_id, project.id);
+            assert_eq!(value.status, MilestoneStatus::Pending);
+        }
+        other => panic!("[req_m2] FAIL - expected Success, got {other:?}"),
+    }
+    println!("[req_m2] PASS - fresh V1->V2->V3->V4 database supports Goal, Project, GoalRelation, and Milestone together");
+}
+
+/// Requirement 3 (migration compatibility): an existing database
+/// populated only through V3 (real Goal/Project/GoalRelation rows - the
+/// actual shape of an existing user's database before this update)
+/// upgrades cleanly to V4 - Goal/Project/GoalRelation data unchanged, the
+/// milestones table appears, and a new Milestone can reference the
+/// pre-existing Project.
+#[test]
+fn req_m3_v3_populated_database_upgrades_cleanly_to_v4() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone3.db");
+
+    let (goal_id, project_id, relation_id);
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 3).unwrap();
+        let has_milestones_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='milestones'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_milestones_table,
+            "[req_m3] FAIL - a V3-only database already has the milestones table"
+        );
+
+        let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V4 goal")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = goal.id;
+        let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V4 goal B"))
+        {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        let project = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Pre-V4 project", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = project.id;
+        let relation = match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(goal_id, goal_b.id, GoalRelationType::Supports),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        relation_id = relation.id;
+    }
+
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+        let goal_after = get_goal(&conn, goal_id).unwrap();
+        assert_eq!(
+            goal_after.as_ref().map(|g| g.title.as_str()),
+            Some("Pre-V4 goal"),
+            "[req_m3] FAIL - Goal data did not survive the V3 -> V4 upgrade"
+        );
+        let project_after = get_project(&conn, project_id).unwrap();
+        assert_eq!(
+            project_after.as_ref().map(|p| p.id),
+            Some(project_id),
+            "[req_m3] FAIL - Project data did not survive the V3 -> V4 upgrade"
+        );
+        let relation_after = get_goal_relation(&conn, relation_id).unwrap();
+        assert!(
+            relation_after.is_some(),
+            "[req_m3] FAIL - GoalRelation data did not survive the V3 -> V4 upgrade"
+        );
+
+        let has_milestones_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='milestones'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            has_milestones_table,
+            "[req_m3] FAIL - milestones table missing after upgrade"
+        );
+
+        match add_milestone(
+            &mut conn,
+            ui_explicit(),
+            mk_add_milestone_payload(project_id, "Post-V4 milestone", 0),
+        ) {
+            ActionOutcome::Success { .. } => println!(
+                "[req_m3] PASS - V3 data survived the upgrade to V4, and a new AddMilestone works against the pre-existing Project"
+            ),
+            other => panic!(
+                "[req_m3] FAIL - expected AddMilestone to succeed after upgrade, got {other:?}"
+            ),
+        }
+    }
+}
+
+/// Requirements 4, 5, 6: a valid AddMilestone succeeds, defaults to
+/// PENDING, and survives a full connection close/reopen.
+#[test]
+fn req_m4_5_6_valid_add_milestone_defaults_pending_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone4.db");
+
+    let (project_id, milestone_id);
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let project = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Van conversion", None),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = project.id;
+
+        match add_milestone(
+            &mut conn,
+            ui_explicit(),
+            mk_add_milestone_payload(project_id, "  Buy the van  ", 0),
+        ) {
+            ActionOutcome::Success {
+                value,
+                confirmation_class,
+            } => {
+                assert_eq!(
+                    value.title, "Buy the van",
+                    "[req_m4] FAIL - title was not trimmed"
+                );
+                assert_eq!(
+                    value.status,
+                    MilestoneStatus::Pending,
+                    "[req_m5] FAIL - a new Milestone must default to PENDING"
+                );
+                assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+                milestone_id = value.id;
+                println!(
+                    "[req_m4/5] PASS - AddMilestone succeeded and defaulted to PENDING: {value:?}"
+                );
+            }
+            other => panic!("[req_m4] FAIL - expected Success, got {other:?}"),
+        }
+    }
+
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let fetched = get_milestone(&conn, milestone_id).unwrap();
+        assert!(
+            fetched.is_some(),
+            "[req_m6] FAIL - milestone not found after reopen"
+        );
+        assert_eq!(fetched.unwrap().title, "Buy the van");
+        println!("[req_m6] PASS - milestone survived a full connection close/reopen");
+    }
+}
+
+/// Requirement 7: a nonexistent `project_id` is rejected before any
+/// write - zero milestone rows written.
+#[test]
+fn req_m7_nonexistent_project_id_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone7.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(fake_project_id, "Dangling reference", 0),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::ReferencedProjectNotFound),
+                "[req_m7] FAIL - expected ReferencedProjectNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_m7] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        milestone_row_count(&conn),
+        0,
+        "[req_m7] FAIL - a milestone row was written despite the dangling project_id"
+    );
+    println!(
+        "[req_m7] PASS - nonexistent project_id rejected before persistence, zero rows written"
+    );
+}
+
+/// Requirement 8: a duplicate `(project_id, order_index)` within the SAME
+/// Project is rejected before any write - resolves the M2 Project Child
+/// Action Freeze report's open question.
+#[test]
+fn req_m8_duplicate_order_index_same_project_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone8.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "First at slot 0", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Second at slot 0", 0),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::DuplicateMilestoneOrderIndex),
+                "[req_m8] FAIL - expected DuplicateMilestoneOrderIndex, got {errors:?}"
+            );
+        }
+        other => panic!("[req_m8] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        milestone_row_count(&conn),
+        1,
+        "[req_m8] FAIL - expected exactly 1 row (the duplicate must not have been written)"
+    );
+    println!("[req_m8] PASS - duplicate order_index within the same Project rejected before persistence, still exactly 1 row");
+}
+
+/// Requirement 9: the SAME order_index reused by a DIFFERENT Project
+/// succeeds - the resolved uniqueness rule is scoped to
+/// (project_id, order_index) together, not order_index alone.
+#[test]
+fn req_m9_same_order_index_different_project_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone9.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project_a = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project A", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project_b = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project B", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project_a.id, "A's slot 0", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_m9] FAIL - expected Success for Project A, got {other:?}"),
+    }
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project_b.id, "B's slot 0", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_m9] FAIL - expected Success for Project B, got {other:?}"),
+    }
+
+    assert_eq!(milestone_row_count(&conn), 2);
+    println!("[req_m9] PASS - two different Projects both reusing order_index=0 coexist as 2 distinct rows");
+}
+
+/// Requirements 10, 11, 12: UpdateMilestone's `title` and `target_date`
+/// (both `Set` and `Clear`) patch semantics all succeed and persist.
+#[test]
+fn req_m10_11_12_update_milestone_title_and_target_date_patch_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone10.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Original title", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert!(created.target_date.is_none());
+
+    // Requirement 10: title update.
+    let renamed = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            title: Some("  Renamed  ".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_m10] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(renamed.title, "Renamed");
+    println!("[req_m10] PASS - UpdateMilestone title succeeded and was trimmed");
+
+    // Requirement 11: target_date Set.
+    let now = chrono::Utc::now();
+    let with_date = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            target_date: FieldPatch::Set(now),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_m11] FAIL - expected Success, got {other:?}"),
+    };
+    assert!(with_date.target_date.is_some());
+    println!("[req_m11] PASS - UpdateMilestone target_date Set succeeded");
+
+    // Requirement 12: target_date Clear -> SQL NULL, re-verified via a
+    // fresh read.
+    let cleared = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            target_date: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_m12] FAIL - expected Success, got {other:?}"),
+    };
+    assert!(
+        cleared.target_date.is_none(),
+        "[req_m12] FAIL - Clear did not null target_date"
+    );
+    let refetched = get_milestone(&conn, created.id).unwrap().unwrap();
+    assert!(
+        refetched.target_date.is_none(),
+        "[req_m12] FAIL - Clear did not persist as SQL NULL"
+    );
+    println!("[req_m12] PASS - UpdateMilestone target_date Clear persisted as NULL");
+}
+
+/// Requirements 13 & 14: PENDING -> DONE and DONE -> PENDING both succeed
+/// - no terminal-state rule.
+#[test]
+fn req_m13_14_status_pending_done_both_directions_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone13.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Reversible status", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.status, MilestoneStatus::Pending);
+
+    let done = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            status: Some(MilestoneStatus::Done),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_m13] FAIL - PENDING -> DONE should succeed, got {other:?}"),
+    };
+    assert_eq!(done.status, MilestoneStatus::Done);
+    println!("[req_m13] PASS - PENDING -> DONE succeeded");
+
+    let reopened = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            status: Some(MilestoneStatus::Pending),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!(
+            "[req_m14] FAIL - DONE -> PENDING should succeed - no terminal-state rule is frozen, got {other:?}"
+        ),
+    };
+    assert_eq!(reopened.status, MilestoneStatus::Pending);
+    println!("[req_m14] PASS - DONE -> PENDING succeeded - PENDING/DONE are freely reversible peer states");
+}
+
+/// Requirements 15 & 16: an `order_index` update succeeds when the
+/// target slot is free, and is rejected with zero mutation when the
+/// target slot is occupied by a DIFFERENT Milestone in the same Project.
+#[test]
+fn req_m15_16_order_index_update_free_succeeds_occupied_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone15.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let first = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Slot 0", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let second = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Slot 1", 1),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // Requirement 15: move `first` to a genuinely free slot (2).
+    let moved = match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: first.id,
+            order_index: Some(2),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_m15] FAIL - moving to a free slot should succeed, got {other:?}"),
+    };
+    assert_eq!(moved.order_index, 2);
+    println!("[req_m15] PASS - order_index update to a free slot succeeded");
+
+    // Requirement 16: try to move `second` (currently at 1) onto
+    // `first`'s now-current slot (2) - occupied by a DIFFERENT Milestone.
+    let before = get_milestone(&conn, second.id).unwrap().unwrap();
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: second.id,
+            order_index: Some(2),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateMilestoneOrderIndex));
+        }
+        other => panic!("[req_m16] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after = get_milestone(&conn, second.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_m16] FAIL - milestone changed despite the rejected order_index move"
+    );
+    println!("[req_m16] PASS - order_index move onto another Milestone's occupied slot rejected, zero mutation");
+}
+
+/// Requirement 17: an UpdateMilestone touching no fields is rejected.
+#[test]
+fn req_m17_update_milestone_no_fields_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone17.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "No-op target", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+        }
+        other => panic!("[req_m17] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    println!("[req_m17] PASS - no-op UpdateMilestone rejected with NoFieldsToUpdate");
+}
+
+/// Requirement 18: UpdateMilestone on a nonexistent id returns structured
+/// NotFound.
+#[test]
+fn req_m18_update_nonexistent_milestone_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone18.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_id = crate::domain::MilestoneId::new();
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: fake_id,
+            title: Some("Doesn't matter".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::NotFound => {
+            println!(
+                "[req_m18] PASS - UpdateMilestone on a nonexistent id returned structured NotFound"
+            )
+        }
+        other => panic!("[req_m18] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+/// Requirement 19: AddMilestone's audit row carries the required
+/// actor/provenance/confirmation-class metadata.
+#[test]
+fn req_m19_add_milestone_audit_metadata_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone19.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Audited milestone", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let (action_type, actor, provenance, confirmation_class, previous_snapshot): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot FROM milestone_audit_log WHERE milestone_id = ?1",
+            [created.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+
+    assert_eq!(action_type, "AddMilestone");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    assert_eq!(
+        previous_snapshot, None,
+        "[req_m19] FAIL - AddMilestone's audit row must have no previous_snapshot"
+    );
+    println!(
+        "[req_m19] PASS - AddMilestone audit row carries action_type={action_type}, actor={actor}, provenance={provenance}, confirmation_class={confirmation_class}, previous_snapshot=None"
+    );
+}
+
+/// Requirement 20: UpdateMilestone's audit row contains a real previous
+/// snapshot (the pre-update Milestone state).
+#[test]
+fn req_m20_update_milestone_audit_contains_previous_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone20.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Pre-update title", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            title: Some("Post-update title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM milestone_audit_log WHERE milestone_id = ?1 AND action_type = 'UpdateMilestone'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot = previous_snapshot
+        .expect("[req_m20] FAIL - UpdateMilestone audit row must have a previous_snapshot");
+    assert!(
+        snapshot.contains("Pre-update title"),
+        "[req_m20] FAIL - previous_snapshot does not contain the pre-update title, got {snapshot}"
+    );
+    println!("[req_m20] PASS - UpdateMilestone audit row's previous_snapshot contains the pre-update state: {snapshot}");
+}
+
+/// Requirement 21: AddMilestone's milestone-insert + audit-insert are one
+/// atomic transaction - same forced-failure proof as Goal/Project/
+/// GoalRelation hardening.
+#[test]
+fn req_m21_add_milestone_audit_failure_rolls_back_milestone_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone21.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    install_milestone_audit_failure_trigger(&conn);
+
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Should never persist", 0),
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_m21] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_m21] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    assert_eq!(
+        milestone_row_count(&conn),
+        0,
+        "[req_m21] FAIL - a milestone row survived a rolled-back transaction"
+    );
+    assert_eq!(
+        milestone_audit_row_count(&conn),
+        0,
+        "[req_m21] FAIL - an audit row survived a rolled-back transaction"
+    );
+
+    remove_milestone_audit_failure_trigger(&conn);
+
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Now it works", 0),
+    ) {
+        ActionOutcome::Success { .. } => {
+            println!("[req_m21] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[req_m21] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Requirement 22: UpdateMilestone's milestone-update + audit-insert are
+/// one atomic transaction.
+#[test]
+fn req_m22_update_milestone_audit_failure_rolls_back_milestone_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone22.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Stable", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_milestone(&conn, created.id).unwrap().unwrap();
+
+    install_milestone_audit_failure_trigger(&conn);
+
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            title: Some("Should not persist".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_m22] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_m22] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_milestone_audit_failure_trigger(&conn);
+
+    let after = get_milestone(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_m22] FAIL - milestone mutated despite a rolled-back transaction"
+    );
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM milestone_audit_log WHERE milestone_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 1,
+        "[req_m22] FAIL - expected exactly 1 audit row (the original AddMilestone), got {audit_count}"
+    );
+    println!(
+        "[req_m22] PASS - milestone left identical to its pre-update state, no orphan audit row"
+    );
+}
+
+/// Requirements 23 & 24: Inferred AddMilestone blocks before write, then
+/// a confirmed resubmission succeeds.
+#[test]
+fn req_m23_24_inferred_add_milestone_requires_confirmation_then_confirmed_resubmission_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone23.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let payload = mk_add_milestone_payload(project.id, "AI-proposed milestone", 0);
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match add_milestone(&mut conn, meta, payload.clone()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_m23] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        milestone_row_count(&conn),
+        0,
+        "[req_m23] FAIL - a milestone was written before confirmation"
+    );
+    println!(
+        "[req_m23] PASS - Inferred AddMilestone blocked with ConfirmationRequired, zero rows written"
+    );
+
+    let mut confirmed_meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    confirmed_meta.confirmed = true;
+    match add_milestone(&mut conn, confirmed_meta, payload) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(milestone_row_count(&conn), 1);
+            println!("[req_m24] PASS - resubmission with confirmed=true persisted the milestone");
+        }
+        other => {
+            panic!("[req_m24] FAIL - expected Success on confirmed resubmission, got {other:?}")
+        }
+    }
+}
+
+/// Requirement 25: Inferred UpdateMilestone blocks before write, zero
+/// mutation.
+#[test]
+fn req_m25_inferred_update_milestone_requires_confirmation_and_does_not_mutate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone25.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Stable title", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_milestone(&conn, created.id).unwrap().unwrap();
+
+    let payload = UpdateMilestonePayload {
+        id: created.id,
+        title: Some("AI-proposed rename".to_string()),
+        ..Default::default()
+    };
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match update_milestone(&mut conn, meta, payload) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_m25] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    let after = get_milestone(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_m25] FAIL - milestone mutated before confirmation"
+    );
+    println!(
+        "[req_m25] PASS - Inferred UpdateMilestone blocked with ConfirmationRequired, zero mutation"
+    );
+}
+
+/// Requirement 26: a direct, raw SQL insert naming a nonexistent
+/// `project_id` is rejected by SQLite's own FK enforcement - bypasses
+/// `AddMilestone` entirely, raw SQL kept local to this test.
+#[test]
+fn req_m26_raw_sql_invalid_project_fk_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone26.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new().to_string();
+    let milestone_id = crate::domain::MilestoneId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO milestones (id, project_id, title, target_date, status, order_index)
+         VALUES (?1, ?2, 'Bypasses AddMilestone validation', NULL, 'PENDING', 0)",
+        rusqlite::params![milestone_id, fake_project_id],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_m26] PASS - raw SQL insert with a nonexistent project_id rejected by FK: {err:?}"
+            );
+        }
+        other => panic!("[req_m26] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+    assert_eq!(milestone_row_count(&conn), 0);
+}
+
+/// Requirement 27: a direct, raw SQL duplicate `(project_id,
+/// order_index)` insert is rejected by the `UNIQUE` constraint.
+#[test]
+fn req_m27_raw_sql_duplicate_order_index_rejected_by_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone27.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Slot 0", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let milestone_id = crate::domain::MilestoneId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO milestones (id, project_id, title, target_date, status, order_index)
+         VALUES (?1, ?2, 'Duplicate slot', NULL, 'PENDING', 0)",
+        rusqlite::params![milestone_id, project.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_m27] PASS - raw SQL duplicate (project_id, order_index) insert rejected by UNIQUE: {err:?}");
+        }
+        other => {
+            panic!("[req_m27] FAIL - expected an SQLite UNIQUE constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(milestone_row_count(&conn), 1);
+}
+
+/// Requirement 28: a direct, raw SQL insert with an invalid `status` text
+/// is rejected by the `CHECK` constraint.
+#[test]
+fn req_m28_raw_sql_invalid_status_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone28.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let milestone_id = crate::domain::MilestoneId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO milestones (id, project_id, title, target_date, status, order_index)
+         VALUES (?1, ?2, 'Invalid status', NULL, 'IN_PROGRESS', 0)",
+        rusqlite::params![milestone_id, project.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_m28] PASS - raw SQL insert with an invalid status rejected by CHECK: {err:?}"
+            );
+        }
+        other => {
+            panic!("[req_m28] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(milestone_row_count(&conn), 0);
+}
+
+/// Requirement 29: a direct, raw SQL insert with an empty (post-trim)
+/// title is rejected by the `CHECK` constraint.
+#[test]
+fn req_m29_raw_sql_empty_title_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone29.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let milestone_id = crate::domain::MilestoneId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO milestones (id, project_id, title, target_date, status, order_index)
+         VALUES (?1, ?2, '   ', NULL, 'PENDING', 0)",
+        rusqlite::params![milestone_id, project.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_m29] PASS - raw SQL insert with a whitespace-only title rejected by CHECK: {err:?}"
+            );
+        }
+        other => {
+            panic!("[req_m29] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(milestone_row_count(&conn), 0);
+}
+
+/// Requirement 30: a direct, raw SQL hard delete of a Project referenced
+/// by a Milestone is rejected by `ON DELETE RESTRICT`.
+#[test]
+fn req_m30_raw_hard_delete_of_referenced_project_is_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone30.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Referenced project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Keeps the project alive", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let result = conn.execute(
+        "DELETE FROM projects WHERE id = ?1",
+        rusqlite::params![project.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_m30] PASS - raw DELETE of a Project referenced by a Milestone rejected by ON DELETE RESTRICT: {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_m30] FAIL - expected an SQLite FK constraint error blocking the delete, got {other:?}"
+        ),
+    }
+
+    let project_still_exists = get_project(&conn, project.id).unwrap();
+    assert!(
+        project_still_exists.is_some(),
+        "[req_m30] FAIL - Project was deleted despite the RESTRICT constraint"
+    );
+    assert_eq!(
+        milestone_row_count(&conn),
+        1,
+        "[req_m30] FAIL - milestone row disappeared despite the delete being rejected"
+    );
+    println!("[req_m30] PASS - Project remains, and the milestone remains - no dangling milestone exists");
+}
+
+/// Requirement 31: `get_milestones_for_project` returns milestones
+/// ordered deterministically by `order_index ASC`.
+#[test]
+fn req_m31_get_milestones_for_project_returns_order_index_ascending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "milestone31.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // Deliberately inserted out of order.
+    let third = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Third", 2),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let first = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "First", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let second = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Second", 1),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let milestones = get_milestones_for_project(&conn, project.id).unwrap();
+    assert_eq!(milestones.len(), 3);
+    assert_eq!(
+        milestones.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![first.id, second.id, third.id],
+        "[req_m31] FAIL - expected order_index ASC ordering (First, Second, Third)"
+    );
+    println!("[req_m31] PASS - get_milestones_for_project returned milestones ordered by order_index ASC, independent of insertion order");
 }

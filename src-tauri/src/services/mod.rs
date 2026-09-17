@@ -18,13 +18,14 @@
 mod storage;
 
 use crate::actions::{
-    blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, ConfirmationClass,
-    CreateGoalPayload, CreateProjectPayload, FieldPatch, LinkGoalsPayload, UpdateGoalPayload,
-    UpdateProgressPayload, ValidationError,
+    blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMilestonePayload,
+    ConfirmationClass, CreateGoalPayload, CreateProjectPayload, FieldPatch, LinkGoalsPayload,
+    UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload, ValidationError,
 };
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Project, ProjectId,
+    Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
+    MilestoneStatus, Project, ProjectId,
 };
 use crate::security;
 use rusqlite::Connection;
@@ -631,6 +632,229 @@ pub(crate) fn get_goal_relations_for_goal(
     goal_id: GoalId,
 ) -> Result<Vec<GoalRelation>, rusqlite::Error> {
     storage::goal_relation_repo::get_goal_relations_for_goal(conn, goal_id)
+}
+
+// --- Milestone (M2 Milestone vertical slice, 2026-09-17) ----------------
+//
+// The fourth real M2 domain entity, and the first required-parent child
+// entity - `milestones.project_id REFERENCES projects(id) ON DELETE
+// RESTRICT` (Project has no hard DeleteProject action; a Milestone must
+// never silently disappear if one is ever added, same reasoning as
+// GoalRelation's endpoints). Only `AddMilestone`/`UpdateMilestone` are
+// implemented - Task is explicitly out of scope for this slice. Same
+// atomic-mutation-plus-audit, typed-`CoreError` pattern as every entity
+// above - see
+// `docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
+
+/// `AddMilestone`'s confirmation floor is `EXPLICIT_ADD` per the
+/// architecture-freeze report §F's confirmation table. Validation order
+/// is pure-first (`validate_add_milestone` - title, order_index bounds)
+/// before any database read; then `project_id` existence, then
+/// `(project_id, order_index)` occupancy - each a real database read,
+/// reported through the same deterministic `ValidationFailed` channel as
+/// the structural checks rather than left to SQLite's FK/UNIQUE
+/// constraints to catch first (those constraints are still real and
+/// enforced - see `migrations/V4__create_milestones.sql` - this is the
+/// friendlier first line of defense, the same relationship
+/// `create_project`'s `ReferencedGoalNotFound` check has with the FK
+/// constraint on `projects.goal_id`). `status` is never taken from the
+/// payload - a new Milestone always starts `PENDING`.
+pub(crate) fn add_milestone(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: AddMilestonePayload,
+) -> ActionOutcome<Milestone> {
+    let normalized_title = match crate::actions::validate_add_milestone(&payload) {
+        Ok(t) => t,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    match storage::project_repo::project_exists(conn, payload.project_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ActionOutcome::ValidationFailed(vec![
+                ValidationError::ReferencedProjectNotFound,
+            ]);
+        }
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    }
+    match storage::milestone_repo::order_index_taken(
+        conn,
+        payload.project_id,
+        payload.order_index,
+        None,
+    ) {
+        Ok(false) => {}
+        Ok(true) => {
+            return ActionOutcome::ValidationFailed(vec![
+                ValidationError::DuplicateMilestoneOrderIndex,
+            ]);
+        }
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let milestone = Milestone {
+        id: MilestoneId::new(),
+        project_id: payload.project_id,
+        title: normalized_title,
+        target_date: payload.target_date,
+        status: MilestoneStatus::Pending,
+        order_index: payload.order_index,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::milestone_repo::insert_milestone(&tx, &milestone) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::milestone_repo::insert_audit_entry(
+        &tx,
+        milestone.id,
+        "AddMilestone",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        meta.requested_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: milestone,
+        confirmation_class: class,
+    }
+}
+
+/// `UpdateMilestone`'s confirmation floor is also `EXPLICIT_ADD` - the
+/// frozen floor from the M2 Project Child Action Freeze report, not
+/// `IMPORTANT_CHANGE` like `UpdateGoal` (do not invent a stricter floor
+/// than frozen). If `payload.order_index` is `Some` and differs from the
+/// existing Milestone's current value, the target slot must not already
+/// belong to a DIFFERENT Milestone in the SAME Project - checked via
+/// `order_index_taken`'s `exclude_id`, so the Milestone keeping its own
+/// current index is never reported as a conflict with itself.
+pub(crate) fn update_milestone(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: UpdateMilestonePayload,
+) -> ActionOutcome<Milestone> {
+    let existing = match storage::milestone_repo::get_milestone(conn, payload.id) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(errors) = crate::actions::validate_update_milestone(&existing, &payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    if let Some(order_index) = payload.order_index {
+        if order_index != existing.order_index {
+            match storage::milestone_repo::order_index_taken(
+                conn,
+                existing.project_id,
+                order_index,
+                Some(existing.id),
+            ) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return ActionOutcome::ValidationFailed(vec![
+                        ValidationError::DuplicateMilestoneOrderIndex,
+                    ]);
+                }
+                Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+            }
+        }
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let previous_snapshot = serde_json::to_string(&existing).ok();
+
+    let mut updated = existing;
+    if let Some(title) = payload.title {
+        updated.title = title.trim().to_string();
+    }
+    match payload.target_date {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(target_date) => updated.target_date = Some(target_date),
+        FieldPatch::Clear => updated.target_date = None,
+    }
+    if let Some(status) = payload.status {
+        updated.status = status;
+    }
+    if let Some(order_index) = payload.order_index {
+        updated.order_index = order_index;
+    }
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::milestone_repo::update_milestone(&tx, &updated) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::milestone_repo::insert_audit_entry(
+        &tx,
+        updated.id,
+        "UpdateMilestone",
+        meta.actor,
+        meta.provenance,
+        class,
+        previous_snapshot.as_deref(),
+        meta.requested_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: updated,
+        confirmation_class: class,
+    }
+}
+
+/// Narrow internal read, same reasoning as `get_goal`/`get_project`.
+pub(crate) fn get_milestone(
+    conn: &Connection,
+    id: MilestoneId,
+) -> Result<Option<Milestone>, rusqlite::Error> {
+    storage::milestone_repo::get_milestone(conn, id)
+}
+
+/// Deterministic `ORDER BY order_index ASC` read - unambiguous since
+/// `(project_id, order_index)` is UNIQUE.
+pub(crate) fn get_milestones_for_project(
+    conn: &Connection,
+    project_id: ProjectId,
+) -> Result<Vec<Milestone>, rusqlite::Error> {
+    storage::milestone_repo::get_milestones_for_project(conn, project_id)
 }
 
 #[cfg(test)]

@@ -489,3 +489,245 @@ fn link_goals_inferred_provenance_becomes_inferred_change() {
     );
     assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
 }
+
+// =========================================================================
+// Milestone / AddMilestone / UpdateMilestone (M2 Milestone vertical
+// slice, 2026-09-17) - direct unit tests. `MilestoneStatus`'s string
+// mappings/parse round trips live in `domain::tests` (pure domain-type
+// concern, same precedent as `LifecycleStatus`/`GoalRelationType`) - not
+// duplicated here. `project_id` existence and `(project_id, order_index)`
+// occupancy both need a database read and are proven in
+// `services::tests` instead.
+// =========================================================================
+
+fn base_milestone(project_id: ProjectId, status: MilestoneStatus) -> Milestone {
+    Milestone {
+        id: MilestoneId::new(),
+        project_id,
+        title: "Base milestone".to_string(),
+        target_date: None,
+        status,
+        order_index: 0,
+    }
+}
+
+fn base_add_milestone_payload() -> AddMilestonePayload {
+    AddMilestonePayload {
+        project_id: ProjectId::new(),
+        title: "Valid milestone title".to_string(),
+        target_date: None,
+        order_index: 0,
+    }
+}
+
+#[test]
+fn add_milestone_title_is_trimmed() {
+    let payload = AddMilestonePayload {
+        title: "  Ship v1  ".to_string(),
+        ..base_add_milestone_payload()
+    };
+    let title = validate_add_milestone(&payload).expect("should validate");
+    assert_eq!(title, "Ship v1");
+}
+
+#[test]
+fn add_milestone_rejects_empty_title() {
+    for bad in ["", "   ", "\t\n"] {
+        let payload = AddMilestonePayload {
+            title: bad.to_string(),
+            ..base_add_milestone_payload()
+        };
+        let errors = validate_add_milestone(&payload).expect_err("empty title must be rejected");
+        assert!(
+            errors.contains(&ValidationError::EmptyTitle),
+            "expected EmptyTitle for {bad:?}, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn add_milestone_rejects_title_too_long() {
+    let payload = AddMilestonePayload {
+        title: "x".repeat(TITLE_MAX_LEN + 1),
+        ..base_add_milestone_payload()
+    };
+    let errors = validate_add_milestone(&payload).expect_err("overlong title must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TitleTooLong { .. })),
+        "expected TitleTooLong, got {errors:?}"
+    );
+}
+
+#[test]
+fn add_milestone_rejects_negative_order_index() {
+    let payload = AddMilestonePayload {
+        order_index: ORDER_INDEX_MIN - 1,
+        ..base_add_milestone_payload()
+    };
+    let errors =
+        validate_add_milestone(&payload).expect_err("negative order_index must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::OrderIndexOutOfBounds { .. })),
+        "expected OrderIndexOutOfBounds, got {errors:?}"
+    );
+}
+
+#[test]
+fn add_milestone_accepts_min_order_index() {
+    let payload = AddMilestonePayload {
+        order_index: ORDER_INDEX_MIN,
+        ..base_add_milestone_payload()
+    };
+    assert!(validate_add_milestone(&payload).is_ok());
+}
+
+#[test]
+fn add_milestone_explicit_provenance_is_explicit_add() {
+    // Architecture-freeze report §F confirmation table lists
+    // AddMilestone under EXPLICIT_ADD.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
+}
+
+#[test]
+fn add_milestone_inferred_provenance_becomes_inferred_change() {
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}
+
+// --- UpdateMilestone validation -----------------------------------------
+
+#[test]
+fn update_milestone_rejects_when_no_fields_touched() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        ..Default::default()
+    };
+    let errors =
+        validate_update_milestone(&existing, &payload).expect_err("no-op update must be rejected");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_milestone_field_patch_unchanged_alone_is_not_a_touch() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        target_date: FieldPatch::Unchanged,
+        ..Default::default()
+    };
+    let errors = validate_update_milestone(&existing, &payload)
+        .expect_err("all-Unchanged update must be rejected as touching nothing");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_milestone_title_some_invalid_is_rejected() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        title: Some("   ".to_string()),
+        ..Default::default()
+    };
+    let errors = validate_update_milestone(&existing, &payload)
+        .expect_err("empty Some(title) must be rejected");
+    assert!(errors.contains(&ValidationError::EmptyTitle));
+}
+
+#[test]
+fn update_milestone_target_date_set_alone_is_valid() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        target_date: FieldPatch::Set(Utc::now()),
+        ..Default::default()
+    };
+    assert!(validate_update_milestone(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_milestone_target_date_clear_alone_is_valid() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        target_date: FieldPatch::Clear,
+        ..Default::default()
+    };
+    assert!(validate_update_milestone(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_milestone_status_pending_to_done_is_valid() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        status: Some(MilestoneStatus::Done),
+        ..Default::default()
+    };
+    assert!(
+        validate_update_milestone(&existing, &payload).is_ok(),
+        "PENDING -> DONE must be allowed"
+    );
+}
+
+#[test]
+fn update_milestone_status_done_to_pending_is_valid() {
+    // No terminal-state rule: PENDING/DONE are freely reversible peer
+    // states (M2 Project Child Action Freeze report §5).
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Done);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        status: Some(MilestoneStatus::Pending),
+        ..Default::default()
+    };
+    assert!(
+        validate_update_milestone(&existing, &payload).is_ok(),
+        "DONE -> PENDING must be allowed - no terminal-state rule is frozen"
+    );
+}
+
+#[test]
+fn update_milestone_rejects_negative_order_index() {
+    let existing = base_milestone(ProjectId::new(), MilestoneStatus::Pending);
+    let payload = UpdateMilestonePayload {
+        id: existing.id,
+        order_index: Some(ORDER_INDEX_MIN - 1),
+        ..Default::default()
+    };
+    let errors = validate_update_milestone(&existing, &payload)
+        .expect_err("negative order_index must be rejected");
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::OrderIndexOutOfBounds { .. })));
+}
+
+#[test]
+fn update_milestone_explicit_provenance_is_explicit_add() {
+    // Frozen floor (M2 Project Child Action Freeze report) - do not
+    // invent an IMPORTANT_CHANGE floor for UpdateMilestone.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
+}
+
+#[test]
+fn update_milestone_inferred_provenance_becomes_inferred_change() {
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}

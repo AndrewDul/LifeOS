@@ -18,9 +18,9 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, GoalRelationType, LifecycleStatus, Priority, Progress, ProjectId,
-    DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX,
-    PROGRESS_MIN, TITLE_MAX_LEN,
+    Goal, GoalId, GoalRelationType, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
+    OrderIndex, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN,
+    ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -226,6 +226,30 @@ pub(crate) enum ValidationError {
     /// 2026-09-17). A different `relation_type` for the same pair, or
     /// the same type in the reverse direction, is NOT a duplicate.
     DuplicateGoalRelation,
+    /// `AddMilestone`'s `project_id` does not reference an existing
+    /// `Project` - needs a database read, so `services::add_milestone`
+    /// performs the check and reports it here, the same relationship
+    /// `create_project`'s `ReferencedGoalNotFound` has with the FK
+    /// constraint on `projects.goal_id` (M2 Milestone vertical slice,
+    /// 2026-09-17).
+    ReferencedProjectNotFound,
+    /// A `Milestone`'s `order_index` is negative - the one canonical
+    /// numeric bound `OrderIndex` has (`domain::ORDER_INDEX_MIN`); no
+    /// upper bound is invented (M2 Milestone vertical-slice report §3).
+    OrderIndexOutOfBounds {
+        min: OrderIndex,
+        actual: OrderIndex,
+    },
+    /// `AddMilestone`/`UpdateMilestone` requested an `order_index`
+    /// already occupied by another `Milestone` within the same
+    /// `Project` - needs a database read, checked before persistence
+    /// rather than left to the SQL `UNIQUE(project_id, order_index)`
+    /// constraint to catch first (M2 Milestone vertical-slice report
+    /// §9, resolving the M2 Project Child Action Freeze report's open
+    /// question). A different Project reusing the same `order_index` is
+    /// NOT a duplicate; a `Milestone` being updated keeping its own
+    /// current `order_index` is NOT a duplicate either.
+    DuplicateMilestoneOrderIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +551,131 @@ pub(crate) fn validate_link_goals(payload: &LinkGoalsPayload) -> Result<(), Vec<
             errors.push(e);
         }
     }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+// --- Milestone (M2 Milestone vertical slice, 2026-09-17) ----------------
+//
+// The frozen M2 action set for Milestone is AddMilestone/UpdateMilestone
+// only - Task is explicitly out of scope for this slice. Both actions
+// have an `EXPLICIT_ADD` confirmation floor (architecture-freeze report
+// §F) - do not invent an `IMPORTANT_CHANGE` floor for `UpdateMilestone`.
+//
+// Patch-semantics correction (2026-09-17, this report's own §2, applied
+// here directly rather than repeating the freeze report's original
+// mistake): `title`/`status`/`order_index` are non-nullable `Milestone`
+// fields, so a plain `Option` is correct for them (`Some(x)` sets,
+// `None` leaves unchanged) - `FieldPatch` would offer a meaningless
+// `Clear` state no non-nullable field can use. `target_date` is
+// `Milestone`'s one genuinely nullable field and uses `FieldPatch` so
+// "leave unchanged" and "explicitly clear to NULL" stay distinct.
+
+fn validate_order_index(order_index: OrderIndex) -> Result<(), ValidationError> {
+    if order_index < ORDER_INDEX_MIN {
+        return Err(ValidationError::OrderIndexOutOfBounds {
+            min: ORDER_INDEX_MIN,
+            actual: order_index,
+        });
+    }
+    Ok(())
+}
+
+/// `AddMilestone` payload. `status` is deliberately absent - a new
+/// Milestone always starts `PENDING` (M2 Milestone vertical-slice
+/// report §5); completion happens only through `UpdateMilestone`.
+/// `project_id` existence and `(project_id, order_index)` occupancy both
+/// need a database read, so neither can happen in this pure module -
+/// `services::add_milestone` performs them.
+#[derive(Debug, Clone)]
+pub(crate) struct AddMilestonePayload {
+    pub project_id: ProjectId,
+    pub title: String,
+    pub target_date: Option<DateTime<Utc>>,
+    pub order_index: OrderIndex,
+}
+
+/// `UpdateMilestone` payload - see the patch-semantics note above for
+/// why `title`/`status`/`order_index` are plain `Option` while
+/// `target_date` is `FieldPatch`. Whether a changed `order_index`
+/// collides with another Milestone in the same Project needs a database
+/// read (`services::update_milestone`), as does `Milestone` existence
+/// itself.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UpdateMilestonePayload {
+    pub id: MilestoneId,
+    pub title: Option<String>,
+    pub target_date: FieldPatch<DateTime<Utc>>,
+    pub status: Option<MilestoneStatus>,
+    pub order_index: Option<OrderIndex>,
+}
+
+/// Returns the normalized (trimmed) title on success, mirroring
+/// `validate_create_goal`/`validate_create_project`. Deliberately does
+/// **not** check `project_id` existence or `order_index` occupancy -
+/// pure logic, no I/O; see `AddMilestonePayload`'s doc.
+pub(crate) fn validate_add_milestone(
+    payload: &AddMilestonePayload,
+) -> Result<String, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    let mut normalized_title = None;
+
+    match validate_title(&payload.title) {
+        Ok(t) => normalized_title = Some(t),
+        Err(e) => errors.push(e),
+    }
+    if let Err(e) = validate_order_index(payload.order_index) {
+        errors.push(e);
+    }
+
+    if errors.is_empty() {
+        Ok(normalized_title.expect("title validated Ok implies normalized_title is Some"))
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validates an update against the *existing* Milestone - `existing` is
+/// taken for the same shape-consistency reason `validate_update_goal`
+/// takes it, though no field here actually needs prior state to
+/// validate. No status-transition restriction: `PENDING`/`DONE` are
+/// freely reversible peer states (M2 Project Child Action Freeze report
+/// §5 / Milestone vertical-slice report §13) - do not add one. Does
+/// **not** check whether a changed `order_index` collides with another
+/// Milestone - needs a database read; `services::update_milestone`
+/// performs it.
+pub(crate) fn validate_update_milestone(
+    existing: &Milestone,
+    payload: &UpdateMilestonePayload,
+) -> Result<(), Vec<ValidationError>> {
+    let _ = existing; // reserved for shape-consistency with validate_update_goal
+    let mut errors = Vec::new();
+
+    let touches_any_field = payload.title.is_some()
+        || !payload.target_date.is_unchanged()
+        || payload.status.is_some()
+        || payload.order_index.is_some();
+    if !touches_any_field {
+        errors.push(ValidationError::NoFieldsToUpdate);
+    }
+
+    if let Some(title) = &payload.title {
+        if let Err(e) = validate_title(title) {
+            errors.push(e);
+        }
+    }
+    if let Some(order_index) = payload.order_index {
+        if let Err(e) = validate_order_index(order_index) {
+            errors.push(e);
+        }
+    }
+    // No target_date-specific validation: same as Goal.target_date, a
+    // typed DateTime<Utc> has nothing further this pure layer checks.
+    // No status-transition check: PENDING <-> DONE is always allowed.
 
     if errors.is_empty() {
         Ok(())

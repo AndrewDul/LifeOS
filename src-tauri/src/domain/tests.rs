@@ -102,3 +102,35 @@ fn goal_relation_type_parse_rejects_unknown_text() {
     assert_eq!(GoalRelationType::parse("supports"), None); // case-sensitive
     assert_eq!(GoalRelationType::parse("PARENTOF"), None); // no missing underscore
 }
+
+// =========================================================================
+// MilestoneStatus (M2 Milestone vertical slice, 2026-09-17) - the
+// frozen, closed 2-value enum. Not LifecycleStatus - a genuinely
+// different value set, see the type's own doc comment.
+// =========================================================================
+
+#[test]
+fn milestone_status_as_str_matches_frozen_db_text_values() {
+    assert_eq!(MilestoneStatus::Pending.as_str(), "PENDING");
+    assert_eq!(MilestoneStatus::Done.as_str(), "DONE");
+}
+
+#[test]
+fn milestone_status_parse_round_trips_through_as_str() {
+    for status in [MilestoneStatus::Pending, MilestoneStatus::Done] {
+        let text = status.as_str();
+        assert_eq!(
+            MilestoneStatus::parse(text),
+            Some(status),
+            "round trip through {text:?} did not return {status:?}"
+        );
+    }
+}
+
+#[test]
+fn milestone_status_parse_rejects_unknown_text() {
+    assert_eq!(MilestoneStatus::parse("SOMETHING_ELSE"), None);
+    assert_eq!(MilestoneStatus::parse(""), None);
+    assert_eq!(MilestoneStatus::parse("pending"), None); // case-sensitive
+    assert_eq!(MilestoneStatus::parse("ACTIVE"), None); // not a LifecycleStatus value
+}

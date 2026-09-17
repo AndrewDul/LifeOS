@@ -178,6 +178,16 @@ this field."
 `Project.progress` is deliberately **absent** from `UpdateProjectPayload`
 - `UpdateProgress` already owns that mutation exclusively (§3).
 
+**Correction note (2026-09-17, M2 Milestone vertical-slice report §2):**
+this section's own conceptual shapes above were already correct
+(`title`/`order_index` as plain `Option<T>`, only `target_date` as
+`FieldPatch<T>`), but `docs/LIFEOS_SPEC.md`'s separate summary prose for
+`UpdateMilestone`/`UpdateTask` (§5.1) had drifted from this section and
+incorrectly described `title`/`order_index` (and `Task.title`) as
+`FieldPatch<T>` too - non-nullable fields with no meaningful `Clear`
+state. Fixed in `LIFEOS_SPEC.md` before Milestone implementation began,
+to match the canonical rule stated here.
+
 ---
 
 ## 7. Confirmation floors
@@ -339,6 +349,12 @@ invention this whole run exists to prevent. Recorded as an open question
 in `LIFEOS_SPEC.md` §13 and `PROJECT_STATE.md` §10 - **must be resolved
 as part of the `Milestone` vertical slice itself**, deliberately, not
 before and not silently deferred past that slice either.
+
+**Resolved (2026-09-17, M2 Milestone vertical-slice report §3), exactly
+as anticipated above:** `(project_id, order_index)` must be unique;
+different Projects may reuse the same values; no automatic renumbering
+was implemented. See `docs/LIFEOS_SPEC.md` §5.1/§13 for the canonical
+statement.
 
 ---
 

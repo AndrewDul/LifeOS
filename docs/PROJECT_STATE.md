@@ -5,15 +5,14 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 Project Child Action Freeze — a
-documentation-only architecture/action-set clarification pass:
-`UpdateProject` frozen (closing the previously-open Project action-set
-gap), and `UpdateMilestone`/`UpdateTask` frozen pre-emptively before
-either entity is implemented, so their vertical slices have an
-unambiguous target. Zero source-code changes. On top of the same day's
-Goal vertical slice/storage hardening, Goal hardening pass, Project
-vertical slice, Project/storage integrity hardening, and GoalRelation
-vertical slice).
+Last updated: 2026-09-17 (M2 Milestone vertical slice — the fourth real
+domain entity, and the first required-parent child entity:
+`AddMilestone`/`UpdateMilestone` implemented end to end, `Milestone`
+order_index uniqueness resolved, a patch-semantics documentation
+correction applied. On top of the same day's Goal vertical slice/storage
+hardening, Goal hardening pass, Project vertical slice, Project/storage
+integrity hardening, GoalRelation vertical slice, and Project Child
+Action Freeze pass).
 
 ---
 
@@ -23,15 +22,15 @@ vertical slice).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, and GoalRelation (the first relationship graph) all implemented** 2026-09-17 (§4); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, and Milestone (the first required-parent child entity) all implemented** 2026-09-17 (§4); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
 
-**M2 now has three real, working, tested domain entities: Goal,
-Project, and GoalRelation**, end to end through
+**M2 now has four real, working, tested domain entities: Goal,
+Project, GoalRelation, and Milestone**, end to end through
 `domain → actions → services → private services/storage → encrypted
-SQLCipher`. Six runs on 2026-09-17 built this: the Goal vertical slice
+SQLCipher`. Seven runs on 2026-09-17 built this: the Goal vertical slice
 (storage foundation hardening + Goal implemented), a dedicated Goal
 hardening pass (fixed 7 issues before the pattern was reused), the
 **Project vertical slice** (second entity, built directly with the
@@ -42,13 +41,15 @@ action-set gap documented), the **GoalRelation vertical slice** (third
 entity, the first true relationship-graph structure - two foreign keys
 into `goals`, a frozen 11-value relation-type enum, the `LinkGoals`
 action - built directly with the twice-hardened pattern, no separate
-hardening pass needed), and a sixth, **documentation-only Project
-Child Action Freeze pass** (`UpdateProject` frozen, closing the
-Project action-set gap; `UpdateMilestone`/`UpdateTask` frozen
-pre-emptively before either entity exists in code). See §4b-§4h. Next
-step is the `Milestone` vertical slice (frozen order, §4g/§4h) - not
-`Task` first, not the rest of the domain model at once, and still not
-M3.
+hardening pass needed), a **documentation-only Project Child Action
+Freeze pass** (`UpdateProject` frozen, closing the Project action-set
+gap; `UpdateMilestone`/`UpdateTask` frozen pre-emptively before either
+entity exists in code), and the **Milestone vertical slice** (fourth
+entity, the first required-parent child entity - `AddMilestone`/
+`UpdateMilestone`, `(project_id, order_index)` UNIQUE resolved, built
+directly with the pattern - no separate hardening pass needed). See
+§4b-§4i. Next step is the `Task` vertical slice (frozen order, §4h/§4i)
+- not the rest of the domain model at once, and still not M3.
 
 ---
 
@@ -56,7 +57,7 @@ M3.
 
 A Tauri 2 + React + TypeScript desktop app that launches in a real
 window (accepted M1 shell, untouched), plus a working, hardened
-encrypted store for three domain entities:
+encrypted store for four domain entities:
 
 - **Goal**: create and update goals with deterministic validation,
   atomic mutation+audit transactions, tri-state patch semantics
@@ -78,21 +79,41 @@ encrypted store for three domain entities:
   persistence, same atomic-transaction/typed-error discipline, its own
   `goal_relation_audit_log`, and a narrow read API
   (`get_goal_relation(id)`/`get_goal_relations_for_goal(goal_id)`).
+- **Milestone**: add a Milestone to an existing Project via
+  `AddMilestone` (always defaults to `status = PENDING`; `project_id`
+  validated to actually exist before persistence; `order_index`
+  validated non-negative and not already occupied within the same
+  Project) and edit it via `UpdateMilestone` (`title`/`status`/
+  `order_index` plain `Option<T>`, `target_date` the one genuinely
+  nullable field using `FieldPatch<T>` - the first entity to apply the
+  corrected patch-semantics rule, §4i) - the first *required-parent*
+  child entity (`milestones.project_id REFERENCES projects(id) ON
+  DELETE RESTRICT`, non-nullable). `PENDING`/`DONE` are freely
+  reversible peer states, no terminal-state rule. `(project_id,
+  order_index)` is UNIQUE (different Projects may freely reuse the same
+  values), enforced both at the Core validation layer and by a real SQL
+  `UNIQUE` constraint. Same atomic-transaction/typed-error discipline,
+  its own `milestone_audit_log`, and a narrow read API
+  (`get_milestone(id)`/`get_milestones_for_project(project_id)`,
+  deterministic `ORDER BY order_index ASC`).
 
-All three are backed by a database that genuinely enforces referential
+All four are backed by a database that genuinely enforces referential
 integrity at the SQLite level (`PRAGMA foreign_keys = ON`, set on every
 connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-104 automated tests prove all of this (9 storage-spike regression, 17
+148 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
 GoalRelation integration, 5 direct `LinkGoals` action-layer unit, 3
-direct `GoalRelationType` unit). **Not wired into the running app yet** -
-no Tauri command layer exists, so the UI cannot create/see real goals,
-projects, or relations yet.
+direct `GoalRelationType` unit, 24 Milestone integration covering 32
+numbered requirements, 17 direct Milestone/`AddMilestone`/
+`UpdateMilestone` action-layer unit, 3 direct `MilestoneStatus` unit).
+**Not wired into the running app yet** - no Tauri command layer exists,
+so the UI cannot create/see real goals, projects, relations, or
+milestones yet.
 
 Repository contents as of this run:
 
@@ -112,54 +133,69 @@ LiFeOS/
 │                    REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md
 │                    REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md
 │                    REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md
+│                    REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md
+│                    REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
     ├── migrations/V1__create_goals.sql          (PRODUCTION schema - Goal only, untouched)
     │              V2__create_projects.sql        (PRODUCTION schema - Project only, untouched)
-    │              V3__create_goal_relations.sql  (PRODUCTION schema - GoalRelation only, new)
+    │              V3__create_goal_relations.sql  (PRODUCTION schema - GoalRelation only, untouched)
+    │              V4__create_milestones.sql      (PRODUCTION schema - Milestone only, new)
     ├── src/
     │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 modules, all private)
     │   ├── core_error.rs          CoreError/CoreErrorKind - typed Core-boundary error model
     │   │                          (Storage/Migration/Security/Internal)
     │   ├── domain/
     │   │   ├── mod.rs              Goal, GoalId, Project, ProjectId, GoalRelation,
-    │   │   │                       GoalRelationId (all UUID v7), LifecycleStatus (shared
-    │   │   │                       by Goal.status/Project.status), GoalRelationType (new -
-    │   │   │                       frozen closed 11-value enum, NOT the same thing as the
-    │   │   │                       Personal Knowledge Layer's separate free-string
-    │   │   │                       Relation.relation_type), Progress, Priority (shared)
-    │   │   └── tests.rs             6 round-trip unit tests (3 LifecycleStatus, 3 new
-    │   │                            GoalRelationType - all 11 values/parse round trips)
+    │   │   │                       GoalRelationId, Milestone, MilestoneId (new, all UUID
+    │   │   │                       v7), LifecycleStatus (shared by Goal.status/
+    │   │   │                       Project.status), GoalRelationType (frozen closed
+    │   │   │                       11-value enum, NOT the same thing as the Personal
+    │   │   │                       Knowledge Layer's separate free-string
+    │   │   │                       Relation.relation_type), MilestoneStatus (new -
+    │   │   │                       frozen closed 2-value enum, NOT LifecycleStatus),
+    │   │   │                       OrderIndex/ORDER_INDEX_MIN (new), Progress, Priority
+    │   │   │                       (shared)
+    │   │   └── tests.rs             9 round-trip unit tests (3 LifecycleStatus, 3
+    │   │                            GoalRelationType - all 11 values/parse round trips,
+    │   │                            3 new MilestoneStatus)
     │   ├── actions/
     │   │   ├── mod.rs              Actor, Provenance, ActionMeta, ConfirmationClass,
     │   │   │                       ActionOutcome<T>, ValidationError (+
     │   │   │                       ReferencedGoalNotFound, SelfGoalRelation,
     │   │   │                       RelationFromGoalNotFound, RelationToGoalNotFound,
-    │   │   │                       DuplicateGoalRelation, NoteTooLong), FieldPatch<T>,
+    │   │   │                       DuplicateGoalRelation, NoteTooLong,
+    │   │   │                       ReferencedProjectNotFound, OrderIndexOutOfBounds,
+    │   │   │                       DuplicateMilestoneOrderIndex - new), FieldPatch<T>,
     │   │   │                       CreateProjectPayload/UpdateProgressPayload/
-    │   │   │                       LinkGoalsPayload (new), blocks_until_confirmed
-    │   │   └── tests.rs             31 direct action-layer unit tests (16 Goal, 10
-    │   │                            Project, 5 new LinkGoals)
+    │   │   │                       LinkGoalsPayload/AddMilestonePayload/
+    │   │   │                       UpdateMilestonePayload (new), blocks_until_confirmed
+    │   │   └── tests.rs             48 direct action-layer unit tests (16 Goal, 10
+    │   │                            Project, 5 LinkGoals, 17 new AddMilestone/
+    │   │                            UpdateMilestone)
     │   ├── security/mod.rs        OS-keyring master-key lifecycle
     │   └── services/
     │       ├── mod.rs              bootstrap_production_db, create_goal/update_goal,
     │       │                       create_project/update_progress/get_project,
     │       │                       link_goals/get_goal_relation/
-    │       │                       get_goal_relations_for_goal (new) - all atomic
+    │       │                       get_goal_relations_for_goal, add_milestone/
+    │       │                       update_milestone/get_milestone/
+    │       │                       get_milestones_for_project (new) - all atomic
     │       │                       (&mut Connection + rusqlite transaction) - capability
     │       │                       API contract's names, no dedicated capability/
     │       │                       module yet (LIFEOS_SPEC.md §5.6/§10.1)
-    │       ├── tests.rs            58 integration test functions against a real
+    │       ├── tests.rs            82 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
-    │       │                       storage integrity, 23 new GoalRelation functions
-    │       │                       covering 26 numbered requirements - incl. 6
-    │       │                       forced-audit-failure/raw-SQL-FK-bypass proofs
-    │       │                       across all 3 entities, a V2-populated-database
-    │       │                       upgrades-to-V3 migration-compatibility test, 5
-    │       │                       raw-SQL DB-defense-in-depth proofs for
-    │       │                       GoalRelation's FK/CHECK/UNIQUE constraints, and a
-    │       │                       raw hard-DELETE RESTRICT proof)
+    │       │                       storage integrity, 23 GoalRelation functions covering
+    │       │                       26 numbered requirements, 24 new Milestone functions
+    │       │                       covering 32 numbered requirements - incl. 8
+    │       │                       forced-audit-failure/raw-SQL-FK-bypass proofs across
+    │       │                       all 4 entities, a V3-populated-database
+    │       │                       upgrades-to-V4 migration-compatibility test, 5 new
+    │       │                       raw-SQL DB-defense-in-depth proofs for Milestone's
+    │       │                       FK/UNIQUE/CHECK constraints, and a raw hard-DELETE
+    │       │                       RESTRICT proof for Project)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
@@ -168,13 +204,19 @@ LiFeOS/
     │           │                    since all go through this one primitive); also
     │           │                    hosts actor_str/provenance_str/
     │           │                    confirmation_class_str/parse_rfc3339 shared by all
-    │           │                    3 repo modules (not duplicated per-module)
-    │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services) - also now
-    │           │                    hosts goal_exists (moved from project_repo, now
-    │           │                    shared by project_repo AND goal_relation_repo)
-    │           ├── project_repo.rs  Project SQL access, pub(in crate::services)
+    │           │                    4 repo modules (not duplicated per-module)
+    │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services) - also
+    │           │                    hosts goal_exists (shared by project_repo AND
+    │           │                    goal_relation_repo)
+    │           ├── project_repo.rs  Project SQL access, pub(in crate::services) - also
+    │           │                    now hosts project_exists (new, shared by
+    │           │                    milestone_repo)
     │           ├── goal_relation_repo.rs  GoalRelation SQL access, pub(in
-    │           │                    crate::services) (new)
+    │           │                    crate::services)
+    │           ├── milestone_repo.rs  Milestone SQL access, pub(in crate::services)
+    │           │                    (new) - incl. order_index_taken, parameterized to
+    │           │                    optionally exclude a Milestone from its own
+    │           │                    occupancy check
     │           └── spike/           #[cfg(test)] only - old storage-spike suite, moved
     │               ├── mod.rs, tests.rs, migrations/V1__init.sql, V2__add_note_column.sql
     ├── Cargo.toml, Cargo.lock, tauri.conf.json, build.rs
@@ -634,9 +676,11 @@ did.
 - **Creation defaults frozen**: `AddMilestone` → `PENDING`, `AddTask` →
   `TODO`.
 - **`Milestone.order_index` uniqueness within a Project flagged as a
-  genuine OPEN QUESTION** (`docs/LIFEOS_SPEC.md` §13), not silently
-  decided either way - no existing document resolves it, and none was
-  invented here.
+  genuine OPEN QUESTION** (`docs/LIFEOS_SPEC.md` §13) at the time this
+  freeze pass was written - not silently decided either way. **Resolved
+  in the Milestone vertical slice itself (§4i, 2026-09-17): YES,
+  `(project_id, order_index)` must be unique; different Projects may
+  freely reuse the same values.**
 - **Next M2 implementation order frozen**: `Milestone` vertical slice,
   then `Task`, then reassess - `Milestone` is the smaller, single-parent
   entity and proves the parent-child FK/action pattern before `Task`'s
@@ -647,34 +691,109 @@ Full reasoning: `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.m
 
 ### 4h. What's still architecturally frozen but not yet implemented
 
-Personal Knowledge Layer, `Milestone`/`Task`/`Challenge`/`Plan`/
-`SolutionAttempt`/`Outcome`/`CalendarEvent`/`Reminder`/`Question`/
-`ProgressUpdate`/`WellbeingCheckin`, the rest of the frozen action list
-(`AddMilestone`/`AddTask` for Project - both still schema/code-
-unimplemented, though their sibling `UpdateMilestone`/`UpdateTask` are
-now action-set-frozen, §4g), `ForgetMemory`'s corrected (hard-delete)
-semantics, the `knowledge`/`backup` modules, a real `capability`
-module, NeXa transport. Full detail: `docs/LIFEOS_SPEC.md` §5.1-§5.6.
+Personal Knowledge Layer, `Task`/`Challenge`/`Plan`/`SolutionAttempt`/
+`Outcome`/`CalendarEvent`/`Reminder`/`Question`/`ProgressUpdate`/
+`WellbeingCheckin`, the rest of the frozen action list (`AddTask` for
+Project - still schema/code-unimplemented, though its sibling
+`UpdateTask` is already action-set-frozen, §4g; `AddMilestone`/
+`UpdateMilestone` are no longer in this list - implemented, §4i),
+`ForgetMemory`'s corrected (hard-delete) semantics, the `knowledge`/
+`backup` modules, a real `capability` module, NeXa transport. Full
+detail: `docs/LIFEOS_SPEC.md` §5.1-§5.6.
+
+### 4i. Milestone vertical slice implemented (2026-09-17)
+
+The fourth real domain entity - and the first *required-parent* child
+entity in production M2, built directly with the pattern (no separate
+hardening pass needed):
+
+- **Domain** (`domain::Milestone`): `id` (UUID v7, own `MilestoneId`
+  newtype), `project_id` (`ProjectId`, required), `title`,
+  `target_date` (nullable, same representation as `Goal.target_date`),
+  `status` (`MilestoneStatus` - frozen, closed 2-value `PENDING`/`DONE`
+  enum, deliberately NOT `LifecycleStatus`), `order_index` (`i64`,
+  non-negative). Deliberately excludes `created_at`/`updated_at` too -
+  a genuine exception, not an oversight: the frozen field table for
+  `Milestone` lists no timestamps at all, unlike `Task`'s own frozen
+  row (see the vertical-slice report §4 for the full reasoning).
+- **Patch-semantics documentation correction applied first** (report
+  §2): `LIFEOS_SPEC.md`'s prose had used `FieldPatch<T>` too broadly for
+  Milestone/Task's non-nullable fields. Canonical rule now written down:
+  `FieldPatch<T>` only for genuinely nullable fields (`target_date`);
+  plain `Option<T>` for non-nullable ones (`title`/`status`/
+  `order_index`) - `None` unchanged, `Some(x)` sets. Same rule now also
+  governs the still-unimplemented `UpdateProject`.
+- **`Milestone.order_index` uniqueness RESOLVED** (report §3, closing
+  the Project Child Action Freeze report's open question): `(project_id,
+  order_index)` must be UNIQUE within a Project; different Projects may
+  freely reuse the same values; no automatic shifting/rebalancing.
+  Enforced twice - a Core-level pre-check
+  (`order_index_taken`, excludable for the Milestone being updated) and
+  a real SQL `UNIQUE(project_id, order_index)` constraint, proven
+  independently with a raw-SQL bypass test.
+- **Actions**: `AddMilestone` (floor `EXPLICIT_ADD`; `status` not in
+  the payload - always defaults to `PENDING`; `project_id` validated to
+  exist, `order_index` validated non-negative and unoccupied, both
+  before persistence) and `UpdateMilestone` (floor `EXPLICIT_ADD`, the
+  frozen floor - NOT `IMPORTANT_CHANGE` like `UpdateGoal`; no
+  terminal-state rule - `PENDING`/`DONE` are freely reversible peer
+  states, proven both directions against a real DB).
+- **Cross-entity reference validation**: `AddMilestone.project_id`
+  checked against a real database read
+  (`storage::project_repo::project_exists`, new) before persistence,
+  `ValidationError::ReferencedProjectNotFound` if absent - same pattern
+  as `CreateProject`'s `goal_id` check. The real
+  `milestones.project_id REFERENCES projects(id) ON DELETE RESTRICT`
+  constraint is independent defense in depth, proven directly with a
+  raw-SQL bypass.
+- **Atomicity from day one, proven again**: `add_milestone`/
+  `update_milestone` use the exact same `&mut Connection` +
+  `rusqlite::Transaction` + `CoreError`-on-any-failure shape as every
+  prior entity - proven with two forced-audit-failure tests targeting
+  the new `milestone_audit_log` table.
+- **Migration compatibility proven, not assumed**: a dedicated test
+  builds a database populated only through V3 (real Goal/Project/
+  GoalRelation rows - the actual shape of an existing user's database
+  before this update), then reopens it normally (applying only the
+  newly-pending V4 migration) and confirms all prior data is unchanged
+  and a new `AddMilestone` works against the pre-existing Project.
+  Neither `V1__create_goals.sql`, `V2__create_projects.sql`, nor
+  `V3__create_goal_relations.sql` was edited.
+- **Database defense-in-depth, all proven with raw SQL bypassing the
+  action API entirely** (kept local to tests): nonexistent `project_id`
+  rejected by the FK constraint; a duplicate `(project_id,
+  order_index)` rejected by `UNIQUE`; an invalid `status` string
+  rejected by its `CHECK (... IN ('PENDING', 'DONE'))`; a whitespace-only
+  title rejected by `CHECK (length(trim(title)) > 0)`; a hard `DELETE`
+  of a Project with a live Milestone rejected by `ON DELETE RESTRICT`.
+- **Read side stays narrow**: `get_milestone(id)` and
+  `get_milestones_for_project(project_id)` (deterministic
+  `ORDER BY order_index ASC`, unambiguous since the pair is UNIQUE) only
+  - no public capability transport added this run.
+
+Full evidence, exact SQL, and every test result:
+`docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
 
 ### Next implementation step (M2)
 
-**`Milestone` vertical slice** (frozen order, §4g) - the fourth domain
-entity, a `Project` child. Reuse `domain → actions → services →
+**`Task` vertical slice** (frozen order, §4g) - the fifth domain
+entity. Reuse `domain → actions → services →
 services::storage::<entity>_repo` with the same atomicity/typed-error
-discipline applied from the start (as Project and GoalRelation both
-did, not retrofitted afterward like Goal needed), and the action set/
-patch semantics/confirmation floor/FK policy/creation default already
-frozen in §4g/`LIFEOS_SPEC.md` §5.1 - implement `AddMilestone` and
-`UpdateMilestone` together (both are already frozen; do not implement
-one without the other, or a `PENDING` milestone has no path to `DONE`).
-Resolve `Milestone.order_index`'s uniqueness open question as part of
-that slice, not before or after. `Task` follows after `Milestone`, not
-in the same pass. Do not invent product rules inside the
-implementation - flag them as open questions instead (§4c's lesson from
-the removed terminal-status rule; §4e's/§4g's action-set-gap
-documentation-before-code discipline; §4f's three relation-integrity
-rules being frozen *before* coding rather than invented
-mid-implementation).
+discipline applied from the start, and the action set/patch semantics
+(corrected per §4i)/confirmation floor/FK policy/creation default
+already frozen in §4g/`LIFEOS_SPEC.md` §5.1 - implement `AddTask` and
+`UpdateTask` together. `Task` adds two genuinely new complexities
+`Milestone` did not have to resolve: two independent optional parent
+foreign keys (`project_id`/`goal_id`, both nullable, a Task may be
+standalone/Project-only/Goal-only/both - already confirmed
+unconstrained) and a four-value status enum (`TODO`/`IN_PROGRESS`/
+`DONE`/`CANCELLED`, all peer states, no terminal-state rule). Do not
+invent product rules inside the implementation - flag them as open
+questions instead (§4c's lesson from the removed terminal-status rule;
+§4e's/§4g's action-set-gap documentation-before-code discipline; §4f's
+relation-integrity rules and §4i's order_index-uniqueness rule both
+being frozen/resolved *before or as part of* coding rather than
+invented ad hoc mid-implementation).
 
 ---
 
@@ -736,10 +855,11 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   15. `feat: implement M2 Project vertical slice`
   16. `fix: harden M2 project integrity and shared lifecycle types`
   17. `feat: implement M2 GoalRelation graph slice`
-  18. (this run) `docs: freeze Project child mutation actions` — a
-      documentation-only commit, zero source-code files changed; see
+  18. `docs: freeze Project child mutation actions` — a
+      documentation-only commit, zero source-code files changed.
+  19. (this run) `feat: implement M2 Milestone vertical slice` — see
       this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-18 were not
+- Pushed to `origin/main` through commit 7. **Commits 8-19 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -753,9 +873,9 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 ## 8. What can the user actually do right now?
 
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
-unchanged, no real goals, projects, or relations visible there yet (no
-Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 104 tests proving:
+unchanged, no real goals, projects, relations, or milestones visible
+there yet (no Tauri command wiring). Separately,
+`cd src-tauri && cargo test -- --test-threads=1` runs 148 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -765,49 +885,57 @@ proof and a V1-to-V2 migration-compatibility check (14 integration + 10
 direct action-layer unit), that SQLite itself genuinely enforces
 `projects.goal_id`'s foreign key (4 integration), that the `GoalStatus`
 → `LifecycleStatus` rename changed nothing observable (3 direct unit),
-and a full LinkGoals lifecycle - directional storage, self-link/
-duplicate rejection, all 5 database-level FK/CHECK/UNIQUE/RESTRICT
-proofs via raw SQL, the PARENT_OF convention, and a V2-to-V3 migration-
-compatibility check (23 integration test functions covering 26 numbered
-requirements + 5 direct action-layer unit + 3 direct `GoalRelationType`
+a full LinkGoals lifecycle - directional storage, self-link/duplicate
+rejection, all 5 database-level FK/CHECK/UNIQUE/RESTRICT proofs via raw
+SQL, the PARENT_OF convention, and a V2-to-V3 migration-compatibility
+check (23 integration test functions covering 26 numbered requirements
++ 5 direct action-layer unit + 3 direct `GoalRelationType` unit), and a
+full AddMilestone/UpdateMilestone lifecycle - default-PENDING creation,
+reversible PENDING/DONE status, `(project_id, order_index)` UNIQUE
+enforced both in Core and the database, all 5 database-level FK/UNIQUE/
+CHECK/RESTRICT proofs via raw SQL, and a V3-to-V4 migration-
+compatibility check (24 integration test functions covering 32 numbered
+requirements + 17 direct action-layer unit + 3 direct `MilestoneStatus`
 unit) - all passing against temp databases, never the user's real data.
-**Test count unchanged at 104 this run** - the Project Child Action
-Freeze pass is documentation-only, zero source-code files touched, so
-there was nothing new to test and nothing existing to regress.
+**Test count rose from 104 to 148 this run** (+44: 24 integration
+functions, 17 direct action-layer unit, 3 domain unit) - all 104 prior
+tests remain green, unmodified.
 
 ---
 
 ## 9. Next recommended step
 
-The `Milestone` vertical slice - see §4h for the exact reasoning (this
-duplicates §4h's "Next implementation step" so it is visible without
-scrolling past the M2 detail section). Its action set
-(`AddMilestone`/`UpdateMilestone`), patch semantics, confirmation floor
-(`EXPLICIT_ADD`), and FK policy (`ON DELETE RESTRICT` on
-`Milestone.project_id`) are already frozen (§4g) - implementation should
-not need to invent any of those, only resolve the one genuinely open
-question (`order_index` uniqueness, `LIFEOS_SPEC.md` §13) as part of
-that slice.
+The `Task` vertical slice - see §4i's "Next implementation step" for the
+exact reasoning (this duplicates it so it is visible without scrolling
+past the M2 detail section). Its action set (`AddTask`/`UpdateTask`),
+patch semantics (`title: Option<String>`; `due_at`/`project_id`/
+`goal_id: FieldPatch<T>`, corrected per §4i), confirmation floor
+(`EXPLICIT_ADD`), and FK policy (`ON DELETE RESTRICT` on both nullable
+parent references) are already frozen (§4g) - implementation should not
+need to invent any of those. Two genuinely new complexities vs.
+`Milestone`: two independent optional parent foreign keys, and a
+four-value status enum with no terminal state.
 
 ---
 
 ## 10. Known problems / risks / unresolved questions
 
-- **Neither Goal, Project, nor GoalRelation (nor the storage bootstrap)
-  is wired into the running app** — no Tauri command layer exists yet;
-  `services`' functions are only reachable from tests.
+- **Neither Goal, Project, GoalRelation, nor Milestone (nor the storage
+  bootstrap) is wired into the running app** — no Tauri command layer
+  exists yet; `services`' functions are only reachable from tests.
 - **RESOLVED (2026-09-17, M2 Project Child Action Freeze): the Project
   action-set gap is closed.** `UpdateProject` (floor `IMPORTANT_CHANGE`)
   is now frozen - `LIFEOS_SPEC.md` §5.1/§5.4. Not yet implemented in
   code (documentation-only freeze); implementation is expected whenever
   Project editing is actually built, not necessarily the very next run.
-  `UpdateMilestone`/`UpdateTask` (both floor `EXPLICIT_ADD`) are also
-  now frozen, pre-emptively, before either entity exists in code.
-- **`Milestone.order_index` uniqueness within a Project is a genuine
-  OPEN QUESTION** (`LIFEOS_SPEC.md` §13, §4g above) - no existing
-  document decides whether duplicate `order_index` values are allowed
-  or forbidden within one Project. Must be resolved as part of the
-  `Milestone` vertical slice, not silently defaulted either way.
+  `UpdateTask` (floor `EXPLICIT_ADD`) is also frozen, pre-emptively,
+  before `Task` exists in code. `UpdateMilestone` is no longer in this
+  category - implemented, §4i.
+- **RESOLVED (2026-09-17, M2 Milestone vertical slice, §4i above):
+  `Milestone.order_index` uniqueness within a Project.** YES,
+  `(project_id, order_index)` must be unique; different Projects may
+  freely reuse the same values; enforced both in Core and by a real SQL
+  `UNIQUE` constraint.
 - **`bundled-sqlcipher`'s build-time OpenSSL dependency is real but no
   longer hardcoded** — any machine building this needs
   `scripts/setup-windows-storage-env.ps1` run once (§4a).
@@ -841,6 +969,15 @@ that slice.
   Deliberately out of scope - that is M6 Goal Intelligence *reasoning*
   over the graph structure this run only makes available, not this
   run's job (M2 GoalRelation vertical-slice report §19 note).
+- **`Milestone` has no read capability beyond
+  `get_milestone`/`get_milestones_for_project`** - no aggregate "due
+  before X" query, no cross-Project query. Deliberately out of scope,
+  same reasoning as GoalRelation above - add only when a real caller
+  needs it (M2 Milestone vertical-slice report §19).
+- **`Milestone.order_index` has no application-level upper bound**
+  beyond `i64`'s own range - deliberate (no canonical policy for one
+  exists, and none was invented), not a correctness risk, only a future
+  UX consideration for whatever eventually assigns these values.
 - **Exact NeXa transport, exact confirmation-class UX (modal/inline/
   toast)** — both deferred, unchanged.
 - Everything already listed as pending from M1/M2-freeze (local/cloud
