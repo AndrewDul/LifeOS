@@ -18,10 +18,12 @@
 //! (`../../../migrations/`) create ONLY real domain tables - `goals`
 //! (V1), `projects`/`project_audit_log` (V2, M2 Project vertical slice,
 //! 2026-09-17), `goal_relations`/`goal_relation_audit_log` (V3, M2
-//! GoalRelation vertical slice, 2026-09-17), and `milestones`/
-//! `milestone_audit_log` (V4, M2 Milestone vertical slice, 2026-09-17) -
-//! the spike's `spike_records` schema lives under `spike/`, compiled for
-//! `#[cfg(test)]` only, and is never reachable from a non-test build.
+//! GoalRelation vertical slice, 2026-09-17), `milestones`/
+//! `milestone_audit_log` (V4, M2 Milestone vertical slice, 2026-09-17),
+//! and `tasks`/`task_audit_log` (V5, M2 Task vertical slice,
+//! 2026-09-17) - the spike's `spike_records` schema lives under
+//! `spike/`, compiled for `#[cfg(test)]` only, and is never reachable
+//! from a non-test build.
 
 // Not wired into `run()` yet this run - only exercised by tests, hence
 // dead_code would otherwise warn on every non-test build.
@@ -36,6 +38,7 @@ pub(super) mod goal_relation_repo;
 pub(super) mod goal_repo;
 pub(super) mod milestone_repo;
 pub(super) mod project_repo;
+pub(super) mod task_repo;
 
 #[cfg(test)]
 pub(super) mod spike;

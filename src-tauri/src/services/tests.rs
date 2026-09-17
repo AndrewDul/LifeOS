@@ -10,7 +10,7 @@ use crate::actions::{
     ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
-use crate::domain::{GoalRelationType, LifecycleStatus, MilestoneStatus};
+use crate::domain::{GoalRelationType, LifecycleStatus, MilestoneStatus, TaskStatus};
 use std::fs;
 use std::io::Read;
 
@@ -3910,4 +3910,1563 @@ fn req_m31_get_milestones_for_project_returns_order_index_ascending() {
         "[req_m31] FAIL - expected order_index ASC ordering (First, Second, Third)"
     );
     println!("[req_m31] PASS - get_milestones_for_project returned milestones ordered by order_index ASC, independent of insertion order");
+}
+
+// =========================================================================
+// M2 Task vertical slice (2026-09-17) - new evidence below. Evidence for
+// `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`. The fifth
+// real M2 domain entity, and the first with two independent nullable
+// parent references - `tasks.project_id`/`tasks.goal_id`, both
+// `ON DELETE RESTRICT`.
+// =========================================================================
+
+fn mk_add_task_payload(
+    title: &str,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    project_id: Option<crate::domain::ProjectId>,
+    goal_id: Option<crate::domain::GoalId>,
+) -> AddTaskPayload {
+    AddTaskPayload {
+        title: title.to_string(),
+        due_at,
+        project_id,
+        goal_id,
+    }
+}
+
+fn task_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn task_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM task_audit_log", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Same forced-failure mechanism as every other entity's audit-failure
+/// trigger, targeting `task_audit_log`.
+fn install_task_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_task_audit_failure
+         BEFORE INSERT ON task_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced task audit failure');
+         END;",
+    )
+    .expect("failed to install the forced task-audit-failure trigger");
+}
+
+fn remove_task_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_task_audit_failure;")
+        .expect("failed to remove the forced task-audit-failure trigger");
+}
+
+/// Requirement 1: V5 migration creates the Task schema.
+#[test]
+fn req_t1_v5_migration_creates_task_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for table in ["tasks", "task_audit_log"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(exists, "[req_t1] FAIL - missing table {table}");
+    }
+    println!("[req_t1] PASS - V5 migration created tasks + task_audit_log");
+}
+
+/// Requirement 2: a fresh V1->V2->V3->V4->V5 database works end to end -
+/// a Goal, a Project linked to it, a GoalRelation, a Milestone, and a
+/// Task all created together in one migration run.
+#[test]
+fn req_t2_fresh_v1_v2_v3_v4_v5_database_works_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project linked to A", Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(goal_a.id, goal_b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "First milestone", 0),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("First task", None, Some(project.id), Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.status, TaskStatus::Todo);
+        }
+        other => panic!("[req_t2] FAIL - expected Success, got {other:?}"),
+    }
+    println!("[req_t2] PASS - fresh V1->V2->V3->V4->V5 database supports Goal, Project, GoalRelation, Milestone, and Task together");
+}
+
+/// Requirement 3 (migration compatibility): an existing database
+/// populated only through V4 (real Goal/Project/GoalRelation/Milestone
+/// rows - the actual shape of an existing user's database before this
+/// update) upgrades cleanly to V5 - all prior data unchanged, the tasks
+/// table appears, and new Tasks can reference the pre-existing Project,
+/// the pre-existing Goal, both, or neither.
+#[test]
+fn req_t3_v4_populated_database_upgrades_cleanly_to_v5() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task3.db");
+
+    let (goal_id, project_id, relation_id, milestone_id);
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 4).unwrap();
+        let has_tasks_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tasks'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_tasks_table,
+            "[req_t3] FAIL - a V4-only database already has the tasks table"
+        );
+
+        let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V5 goal")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = goal.id;
+        let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V5 goal B"))
+        {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        let project = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Pre-V5 project", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = project.id;
+        let relation = match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(goal_id, goal_b.id, GoalRelationType::Supports),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        relation_id = relation.id;
+        let milestone = match add_milestone(
+            &mut conn,
+            ui_explicit(),
+            mk_add_milestone_payload(project_id, "Pre-V5 milestone", 0),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        milestone_id = milestone.id;
+    }
+
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+        let goal_after = get_goal(&conn, goal_id).unwrap();
+        assert_eq!(
+            goal_after.as_ref().map(|g| g.title.as_str()),
+            Some("Pre-V5 goal"),
+            "[req_t3] FAIL - Goal data did not survive the V4 -> V5 upgrade"
+        );
+        let project_after = get_project(&conn, project_id).unwrap();
+        assert_eq!(
+            project_after.as_ref().map(|p| p.id),
+            Some(project_id),
+            "[req_t3] FAIL - Project data did not survive the V4 -> V5 upgrade"
+        );
+        let relation_after = get_goal_relation(&conn, relation_id).unwrap();
+        assert!(
+            relation_after.is_some(),
+            "[req_t3] FAIL - GoalRelation data did not survive the V4 -> V5 upgrade"
+        );
+        let milestone_after = get_milestone(&conn, milestone_id).unwrap();
+        assert!(
+            milestone_after.is_some(),
+            "[req_t3] FAIL - Milestone data did not survive the V4 -> V5 upgrade"
+        );
+
+        let has_tasks_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tasks'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            has_tasks_table,
+            "[req_t3] FAIL - tasks table missing after upgrade"
+        );
+
+        // Tasks referencing: the pre-existing Project, the pre-existing
+        // Goal, both, and neither - all four ownership modes against
+        // upgraded, pre-existing data.
+        for (title, proj, goal) in [
+            ("Post-V5 standalone", None, None),
+            ("Post-V5 project-only", Some(project_id), None),
+            ("Post-V5 goal-only", None, Some(goal_id)),
+            ("Post-V5 both", Some(project_id), Some(goal_id)),
+        ] {
+            match add_task(
+                &mut conn,
+                ui_explicit(),
+                mk_add_task_payload(title, None, proj, goal),
+            ) {
+                ActionOutcome::Success { .. } => {}
+                other => panic!(
+                    "[req_t3] FAIL - AddTask({title}) should succeed after upgrade, got {other:?}"
+                ),
+            }
+        }
+        println!("[req_t3] PASS - V4 data survived the upgrade to V5, and new Tasks work in all four ownership modes against pre-existing Project/Goal");
+    }
+}
+
+/// Requirements 4, 5, 6, 7, 8, 9: AddTask succeeds in all four ownership
+/// modes (standalone, Project-only, Goal-only, both), every new Task
+/// defaults to `TODO`, and `recurring_rule_id` defaults to `NULL`
+/// (verified via a direct raw-SQL read, not just the in-memory value).
+#[test]
+fn req_t4_5_6_7_8_9_add_task_all_ownership_modes_default_todo_and_null_recurring_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task4.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let cases: [(
+        &str,
+        Option<crate::domain::ProjectId>,
+        Option<crate::domain::GoalId>,
+    ); 4] = [
+        ("Standalone", None, None),
+        ("Project-only", Some(project.id), None),
+        ("Goal-only", None, Some(goal.id)),
+        ("Project+Goal", Some(project.id), Some(goal.id)),
+    ];
+
+    for (title, proj, g) in cases {
+        let created = match add_task(
+            &mut conn,
+            ui_explicit(),
+            mk_add_task_payload(title, None, proj, g),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("[req_t4-7] FAIL - AddTask({title}) should succeed, got {other:?}"),
+        };
+        assert_eq!(
+            created.project_id, proj,
+            "[req_t4-7] FAIL - project_id mismatch for {title}"
+        );
+        assert_eq!(
+            created.goal_id, g,
+            "[req_t4-7] FAIL - goal_id mismatch for {title}"
+        );
+        assert_eq!(
+            created.status,
+            TaskStatus::Todo,
+            "[req_t8] FAIL - new Task must default to TODO"
+        );
+        assert_eq!(
+            created.recurring_rule_id, None,
+            "[req_t9] FAIL - new Task must default recurring_rule_id to None"
+        );
+
+        let raw_recurring_rule_id: Option<String> = conn
+            .query_row(
+                "SELECT recurring_rule_id FROM tasks WHERE id = ?1",
+                rusqlite::params![created.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_recurring_rule_id, None,
+            "[req_t9] FAIL - recurring_rule_id must be persisted as SQL NULL for {title}"
+        );
+    }
+    println!("[req_t4-9] PASS - AddTask succeeded in all four ownership modes, every new Task defaulted to TODO with recurring_rule_id = NULL");
+}
+
+/// Requirement 10: a Task survives a full connection close/reopen.
+#[test]
+fn req_t10_task_survives_close_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task10.db");
+
+    let task_id;
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let created = match add_task(
+            &mut conn,
+            ui_explicit(),
+            mk_add_task_payload("  Persisted task  ", None, None, None),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("[req_t10] FAIL - expected Success, got {other:?}"),
+        };
+        assert_eq!(
+            created.title, "Persisted task",
+            "[req_t10] FAIL - title was not trimmed"
+        );
+        task_id = created.id;
+    }
+
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let fetched = get_task(&conn, task_id).unwrap();
+        assert!(
+            fetched.is_some(),
+            "[req_t10] FAIL - task not found after reopen"
+        );
+        assert_eq!(fetched.unwrap().title, "Persisted task");
+        println!("[req_t10] PASS - task survived a full connection close/reopen");
+    }
+}
+
+/// Requirement 11: a nonexistent `project_id` is rejected before any
+/// write - zero task rows written.
+#[test]
+fn req_t11_nonexistent_project_id_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task11.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload(
+            "Dangling project reference",
+            None,
+            Some(fake_project_id),
+            None,
+        ),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::ReferencedProjectNotFound),
+                "[req_t11] FAIL - expected ReferencedProjectNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_t11] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_t11] FAIL - a task row was written despite the dangling project_id"
+    );
+    println!(
+        "[req_t11] PASS - nonexistent project_id rejected before persistence, zero rows written"
+    );
+}
+
+/// Requirement 12: a nonexistent `goal_id` is rejected before any write
+/// - zero task rows written.
+#[test]
+fn req_t12_nonexistent_goal_id_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task12.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new();
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Dangling goal reference", None, None, Some(fake_goal_id)),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::ReferencedGoalNotFound),
+                "[req_t12] FAIL - expected ReferencedGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_t12] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_t12] FAIL - a task row was written despite the dangling goal_id"
+    );
+    println!("[req_t12] PASS - nonexistent goal_id rejected before persistence, zero rows written");
+}
+
+/// Requirements 13, 14-21: both valid parents persist correctly, and
+/// every `UpdateTask` patch-semantics case succeeds and persists -
+/// title, `due_at` Set/Clear, `project_id` Set/Clear, `goal_id`
+/// Set/Clear, and both parents cleared together in one update.
+#[test]
+fn req_t13_14_to_21_update_task_full_patch_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task13.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // Requirement 13: both valid parents persist correctly.
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Original title", None, Some(project.id), Some(goal.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.project_id, Some(project.id));
+    assert_eq!(created.goal_id, Some(goal.id));
+    println!("[req_t13] PASS - Task created with both valid parents persisted correctly");
+
+    // Requirement 14: title update.
+    let renamed = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            title: Some("  Renamed  ".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t14] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(renamed.title, "Renamed");
+    println!("[req_t14] PASS - UpdateTask title succeeded and was trimmed");
+
+    // Requirement 15: due_at Set.
+    let now = chrono::Utc::now();
+    let with_due = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            due_at: FieldPatch::Set(now),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t15] FAIL - expected Success, got {other:?}"),
+    };
+    assert!(with_due.due_at.is_some());
+    println!("[req_t15] PASS - UpdateTask due_at Set succeeded");
+
+    // Requirement 16: due_at Clear -> SQL NULL.
+    let cleared_due = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            due_at: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t16] FAIL - expected Success, got {other:?}"),
+    };
+    assert!(cleared_due.due_at.is_none());
+    let refetched = get_task(&conn, created.id).unwrap().unwrap();
+    assert!(
+        refetched.due_at.is_none(),
+        "[req_t16] FAIL - due_at Clear did not persist as NULL"
+    );
+    println!("[req_t16] PASS - UpdateTask due_at Clear persisted as NULL");
+
+    // Requirement 17: project_id Set (relink to a second Project).
+    let project_b = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project B", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let relinked_project = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(project_b.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t17] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(relinked_project.project_id, Some(project_b.id));
+    println!("[req_t17] PASS - UpdateTask project_id Set succeeded");
+
+    // Requirement 18: project_id Clear -> SQL NULL.
+    let cleared_project = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t18] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(cleared_project.project_id, None);
+    println!("[req_t18] PASS - UpdateTask project_id Clear succeeded");
+
+    // Requirement 19: goal_id Set (relink to a second Goal).
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let relinked_goal = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            goal_id: FieldPatch::Set(goal_b.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t19] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(relinked_goal.goal_id, Some(goal_b.id));
+    println!("[req_t19] PASS - UpdateTask goal_id Set succeeded");
+
+    // Requirement 20: goal_id Clear -> SQL NULL.
+    let cleared_goal = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            goal_id: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t20] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(cleared_goal.goal_id, None);
+    println!("[req_t20] PASS - UpdateTask goal_id Clear succeeded");
+
+    // Requirement 21: both parents cleared together in one update -
+    // re-link both first so there is something real to clear.
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(project.id),
+            goal_id: FieldPatch::Set(goal.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let both_cleared = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Clear,
+            goal_id: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t21] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(both_cleared.project_id, None);
+    assert_eq!(both_cleared.goal_id, None);
+    println!(
+        "[req_t21] PASS - both parents cleared together in one UpdateTask - Task is now standalone"
+    );
+}
+
+/// Requirements 22, 23: a Task's Project can be relinked, and its Goal
+/// can be relinked, to a different valid target.
+#[test]
+fn req_t22_23_project_and_goal_can_both_be_relinked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task22.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project_a = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project A", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project_b = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project B", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Relinkable", None, Some(project_a.id), Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let relinked = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(project_b.id),
+            goal_id: FieldPatch::Set(goal_b.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t22-23] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(relinked.project_id, Some(project_b.id));
+    assert_eq!(relinked.goal_id, Some(goal_b.id));
+    println!("[req_t22-23] PASS - both Project and Goal successfully relinked to different valid targets");
+}
+
+/// Requirements 24, 25: relinking to a nonexistent Project (or Goal)
+/// causes zero mutation.
+#[test]
+fn req_t24_25_invalid_relink_causes_zero_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task24.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable task", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            project_id: FieldPatch::Set(fake_project_id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedProjectNotFound));
+        }
+        other => panic!("[req_t24] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after_project_attempt = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after_project_attempt,
+        "[req_t24] FAIL - task changed despite invalid project relink"
+    );
+    println!("[req_t24] PASS - invalid Project relink rejected, zero mutation");
+
+    let fake_goal_id = crate::domain::GoalId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            goal_id: FieldPatch::Set(fake_goal_id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedGoalNotFound));
+        }
+        other => panic!("[req_t25] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after_goal_attempt = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after_goal_attempt,
+        "[req_t25] FAIL - task changed despite invalid goal relink"
+    );
+    println!("[req_t25] PASS - invalid Goal relink rejected, zero mutation");
+}
+
+/// Requirement 26: an UpdateTask touching no fields is rejected.
+#[test]
+fn req_t26_update_task_no_fields_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task26.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("No-op target", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+        }
+        other => panic!("[req_t26] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    println!("[req_t26] PASS - no-op UpdateTask rejected with NoFieldsToUpdate");
+}
+
+/// Requirement 27: UpdateTask on a nonexistent id returns structured
+/// NotFound.
+#[test]
+fn req_t27_update_nonexistent_task_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task27.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_id = crate::domain::TaskId::new();
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: fake_id,
+            title: Some("Doesn't matter".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::NotFound => {
+            println!("[req_t27] PASS - UpdateTask on a nonexistent id returned structured NotFound")
+        }
+        other => panic!("[req_t27] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+/// Requirements 28-32: representative TaskStatus transitions all
+/// succeed against a real DB, demonstrating no terminal-state rule -
+/// TODO -> IN_PROGRESS, IN_PROGRESS -> DONE, DONE -> TODO (reopen),
+/// TODO -> CANCELLED, CANCELLED -> TODO (reopen).
+#[test]
+fn req_t28_to_32_representative_status_transitions_all_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task28.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Transitions", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.status, TaskStatus::Todo);
+
+    let transitions = [
+        (TaskStatus::InProgress, "req_t28", "TODO -> IN_PROGRESS"),
+        (TaskStatus::Done, "req_t29", "IN_PROGRESS -> DONE"),
+        (TaskStatus::Todo, "req_t30", "DONE -> TODO"),
+        (TaskStatus::Cancelled, "req_t31", "TODO -> CANCELLED"),
+        (TaskStatus::Todo, "req_t32", "CANCELLED -> TODO"),
+    ];
+
+    for (target, tag, label) in transitions {
+        let updated = match update_task(
+            &mut conn,
+            ui_explicit(),
+            UpdateTaskPayload {
+                id: created.id,
+                status: Some(target),
+                ..Default::default()
+            },
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("[{tag}] FAIL - {label} should succeed, got {other:?}"),
+        };
+        assert_eq!(
+            updated.status, target,
+            "[{tag}] FAIL - status did not update for {label}"
+        );
+        println!("[{tag}] PASS - {label} succeeded");
+    }
+}
+
+/// Requirements 33, 34, 35: `created_at` is preserved across a
+/// successful update, `updated_at` advances on a successful update, and
+/// a rejected update leaves both timestamps unchanged.
+#[test]
+fn req_t33_34_35_timestamp_behavior_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task33.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Timestamped", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let original_created_at = created.created_at;
+    let original_updated_at = created.updated_at;
+    assert_eq!(
+        original_created_at, original_updated_at,
+        "[req_t33/34] FAIL - a freshly created Task should have created_at == updated_at"
+    );
+
+    // Requirement 35: a rejected update (no fields touched) leaves both
+    // timestamps unchanged.
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(_) => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let after_rejected = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(after_rejected.created_at, original_created_at);
+    assert_eq!(
+        after_rejected.updated_at, original_updated_at,
+        "[req_t35] FAIL - a rejected update must not change updated_at"
+    );
+    println!("[req_t35] PASS - rejected update left both timestamps unchanged");
+
+    // Requirements 33, 34: a successful update preserves created_at and
+    // advances updated_at.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let updated = match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            title: Some("Timestamped, renamed".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_t33/34] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(
+        updated.created_at, original_created_at,
+        "[req_t33] FAIL - created_at must never change"
+    );
+    assert!(
+        updated.updated_at > original_updated_at,
+        "[req_t34] FAIL - updated_at must advance on a successful update"
+    );
+    println!("[req_t33/34] PASS - created_at preserved, updated_at advanced on successful update");
+}
+
+/// Requirement 36: AddTask's audit row carries the required
+/// actor/provenance/confirmation-class metadata.
+#[test]
+fn req_t36_add_task_audit_metadata_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task36.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Audited task", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let (action_type, actor, provenance, confirmation_class, previous_snapshot): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot FROM task_audit_log WHERE task_id = ?1",
+            [created.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+
+    assert_eq!(action_type, "AddTask");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    assert_eq!(
+        previous_snapshot, None,
+        "[req_t36] FAIL - AddTask's audit row must have no previous_snapshot"
+    );
+    println!("[req_t36] PASS - AddTask audit row carries action_type={action_type}, actor={actor}, provenance={provenance}, confirmation_class={confirmation_class}, previous_snapshot=None");
+}
+
+/// Requirement 37: UpdateTask's audit row contains a real previous
+/// snapshot (the pre-update Task state).
+#[test]
+fn req_t37_update_task_audit_contains_previous_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task37.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Pre-update title", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            title: Some("Post-update title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM task_audit_log WHERE task_id = ?1 AND action_type = 'UpdateTask'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot = previous_snapshot
+        .expect("[req_t37] FAIL - UpdateTask audit row must have a previous_snapshot");
+    assert!(
+        snapshot.contains("Pre-update title"),
+        "[req_t37] FAIL - previous_snapshot does not contain the pre-update title, got {snapshot}"
+    );
+    println!("[req_t37] PASS - UpdateTask audit row's previous_snapshot contains the pre-update state: {snapshot}");
+}
+
+/// Requirement 38: AddTask's task-insert + audit-insert are one atomic
+/// transaction - same forced-failure proof as every entity above.
+#[test]
+fn req_t38_add_task_audit_failure_rolls_back_task_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task38.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    install_task_audit_failure_trigger(&conn);
+
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Should never persist", None, None, None),
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_t38] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_t38] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_t38] FAIL - a task row survived a rolled-back transaction"
+    );
+    assert_eq!(
+        task_audit_row_count(&conn),
+        0,
+        "[req_t38] FAIL - an audit row survived a rolled-back transaction"
+    );
+
+    remove_task_audit_failure_trigger(&conn);
+
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Now it works", None, None, None),
+    ) {
+        ActionOutcome::Success { .. } => {
+            println!("[req_t38] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[req_t38] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Requirement 39: UpdateTask's task-update + audit-insert are one
+/// atomic transaction - `updated_at` must not leak from the rolled-back
+/// update either.
+#[test]
+fn req_t39_update_task_audit_failure_rolls_back_task_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task39.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+
+    install_task_audit_failure_trigger(&conn);
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            title: Some("Should not persist".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_t39] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_t39] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_task_audit_failure_trigger(&conn);
+
+    let after = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_t39] FAIL - task mutated despite a rolled-back transaction"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "[req_t39] FAIL - updated_at leaked from a rolled-back update"
+    );
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM task_audit_log WHERE task_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 1,
+        "[req_t39] FAIL - expected exactly 1 audit row (the original AddTask), got {audit_count}"
+    );
+    println!("[req_t39] PASS - task left identical to its pre-update state, no orphan audit row, updated_at did not leak");
+}
+
+/// Requirements 40, 41: Inferred AddTask blocks before write, then a
+/// confirmed resubmission succeeds.
+#[test]
+fn req_t40_41_inferred_add_task_requires_confirmation_then_confirmed_resubmission_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task40.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload = mk_add_task_payload("AI-proposed task", None, None, None);
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match add_task(&mut conn, meta, payload.clone()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_t40] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        task_row_count(&conn),
+        0,
+        "[req_t40] FAIL - a task was written before confirmation"
+    );
+    println!(
+        "[req_t40] PASS - Inferred AddTask blocked with ConfirmationRequired, zero rows written"
+    );
+
+    let mut confirmed_meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    confirmed_meta.confirmed = true;
+    match add_task(&mut conn, confirmed_meta, payload) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(task_row_count(&conn), 1);
+            println!("[req_t41] PASS - resubmission with confirmed=true persisted the task");
+        }
+        other => {
+            panic!("[req_t41] FAIL - expected Success on confirmed resubmission, got {other:?}")
+        }
+    }
+}
+
+/// Requirement 42: Inferred UpdateTask blocks before write, zero
+/// mutation.
+#[test]
+fn req_t42_inferred_update_task_requires_confirmation_and_does_not_mutate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task42.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Stable title", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_task(&conn, created.id).unwrap().unwrap();
+
+    let payload = UpdateTaskPayload {
+        id: created.id,
+        title: Some("AI-proposed rename".to_string()),
+        ..Default::default()
+    };
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match update_task(&mut conn, meta, payload) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_t42] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    let after = get_task(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_t42] FAIL - task mutated before confirmation"
+    );
+    println!(
+        "[req_t42] PASS - Inferred UpdateTask blocked with ConfirmationRequired, zero mutation"
+    );
+}
+
+/// Requirement 43: a direct, raw SQL insert naming a nonexistent
+/// `project_id` is rejected by SQLite's own FK enforcement.
+#[test]
+fn req_t43_raw_sql_invalid_project_fk_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task43.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_project_id = crate::domain::ProjectId::new().to_string();
+    let task_id = crate::domain::TaskId::new().to_string();
+    let now = "2026-09-17T00:00:00Z";
+    let result = conn.execute(
+        "INSERT INTO tasks (id, title, status, due_at, project_id, goal_id, recurring_rule_id, created_at, updated_at)
+         VALUES (?1, 'Bypasses AddTask validation', 'TODO', NULL, ?2, NULL, NULL, ?3, ?3)",
+        rusqlite::params![task_id, fake_project_id, now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_t43] PASS - raw SQL insert with a nonexistent project_id rejected by FK: {err:?}");
+        }
+        other => panic!("[req_t43] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+    assert_eq!(task_row_count(&conn), 0);
+}
+
+/// Requirement 44: same as requirement 43, for `goal_id`.
+#[test]
+fn req_t44_raw_sql_invalid_goal_fk_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task44.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new().to_string();
+    let task_id = crate::domain::TaskId::new().to_string();
+    let now = "2026-09-17T00:00:00Z";
+    let result = conn.execute(
+        "INSERT INTO tasks (id, title, status, due_at, project_id, goal_id, recurring_rule_id, created_at, updated_at)
+         VALUES (?1, 'Bypasses AddTask validation', 'TODO', NULL, NULL, ?2, NULL, ?3, ?3)",
+        rusqlite::params![task_id, fake_goal_id, now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_t44] PASS - raw SQL insert with a nonexistent goal_id rejected by FK: {err:?}");
+        }
+        other => panic!("[req_t44] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+    assert_eq!(task_row_count(&conn), 0);
+}
+
+/// Requirement 45: a direct, raw SQL insert with an invalid `status`
+/// text is rejected by the `CHECK` constraint.
+#[test]
+fn req_t45_raw_sql_invalid_status_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task45.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let task_id = crate::domain::TaskId::new().to_string();
+    let now = "2026-09-17T00:00:00Z";
+    let result = conn.execute(
+        "INSERT INTO tasks (id, title, status, due_at, project_id, goal_id, recurring_rule_id, created_at, updated_at)
+         VALUES (?1, 'Invalid status', 'BLOCKED', NULL, NULL, NULL, NULL, ?2, ?2)",
+        rusqlite::params![task_id, now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_t45] PASS - raw SQL insert with an invalid status rejected by CHECK: {err:?}"
+            );
+        }
+        other => {
+            panic!("[req_t45] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(task_row_count(&conn), 0);
+}
+
+/// Requirement 46: a direct, raw SQL insert with an empty (post-trim)
+/// title is rejected by the `CHECK` constraint.
+#[test]
+fn req_t46_raw_sql_empty_title_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task46.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let task_id = crate::domain::TaskId::new().to_string();
+    let now = "2026-09-17T00:00:00Z";
+    let result = conn.execute(
+        "INSERT INTO tasks (id, title, status, due_at, project_id, goal_id, recurring_rule_id, created_at, updated_at)
+         VALUES (?1, '   ', 'TODO', NULL, NULL, NULL, NULL, ?2, ?2)",
+        rusqlite::params![task_id, now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_t46] PASS - raw SQL insert with a whitespace-only title rejected by CHECK: {err:?}");
+        }
+        other => {
+            panic!("[req_t46] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(task_row_count(&conn), 0);
+}
+
+/// Requirement 47: a direct, raw SQL insert with a non-NULL
+/// `recurring_rule_id` is rejected by the temporary
+/// `CHECK (recurring_rule_id IS NULL)` constraint - proves the deferred
+/// RecurringRule design is genuinely enforced, not just documented.
+#[test]
+fn req_t47_raw_sql_non_null_recurring_rule_id_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task47.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let task_id = crate::domain::TaskId::new().to_string();
+    let fake_recurring_rule_id = crate::domain::RecurringRuleId::new().to_string();
+    let now = "2026-09-17T00:00:00Z";
+    let result = conn.execute(
+        "INSERT INTO tasks (id, title, status, due_at, project_id, goal_id, recurring_rule_id, created_at, updated_at)
+         VALUES (?1, 'Premature recurrence', 'TODO', NULL, NULL, NULL, ?2, ?3, ?3)",
+        rusqlite::params![task_id, fake_recurring_rule_id, now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_t47] PASS - raw SQL insert with a non-NULL recurring_rule_id rejected by the temporary CHECK: {err:?}");
+        }
+        other => {
+            panic!("[req_t47] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(task_row_count(&conn), 0);
+}
+
+/// Requirement 48: a direct, raw SQL hard delete of a Project referenced
+/// by a Task is rejected by `ON DELETE RESTRICT`.
+#[test]
+fn req_t48_raw_hard_delete_of_referenced_project_is_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task48.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Referenced project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Keeps the project alive", None, Some(project.id), None),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let result = conn.execute(
+        "DELETE FROM projects WHERE id = ?1",
+        rusqlite::params![project.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(err.code, rusqlite::ErrorCode::ConstraintViolation, "expected a constraint-violation error, got {err:?}");
+            println!("[req_t48] PASS - raw DELETE of a Project referenced by a Task rejected by ON DELETE RESTRICT: {err:?}");
+        }
+        other => panic!("[req_t48] FAIL - expected an SQLite FK constraint error blocking the delete, got {other:?}"),
+    }
+
+    assert!(
+        get_project(&conn, project.id).unwrap().is_some(),
+        "[req_t48] FAIL - Project was deleted despite the RESTRICT constraint"
+    );
+    assert_eq!(
+        task_row_count(&conn),
+        1,
+        "[req_t48] FAIL - task row disappeared despite the delete being rejected"
+    );
+    println!("[req_t48] PASS - Project remains, and the task remains - no dangling task exists");
+}
+
+/// Requirement 49: same as requirement 48, for a referenced Goal.
+#[test]
+fn req_t49_raw_hard_delete_of_referenced_goal_is_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task49.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Referenced goal"),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Keeps the goal alive", None, None, Some(goal.id)),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let result = conn.execute(
+        "DELETE FROM goals WHERE id = ?1",
+        rusqlite::params![goal.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(err.code, rusqlite::ErrorCode::ConstraintViolation, "expected a constraint-violation error, got {err:?}");
+            println!("[req_t49] PASS - raw DELETE of a Goal referenced by a Task rejected by ON DELETE RESTRICT: {err:?}");
+        }
+        other => panic!("[req_t49] FAIL - expected an SQLite FK constraint error blocking the delete, got {other:?}"),
+    }
+
+    assert!(
+        get_goal(&conn, goal.id).unwrap().is_some(),
+        "[req_t49] FAIL - Goal was deleted despite the RESTRICT constraint"
+    );
+    assert_eq!(
+        task_row_count(&conn),
+        1,
+        "[req_t49] FAIL - task row disappeared despite the delete being rejected"
+    );
+    println!("[req_t49] PASS - Goal remains, and the task remains - no dangling task exists");
+}
+
+/// Requirements 50, 51: `get_tasks_for_project`/`get_tasks_for_goal`
+/// return only Tasks actually referencing the queried parent.
+#[test]
+fn req_t50_51_get_tasks_for_project_and_goal_return_only_matching_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "task50.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project_a = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project A", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project_b = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project B", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let task_a_project = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("A's project task", None, Some(project_a.id), None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("B's project task", None, Some(project_b.id), None),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let task_a_goal = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("A's goal task", None, None, Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("B's goal task", None, None, Some(goal_b.id)),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let for_project_a = get_tasks_for_project(&conn, project_a.id).unwrap();
+    assert_eq!(
+        for_project_a.len(),
+        1,
+        "[req_t50] FAIL - expected exactly 1 task for Project A"
+    );
+    assert_eq!(for_project_a[0].id, task_a_project.id);
+    println!("[req_t50] PASS - get_tasks_for_project returned only the Task referencing Project A");
+
+    let for_goal_a = get_tasks_for_goal(&conn, goal_a.id).unwrap();
+    assert_eq!(
+        for_goal_a.len(),
+        1,
+        "[req_t51] FAIL - expected exactly 1 task for Goal A"
+    );
+    assert_eq!(for_goal_a[0].id, task_a_goal.id);
+    println!("[req_t51] PASS - get_tasks_for_goal returned only the Task referencing Goal A");
 }

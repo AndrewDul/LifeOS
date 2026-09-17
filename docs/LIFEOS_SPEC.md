@@ -9,7 +9,7 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 
 Status (2026-09-17): M0/M1 done and accepted. M2's storage foundation is
 proven and hardened for production use, including genuine SQLite
-foreign-key enforcement. Four real domain entities are implemented:
+foreign-key enforcement. Five real domain entities are implemented:
 **Goal** (implemented, then hardened - validated atomicity, typed
 errors, tri-state patch semantics; see the M2 Goal hardening report),
 **Project** (implemented directly with the hardened pattern -
@@ -19,19 +19,24 @@ Project/storage integrity hardening reports), **GoalRelation**
 (implemented directly with the twice-hardened pattern - `LinkGoals`
 only, the first true relationship-*graph* structure, its frozen
 11-value relation-type enum and direction convention proven; see the M2
-GoalRelation vertical-slice report), and **Milestone** (implemented
+GoalRelation vertical-slice report), **Milestone** (implemented
 directly with the pattern - `AddMilestone`/`UpdateMilestone` both, the
 first *required-parent* child entity, its `(project_id, order_index)`
 UNIQUE rule resolved and enforced both in Core and the database; see the
-M2 Milestone vertical-slice report). The rest of the M2 domain model
-(Task, Calendar, Personal Knowledge, Goal Intelligence *reasoning* over
-the graph GoalRelation now makes available, and the rest of the frozen
-action set, including Project's own `AddTask`) is still in progress -
-not implemented yet. M3 is not started. See `PROJECT_STATE.md` for
-exactly what exists; most of this document still describes design
-targets for later milestones, not built functionality — §5.1-§5.6 in
-particular are a frozen *architecture*, only partially code so far
-(Goal, Project, GoalRelation, and Milestone).
+M2 Milestone vertical-slice report), and **Task** (implemented directly
+with the pattern - `AddTask`/`UpdateTask` both, the first entity with
+two independent, both-nullable parent references; `recurring_rule_id`
+deliberately deferred behind a database-enforced `NULL`-only `CHECK`
+until `RecurringRule` itself is designed; see the M2 Task vertical-slice
+report). The rest of the M2 domain model (Calendar, `RecurringRule`,
+Personal Knowledge, Goal Intelligence *reasoning* over the graph
+GoalRelation now makes available, and the rest of the frozen action set,
+including `UpdateProject`) is still in progress - not implemented yet.
+M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
+of this document still describes design targets for later milestones,
+not built functionality — §5.1-§5.6 in particular are a frozen
+*architecture*, only partially code so far (Goal, Project, GoalRelation,
+Milestone, and Task).
 
 ---
 
@@ -394,18 +399,34 @@ Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
 specifically because the capability API's `log_wellbeing()`, §10.1,
 needed something real to persist — not originally in this list, flagged
 in the M2 report as a deliberate small addition, not scope creep).
+
+**`RecurringRule` — reserved, not yet a designed/frozen entity
+(2026-09-17, M2 Task vertical-slice report §3).** `Task.recurring_rule_id`
+is a frozen field (nullable, FUTURE) referencing an entity that was
+never itself added to this frozen list or designed - `RecurringRule`'s
+own shape (rrule/RFC5545 representation, recurrence expansion rules,
+relationship to Calendar/Reminder) remains completely undesigned. A
+typed `RecurringRuleId` newtype exists in `domain::` purely as a
+placeholder so `Task.recurring_rule_id` has something real to be typed
+as; nothing constructs a real one. The production schema enforces
+`CHECK (recurring_rule_id IS NULL)` until `RecurringRule` gets its own
+design/freeze pass and migration - do not treat this placeholder as an
+implicit freeze of `RecurringRule` itself.
 **Implementation status (2026-09-17): `Goal`, `Project`, `GoalRelation`,
-and `Milestone` are implemented** (Goal with its own hardened vertical
-slice; Project built directly with that hardened pattern -
-`CreateProject`/`UpdateProgress` only, not `AddMilestone`/`AddTask`;
-GoalRelation built directly with the twice-hardened pattern -
-`LinkGoals` only, its full frozen relation-type enum and direction
-convention; Milestone built directly with the pattern - `AddMilestone`/
-`UpdateMilestone` both, its `(project_id, order_index)` UNIQUE rule
-resolved and enforced both in Core and the database); every other
-entity in this list is schema-frozen only — see §5.2 for `GoalRelation`'s
-detail and correction, §5.1 below for `Milestone`'s detail, and
-`PROJECT_STATE.md` §9 for which entity is next (`Task`).
+`Milestone`, and `Task` are implemented** (Goal with its own hardened
+vertical slice; Project built directly with that hardened pattern -
+`CreateProject`/`UpdateProgress` only, not `UpdateProject`; GoalRelation
+built directly with the twice-hardened pattern - `LinkGoals` only, its
+full frozen relation-type enum and direction convention; Milestone
+built directly with the pattern - `AddMilestone`/`UpdateMilestone` both,
+its `(project_id, order_index)` UNIQUE rule resolved and enforced both
+in Core and the database; Task built directly with the pattern -
+`AddTask`/`UpdateTask` both, the first entity with two independent
+nullable parent references, `recurring_rule_id` deliberately deferred);
+every other entity in this list is schema-frozen only — see §5.2 for
+`GoalRelation`'s detail and correction, §5.1 below for `Milestone`'s/
+`Task`'s detail, and `PROJECT_STATE.md` §9 for what is next
+(`UpdateProject` or `RecurringRule`).
 
 **`Project.progress` — canonically resolved (2026-09-17, M2 Project/
 storage integrity hardening report).** The Project vertical slice had
@@ -445,14 +466,15 @@ This is a documentation-only freeze — no code implementing
 `UpdateProject` was written this run; it exists so implementation has
 an unambiguous target when Project editing is actually built.
 
-**Project child action set (Milestone, Task) — Milestone implemented,
-Task frozen but not yet implemented (2026-09-17, M2 Project Child Action
-Freeze report; Milestone side implemented in the M2 Milestone vertical
-slice, same date).** Before `Milestone`/`Task` implementation began, the
-same mutation gap `UpdateProject` just closed was identified and closed
-for both children, documentation-only, same reasoning. `AddMilestone`/
-`UpdateMilestone` below are now real, tested code, not just a frozen
-target; `AddTask`/`UpdateTask` remain frozen-only:
+**Project child action set (Milestone, Task) — both implemented
+(2026-09-17, M2 Project Child Action Freeze report for the original
+freeze; Milestone side implemented in the M2 Milestone vertical slice,
+Task side implemented in the M2 Task vertical slice, same date).**
+Before `Milestone`/`Task` implementation began, the same mutation gap
+`UpdateProject` just closed was identified and closed for both
+children, documentation-only, same reasoning. `AddMilestone`/
+`UpdateMilestone`/`AddTask`/`UpdateTask` below are now all real, tested
+code, not just a frozen target:
 
 **Patch-semantics correction (2026-09-17, M2 Milestone vertical-slice
 report §2).** The two bullets immediately below originally used
@@ -480,25 +502,29 @@ nullable → `FieldPatch<T>`, already correctly stated there).
   This is the only way a `Milestone` created `PENDING` via
   `AddMilestone` can ever become `DONE` (or move back) — without it,
   `AddMilestone` alone leaves no path to completion.
-- **`UpdateTask`** (floor `EXPLICIT_ADD`) — `title: Option<String>`
-  (non-nullable); `due_at`/`project_id`/`goal_id` all
-  `FieldPatch<T>` (all three genuinely nullable — clearing
-  `project_id`/`goal_id` is a legitimate "unlink" operation, distinct
-  from leaving either unchanged); `status: Option<TaskStatus>`
-  (non-nullable). `TODO`/`IN_PROGRESS`/`DONE`/`CANCELLED` are peer
-  persisted states with **no** frozen transition policy — a task may
-  move directly `TODO -> DONE`, reopen from `DONE`/`CANCELLED`, etc.; do
-  not invent restrictions. `recurring_rule_id` mutation is deliberately
-  out of scope (recurrence behavior itself is not designed yet).
+- **`UpdateTask`** (floor `EXPLICIT_ADD`, **implemented** - M2 Task
+  vertical slice) — `title: Option<String>` (non-nullable);
+  `due_at`/`project_id`/`goal_id` all `FieldPatch<T>` (all three
+  genuinely nullable — clearing `project_id`/`goal_id` is a legitimate
+  "unlink" operation, distinct from leaving either unchanged);
+  `status: Option<TaskStatus>` (non-nullable). `TODO`/`IN_PROGRESS`/
+  `DONE`/`CANCELLED` are peer persisted states with **no** frozen
+  transition policy — a task may move directly `TODO -> DONE`, reopen
+  from `DONE`/`CANCELLED`, etc.; no restriction was invented (proven,
+  Task vertical-slice report §7). `recurring_rule_id` mutation is
+  deliberately out of scope - `UpdateTaskPayload` has no such field at
+  all; recurrence behavior itself is not designed yet (Task
+  vertical-slice report §3).
 - Both are `EXPLICIT_ADD`, not `IMPORTANT_CHANGE` — `UpdateProgress`
   already established that an *update* action can sit at `EXPLICIT_ADD`
   when the mutation is routine/low-risk; Milestone/Task status changes
   are the routine, frequent case a user makes constantly, unlike
   Project's own structural identity fields.
-- **Task ownership stays exactly as frozen — nullable, unconstrained.**
-  Neither `project_id` nor `goal_id` is required; a `Task` may be
-  standalone, linked to a `Project` only, a `Goal` only, or both. No new
-  requirement is introduced.
+- **Task ownership stays exactly as frozen — nullable, unconstrained,
+  now proven in code.** Neither `project_id` nor `goal_id` is required;
+  a `Task` may be standalone, linked to a `Project` only, a `Goal` only,
+  or both - all four modes proven directly against a real database (Task
+  vertical-slice report §6). No new requirement was introduced.
 - **FK/delete policy, matching `GoalRelation`'s precedent exactly:**
   `Milestone.project_id` (required) and `Task.project_id`/`Task.goal_id`
   (both nullable, when present) all use `ON DELETE RESTRICT` against
@@ -661,11 +687,12 @@ requires judgment). Frozen minimum v0.1 action set (M2 report §E):
 - **Project** (and its children `Milestone`/`Task`): `CreateProject`,
   `UpdateProject`, `UpdateProgress`, `AddMilestone`, `UpdateMilestone`,
   `AddTask`, `UpdateTask` — `AddMilestone`/`UpdateMilestone` are
-  **implemented** (2026-09-17, M2 Milestone vertical slice);
-  `UpdateProject`/`UpdateMilestone`/`UpdateTask` were frozen 2026-09-17
-  (M2 Project Child Action Freeze report), documentation-only at the
-  time; `UpdateProject` remains implemented-ready but not yet coded,
-  `AddTask`/`UpdateTask` await `Task`'s own vertical slice (§5.1)
+  **implemented** (2026-09-17, M2 Milestone vertical slice), and
+  `AddTask`/`UpdateTask` are now **implemented** too (2026-09-17, M2
+  Task vertical slice); `UpdateProject`/`UpdateMilestone`/`UpdateTask`
+  were frozen 2026-09-17 (M2 Project Child Action Freeze report),
+  documentation-only at the time - `UpdateProject` is the only action in
+  this set that remains implemented-ready but not yet coded
 - **Calendar**: `CreateEvent`, `MoveEvent`, `CancelEvent`, `AddReminder`
 - **Challenge**: `CreateChallenge`, `AddHypothesis`, `TrySolution`,
   `RecordOutcome`
@@ -1258,3 +1285,11 @@ These are genuinely unresolved and should not be treated as decided:
   `Milestone.order_index` uniqueness within a Project (§5.1) — YES,
   `(project_id, order_index)` must be unique; different Projects may
   reuse the same values; no automatic renumbering is implemented.
+- **Genuinely open (2026-09-17, M2 Task vertical-slice report §3):**
+  `RecurringRule`'s own design — representation (rrule/RFC5545 vs. a
+  custom scheme), recurrence-expansion semantics, and its relationship
+  to the still-unbuilt Calendar/Reminder entities are all undecided.
+  `Task.recurring_rule_id` exists as a frozen but deliberately
+  unimplemented field (§5.1) specifically so this question can be
+  answered later, in its own design/freeze pass, rather than forced by
+  the Task vertical slice's implementation needs.

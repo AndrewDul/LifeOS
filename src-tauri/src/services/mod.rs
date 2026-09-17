@@ -19,13 +19,14 @@ mod storage;
 
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMilestonePayload,
-    ConfirmationClass, CreateGoalPayload, CreateProjectPayload, FieldPatch, LinkGoalsPayload,
-    UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload, ValidationError,
+    AddTaskPayload, ConfirmationClass, CreateGoalPayload, CreateProjectPayload, FieldPatch,
+    LinkGoalsPayload, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
+    UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::CoreError;
 use crate::domain::{
     Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
-    MilestoneStatus, Project, ProjectId,
+    MilestoneStatus, Project, ProjectId, Task, TaskId, TaskStatus,
 };
 use crate::security;
 use rusqlite::Connection;
@@ -855,6 +856,250 @@ pub(crate) fn get_milestones_for_project(
     project_id: ProjectId,
 ) -> Result<Vec<Milestone>, rusqlite::Error> {
     storage::milestone_repo::get_milestones_for_project(conn, project_id)
+}
+
+// --- Task (M2 Task vertical slice, 2026-09-17) --------------------------
+//
+// The fifth real M2 domain entity, and the first with two independent
+// nullable parent references - `tasks.project_id`/`tasks.goal_id`, both
+// `ON DELETE RESTRICT` (Project/Goal have no hard delete action; a Task
+// must never silently disappear if one is ever added, same reasoning as
+// Milestone/GoalRelation). Only `AddTask`/`UpdateTask` are implemented -
+// RecurringRule/Calendar/Reminder/Challenge/Personal Knowledge are all
+// explicitly out of scope for this slice. Same atomic-mutation-plus-
+// audit, typed-`CoreError` pattern as every entity above - see
+// `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
+
+/// `AddTask`'s confirmation floor is `EXPLICIT_ADD` per the
+/// architecture-freeze report §F's confirmation table / the M2 Project
+/// Child Action Freeze report. Validation order is pure-first
+/// (`validate_add_task` - title only) before any database read; then
+/// `project_id` existence (if supplied), then `goal_id` existence (if
+/// supplied) - each independently, a real database read, neither ever
+/// skipped because the other was checked (Task vertical-slice report
+/// §10 - a Task's Project and Goal need not have any relationship to
+/// each other). `status` is never taken from the payload - a new Task
+/// always starts `TODO`; `recurring_rule_id` is never taken from the
+/// payload either - it always starts `None` (report §2C).
+pub(crate) fn add_task(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: AddTaskPayload,
+) -> ActionOutcome<Task> {
+    let normalized_title = match crate::actions::validate_add_task(&payload) {
+        Ok(t) => t,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    if let Some(project_id) = payload.project_id {
+        match storage::project_repo::project_exists(conn, project_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedProjectNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+    if let Some(goal_id) = payload.goal_id {
+        match storage::goal_repo::goal_exists(conn, goal_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedGoalNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+    let task = Task {
+        id: TaskId::new(),
+        title: normalized_title,
+        status: TaskStatus::Todo,
+        due_at: payload.due_at,
+        project_id: payload.project_id,
+        goal_id: payload.goal_id,
+        recurring_rule_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::task_repo::insert_task(&tx, &task) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::task_repo::insert_audit_entry(
+        &tx,
+        task.id,
+        "AddTask",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: task,
+        confirmation_class: class,
+    }
+}
+
+/// `UpdateTask`'s confirmation floor is also `EXPLICIT_ADD` - the frozen
+/// floor from the M2 Project Child Action Freeze report, not
+/// `IMPORTANT_CHANGE` like `UpdateGoal` (do not invent a stricter floor
+/// than frozen). If `payload.project_id`/`payload.goal_id` is
+/// `FieldPatch::Set(x)`, `x` must reference a real, existing Project/
+/// Goal - checked independently, same reasoning as `add_task` above.
+/// `FieldPatch::Clear`/`Unchanged` need no existence check.
+/// `recurring_rule_id` is never touched - `UpdateTaskPayload` has no
+/// such field.
+pub(crate) fn update_task(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: UpdateTaskPayload,
+) -> ActionOutcome<Task> {
+    let existing = match storage::task_repo::get_task(conn, payload.id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(errors) = crate::actions::validate_update_task(&existing, &payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    if let FieldPatch::Set(project_id) = payload.project_id {
+        match storage::project_repo::project_exists(conn, project_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedProjectNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+    if let FieldPatch::Set(goal_id) = payload.goal_id {
+        match storage::goal_repo::goal_exists(conn, goal_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedGoalNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let previous_snapshot = serde_json::to_string(&existing).ok();
+
+    let mut updated = existing;
+    if let Some(title) = payload.title {
+        updated.title = title.trim().to_string();
+    }
+    if let Some(status) = payload.status {
+        updated.status = status;
+    }
+    match payload.due_at {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(due_at) => updated.due_at = Some(due_at),
+        FieldPatch::Clear => updated.due_at = None,
+    }
+    match payload.project_id {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(project_id) => updated.project_id = Some(project_id),
+        FieldPatch::Clear => updated.project_id = None,
+    }
+    match payload.goal_id {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(goal_id) => updated.goal_id = Some(goal_id),
+        FieldPatch::Clear => updated.goal_id = None,
+    }
+    updated.updated_at = meta.requested_at;
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::task_repo::update_task(&tx, &updated) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::task_repo::insert_audit_entry(
+        &tx,
+        updated.id,
+        "UpdateTask",
+        meta.actor,
+        meta.provenance,
+        class,
+        previous_snapshot.as_deref(),
+        meta.requested_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: updated,
+        confirmation_class: class,
+    }
+}
+
+/// Narrow internal read, same reasoning as `get_goal`/`get_project`/
+/// `get_milestone`.
+pub(crate) fn get_task(conn: &Connection, id: TaskId) -> Result<Option<Task>, rusqlite::Error> {
+    storage::task_repo::get_task(conn, id)
+}
+
+/// Deterministic technical ordering (`due_at ASC, created_at ASC, id
+/// ASC` - NOT product prioritization; see `task_repo::get_tasks_for_project`'s
+/// doc comment).
+pub(crate) fn get_tasks_for_project(
+    conn: &Connection,
+    project_id: ProjectId,
+) -> Result<Vec<Task>, rusqlite::Error> {
+    storage::task_repo::get_tasks_for_project(conn, project_id)
+}
+
+/// Same ordering/documentation as `get_tasks_for_project`, above.
+pub(crate) fn get_tasks_for_goal(
+    conn: &Connection,
+    goal_id: GoalId,
+) -> Result<Vec<Task>, rusqlite::Error> {
+    storage::task_repo::get_tasks_for_goal(conn, goal_id)
 }
 
 #[cfg(test)]

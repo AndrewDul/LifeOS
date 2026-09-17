@@ -731,3 +731,237 @@ fn update_milestone_inferred_provenance_becomes_inferred_change() {
     );
     assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
 }
+
+// =========================================================================
+// Task / AddTask / UpdateTask (M2 Task vertical slice, 2026-09-17) -
+// direct unit tests. `TaskStatus`'s string mappings/parse round trips
+// live in `domain::tests` (pure domain-type concern, same precedent as
+// `LifecycleStatus`/`MilestoneStatus`) - not duplicated here.
+// `project_id`/`goal_id` existence both need a database read and are
+// proven in `services::tests` instead.
+// =========================================================================
+
+fn base_task(status: TaskStatus) -> Task {
+    Task {
+        id: TaskId::new(),
+        title: "Base task".to_string(),
+        status,
+        due_at: None,
+        project_id: None,
+        goal_id: None,
+        recurring_rule_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn base_add_task_payload() -> AddTaskPayload {
+    AddTaskPayload {
+        title: "Valid task title".to_string(),
+        due_at: None,
+        project_id: None,
+        goal_id: None,
+    }
+}
+
+#[test]
+fn add_task_title_is_trimmed() {
+    let payload = AddTaskPayload {
+        title: "  Buy groceries  ".to_string(),
+        ..base_add_task_payload()
+    };
+    let title = validate_add_task(&payload).expect("should validate");
+    assert_eq!(title, "Buy groceries");
+}
+
+#[test]
+fn add_task_rejects_empty_title() {
+    for bad in ["", "   ", "\t\n"] {
+        let payload = AddTaskPayload {
+            title: bad.to_string(),
+            ..base_add_task_payload()
+        };
+        let errors = validate_add_task(&payload).expect_err("empty title must be rejected");
+        assert!(
+            errors.contains(&ValidationError::EmptyTitle),
+            "expected EmptyTitle for {bad:?}, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn add_task_rejects_title_too_long() {
+    let payload = AddTaskPayload {
+        title: "x".repeat(TITLE_MAX_LEN + 1),
+        ..base_add_task_payload()
+    };
+    let errors = validate_add_task(&payload).expect_err("overlong title must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TitleTooLong { .. })),
+        "expected TitleTooLong, got {errors:?}"
+    );
+}
+
+#[test]
+fn add_task_explicit_provenance_is_explicit_add() {
+    // Architecture-freeze report §F confirmation table / M2 Project
+    // Child Action Freeze report list AddTask under EXPLICIT_ADD.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
+}
+
+#[test]
+fn add_task_inferred_provenance_becomes_inferred_change() {
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}
+
+// --- UpdateTask validation ------------------------------------------------
+
+#[test]
+fn update_task_rejects_when_no_fields_touched() {
+    let existing = base_task(TaskStatus::Todo);
+    let payload = UpdateTaskPayload {
+        id: existing.id,
+        ..Default::default()
+    };
+    let errors =
+        validate_update_task(&existing, &payload).expect_err("no-op update must be rejected");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_task_field_patch_unchanged_alone_is_not_a_touch() {
+    let existing = base_task(TaskStatus::Todo);
+    let payload = UpdateTaskPayload {
+        id: existing.id,
+        due_at: FieldPatch::Unchanged,
+        project_id: FieldPatch::Unchanged,
+        goal_id: FieldPatch::Unchanged,
+        ..Default::default()
+    };
+    let errors = validate_update_task(&existing, &payload)
+        .expect_err("all-Unchanged update must be rejected as touching nothing");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_task_title_some_invalid_is_rejected() {
+    let existing = base_task(TaskStatus::Todo);
+    let payload = UpdateTaskPayload {
+        id: existing.id,
+        title: Some("   ".to_string()),
+        ..Default::default()
+    };
+    let errors =
+        validate_update_task(&existing, &payload).expect_err("empty Some(title) must be rejected");
+    assert!(errors.contains(&ValidationError::EmptyTitle));
+}
+
+#[test]
+fn update_task_due_at_field_patch_semantics_all_valid_alone() {
+    let existing = base_task(TaskStatus::Todo);
+    for patch in [FieldPatch::Set(Utc::now()), FieldPatch::Clear] {
+        let payload = UpdateTaskPayload {
+            id: existing.id,
+            due_at: patch,
+            ..Default::default()
+        };
+        assert!(validate_update_task(&existing, &payload).is_ok());
+    }
+}
+
+#[test]
+fn update_task_project_id_field_patch_semantics_all_valid_alone() {
+    let existing = base_task(TaskStatus::Todo);
+    for patch in [FieldPatch::Set(ProjectId::new()), FieldPatch::Clear] {
+        let payload = UpdateTaskPayload {
+            id: existing.id,
+            project_id: patch,
+            ..Default::default()
+        };
+        assert!(validate_update_task(&existing, &payload).is_ok());
+    }
+}
+
+#[test]
+fn update_task_goal_id_field_patch_semantics_all_valid_alone() {
+    let existing = base_task(TaskStatus::Todo);
+    for patch in [FieldPatch::Set(GoalId::new()), FieldPatch::Clear] {
+        let payload = UpdateTaskPayload {
+            id: existing.id,
+            goal_id: patch,
+            ..Default::default()
+        };
+        assert!(validate_update_task(&existing, &payload).is_ok());
+    }
+}
+
+#[test]
+fn update_task_all_four_statuses_are_accepted_by_pure_validation() {
+    // No transition matrix exists - any typed TaskStatus is accepted by
+    // pure validation regardless of the existing status.
+    let existing = base_task(TaskStatus::Todo);
+    for status in [
+        TaskStatus::Todo,
+        TaskStatus::InProgress,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+    ] {
+        let payload = UpdateTaskPayload {
+            id: existing.id,
+            status: Some(status),
+            ..Default::default()
+        };
+        assert!(
+            validate_update_task(&existing, &payload).is_ok(),
+            "status {status:?} should be accepted - no terminal-state rule exists"
+        );
+    }
+}
+
+#[test]
+fn update_task_no_terminal_state_validation_exists() {
+    // Reopening a DONE or CANCELLED task must not be rejected by pure
+    // validation - matches the Milestone/Goal hardening precedent.
+    for existing_status in [TaskStatus::Done, TaskStatus::Cancelled] {
+        let existing = base_task(existing_status);
+        let payload = UpdateTaskPayload {
+            id: existing.id,
+            status: Some(TaskStatus::Todo),
+            ..Default::default()
+        };
+        assert!(
+            validate_update_task(&existing, &payload).is_ok(),
+            "{existing_status:?} -> Todo must be allowed - no terminal-state rule is frozen"
+        );
+    }
+}
+
+#[test]
+fn update_task_explicit_provenance_is_explicit_add() {
+    // Frozen floor (M2 Project Child Action Freeze report) - do not
+    // invent an IMPORTANT_CHANGE floor for UpdateTask.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
+}
+
+#[test]
+fn update_task_inferred_provenance_becomes_inferred_change() {
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}

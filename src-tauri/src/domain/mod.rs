@@ -4,13 +4,15 @@
 //! the canonical `Project.progress` resolution; GoalRelation vertical
 //! slice added 2026-09-17 - the first true relationship-graph entity;
 //! Milestone vertical slice added 2026-09-17 - the fourth entity, the
-//! first required-parent child entity).
+//! first required-parent child entity; Task vertical slice added
+//! 2026-09-17 - the fifth entity, the first with two independent
+//! nullable parent references).
 //!
 //! Pure data, no I/O, no SQL - matches `LIFEOS_SPEC.md` §5.6's module
-//! boundaries. `Goal`, `Project`, `GoalRelation`, and `Milestone` are
-//! implemented so far (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model
-//! has more; `Task`/`Fact`/etc. are explicitly out of scope for this
-//! run).
+//! boundaries. `Goal`, `Project`, `GoalRelation`, `Milestone`, and
+//! `Task` are implemented so far (`LIFEOS_SPEC.md` §5.1's frozen v0.1
+//! domain model has more; `Fact`/etc. are explicitly out of scope for
+//! this run).
 
 // Not wired into `run()` yet this run (no capability/Tauri-command
 // layer exists) - only exercised by services::tests, hence dead_code
@@ -412,6 +414,132 @@ pub(crate) struct Milestone {
     pub target_date: Option<DateTime<Utc>>,
     pub status: MilestoneStatus,
     pub order_index: OrderIndex,
+}
+
+/// A stable, globally unique Task identifier - same UUID v7 design as
+/// every other entity ID (M2 Task vertical slice, 2026-09-17). Its own
+/// newtype for the same type-safety reason every other entity ID is its
+/// own type.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct TaskId(pub Uuid);
+
+impl TaskId {
+    pub(crate) fn new() -> Self {
+        TaskId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(TaskId)
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique identifier reserved for the future,
+/// **not-yet-implemented** `RecurringRule` entity (M2 Task vertical
+/// slice, 2026-09-17). Defined now, alongside `Task.recurring_rule_id`
+/// below, purely as a typed placeholder so the frozen field can exist
+/// without a stringly-typed or `Uuid`-raw stand-in - `RecurringRule`
+/// itself (the table, the rrule/RFC5545 machinery, recurrence
+/// expansion, Calendar/Reminder) is deliberately **not built this
+/// run** - see the Task vertical-slice report §3 for the full
+/// reasoning. Nothing in this codebase constructs a real
+/// `RecurringRuleId` yet; `AddTask`/`UpdateTask` never accept one
+/// (`Task.recurring_rule_id` is always `None`, enforced additionally by
+/// a database `CHECK (recurring_rule_id IS NULL)` -
+/// `migrations/V5__create_tasks.sql`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct RecurringRuleId(pub Uuid);
+
+impl RecurringRuleId {
+    pub(crate) fn new() -> Self {
+        RecurringRuleId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(RecurringRuleId)
+    }
+}
+
+impl std::fmt::Display for RecurringRuleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `Task`'s frozen, closed 4-value status enum (architecture-freeze
+/// report §C / `LIFEOS_SPEC.md` §5.1). No terminal-state rule: all four
+/// are freely reversible peer states (M2 Project Child Action Freeze
+/// report §5 / Task vertical-slice report §7) - do not reintroduce one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TaskStatus {
+    Todo,
+    InProgress,
+    Done,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Todo => "TODO",
+            TaskStatus::InProgress => "IN_PROGRESS",
+            TaskStatus::Done => "DONE",
+            TaskStatus::Cancelled => "CANCELLED",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "TODO" => Some(TaskStatus::Todo),
+            "IN_PROGRESS" => Some(TaskStatus::InProgress),
+            "DONE" => Some(TaskStatus::Done),
+            "CANCELLED" => Some(TaskStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// `Task` (M2 Task vertical slice, 2026-09-17) - the fifth real M2
+/// domain entity, and the first entity with **two independent,
+/// both-nullable** parent references: `project_id`/`goal_id`. A Task
+/// may be standalone (both `None`), Project-only, Goal-only, or linked
+/// to both at once - all four configurations are valid, neither parent
+/// is required, and neither is ever inferred from the other (Task
+/// vertical-slice report §3 - a Task's `Project` being linked to some
+/// `Goal` does NOT imply anything about the Task's own `goal_id`).
+/// Field set is EXACTLY the frozen architecture-freeze definition:
+/// `id`, `title`, `status`, `due_at` (nullable), `project_id`
+/// (nullable), `goal_id` (nullable), `recurring_rule_id` (nullable,
+/// reserved for the future - see `RecurringRuleId`'s doc comment),
+/// `created_at`/`updated_at`. Deliberately **excludes**
+/// `description`/`priority`/`milestone_id`/`progress`/
+/// `parent_task_id`/`tags`/a completion percentage/AI metadata/any
+/// other hidden workflow field - none are in the frozen model, and
+/// `milestone_id` specifically is NOT inferred just because `Milestone`
+/// and `Task` are both `Project` children (Task vertical-slice report
+/// §24 - if a future product requirement needs tasks attached directly
+/// to milestones, that must be frozen separately, not added here
+/// silently).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Task {
+    pub id: TaskId,
+    pub title: String,
+    pub status: TaskStatus,
+    pub due_at: Option<DateTime<Utc>>,
+    pub project_id: Option<ProjectId>,
+    pub goal_id: Option<GoalId>,
+    pub recurring_rule_id: Option<RecurringRuleId>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

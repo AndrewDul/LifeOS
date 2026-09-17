@@ -19,8 +19,9 @@
 use crate::core_error::CoreError;
 use crate::domain::{
     Goal, GoalId, GoalRelationType, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
-    OrderIndex, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN,
-    ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
+    OrderIndex, Priority, Progress, ProjectId, Task, TaskId, TaskStatus, DESCRIPTION_MAX_LEN,
+    DOMAIN_TAG_MAX_LEN, ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN,
+    TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -676,6 +677,123 @@ pub(crate) fn validate_update_milestone(
     // No target_date-specific validation: same as Goal.target_date, a
     // typed DateTime<Utc> has nothing further this pure layer checks.
     // No status-transition check: PENDING <-> DONE is always allowed.
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+// --- Task (M2 Task vertical slice, 2026-09-17) --------------------------
+//
+// The frozen M2 action set for Task is AddTask/UpdateTask only -
+// RecurringRule/Calendar/Reminder/Challenge/Personal Knowledge are all
+// explicitly out of scope for this slice. Both actions have an
+// `EXPLICIT_ADD` confirmation floor (architecture-freeze report §F /
+// M2 Project Child Action Freeze report) - do not invent an
+// `IMPORTANT_CHANGE` floor for `UpdateTask`.
+//
+// Patch semantics (Task vertical-slice report §5, applying the same
+// corrected rule Milestone already established): `title`/`status` are
+// non-nullable `Task` fields -> plain `Option<T>`. `due_at`/`project_id`/
+// `goal_id` are all genuinely nullable `Task` fields -> `FieldPatch<T>`,
+// so "leave unchanged" and "explicitly clear to NULL" (e.g. unlinking a
+// Task from its Project) stay distinct. `recurring_rule_id` is not part
+// of `UpdateTaskPayload` at all - `UpdateTask` never mutates it (Task
+// vertical-slice report §2C).
+
+/// `AddTask` payload. `status` is deliberately absent - a new Task
+/// always starts `TODO` (Task vertical-slice report §6); completion (or
+/// any other transition) happens only through `UpdateTask`.
+/// `recurring_rule_id` is not part of this payload at all - `AddTask`
+/// always creates one with `recurring_rule_id = None` (report §2C).
+/// `project_id`/`goal_id` existence, when supplied, both need a database
+/// read, so neither can happen in this pure module -
+/// `services::add_task` performs them, independently of each other (a
+/// Task may reference a Project and a Goal that have no relationship to
+/// one another at all - report §3).
+#[derive(Debug, Clone)]
+pub(crate) struct AddTaskPayload {
+    pub title: String,
+    pub due_at: Option<DateTime<Utc>>,
+    pub project_id: Option<ProjectId>,
+    pub goal_id: Option<GoalId>,
+}
+
+/// `UpdateTask` payload - see the patch-semantics note above for why
+/// `title`/`status` are plain `Option` while `due_at`/`project_id`/
+/// `goal_id` are all `FieldPatch`. Whether a `Set` parent reference
+/// exists needs a database read (`services::update_task`), as does
+/// `Task` existence itself. No `recurring_rule_id` field - `UpdateTask`
+/// never mutates it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UpdateTaskPayload {
+    pub id: TaskId,
+    pub title: Option<String>,
+    pub status: Option<TaskStatus>,
+    pub due_at: FieldPatch<DateTime<Utc>>,
+    pub project_id: FieldPatch<ProjectId>,
+    pub goal_id: FieldPatch<GoalId>,
+}
+
+/// Returns the normalized (trimmed) title on success, mirroring
+/// `validate_create_goal`/`validate_create_project`/
+/// `validate_add_milestone`. Deliberately does **not** check
+/// `project_id`/`goal_id` existence - pure logic, no I/O; see
+/// `AddTaskPayload`'s doc. No `due_at`-specific validation exists, same
+/// as `Goal.target_date`/`Milestone.target_date` - a typed
+/// `DateTime<Utc>` has nothing further this pure layer checks (no extra
+/// due-date product rule is invented, per the brief).
+pub(crate) fn validate_add_task(payload: &AddTaskPayload) -> Result<String, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    let mut normalized_title = None;
+
+    match validate_title(&payload.title) {
+        Ok(t) => normalized_title = Some(t),
+        Err(e) => errors.push(e),
+    }
+
+    if errors.is_empty() {
+        Ok(normalized_title.expect("title validated Ok implies normalized_title is Some"))
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validates an update against the *existing* Task - `existing` is
+/// taken for the same shape-consistency reason
+/// `validate_update_goal`/`validate_update_milestone` take it, though no
+/// field here actually needs prior state to validate. No status-
+/// transition restriction: all four `TaskStatus` values are freely
+/// reversible peer states (M2 Project Child Action Freeze report §7 /
+/// Task vertical-slice report §7) - do not add one. Does **not** check
+/// whether a `Set` parent reference exists - needs a database read;
+/// `services::update_task` performs it.
+pub(crate) fn validate_update_task(
+    existing: &Task,
+    payload: &UpdateTaskPayload,
+) -> Result<(), Vec<ValidationError>> {
+    let _ = existing; // reserved for shape-consistency with validate_update_goal/validate_update_milestone
+    let mut errors = Vec::new();
+
+    let touches_any_field = payload.title.is_some()
+        || payload.status.is_some()
+        || !payload.due_at.is_unchanged()
+        || !payload.project_id.is_unchanged()
+        || !payload.goal_id.is_unchanged();
+    if !touches_any_field {
+        errors.push(ValidationError::NoFieldsToUpdate);
+    }
+
+    if let Some(title) = &payload.title {
+        if let Err(e) = validate_title(title) {
+            errors.push(e);
+        }
+    }
+    // No due_at-specific validation, same reasoning as validate_add_task
+    // above. No status-transition check: any TaskStatus -> TaskStatus
+    // change an explicit action requests is allowed.
 
     if errors.is_empty() {
         Ok(())

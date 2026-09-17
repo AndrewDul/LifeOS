@@ -134,3 +134,45 @@ fn milestone_status_parse_rejects_unknown_text() {
     assert_eq!(MilestoneStatus::parse("pending"), None); // case-sensitive
     assert_eq!(MilestoneStatus::parse("ACTIVE"), None); // not a LifecycleStatus value
 }
+
+// =========================================================================
+// TaskStatus (M2 Task vertical slice, 2026-09-17) - the frozen, closed
+// 4-value enum. Not LifecycleStatus and not MilestoneStatus - a
+// genuinely different value set.
+// =========================================================================
+
+const ALL_TASK_STATUSES: [TaskStatus; 4] = [
+    TaskStatus::Todo,
+    TaskStatus::InProgress,
+    TaskStatus::Done,
+    TaskStatus::Cancelled,
+];
+
+#[test]
+fn task_status_as_str_matches_frozen_db_text_values() {
+    assert_eq!(TaskStatus::Todo.as_str(), "TODO");
+    assert_eq!(TaskStatus::InProgress.as_str(), "IN_PROGRESS");
+    assert_eq!(TaskStatus::Done.as_str(), "DONE");
+    assert_eq!(TaskStatus::Cancelled.as_str(), "CANCELLED");
+}
+
+#[test]
+fn task_status_parse_round_trips_through_as_str_for_all_4() {
+    for status in ALL_TASK_STATUSES {
+        let text = status.as_str();
+        assert_eq!(
+            TaskStatus::parse(text),
+            Some(status),
+            "round trip through {text:?} did not return {status:?}"
+        );
+    }
+}
+
+#[test]
+fn task_status_parse_rejects_unknown_text() {
+    assert_eq!(TaskStatus::parse("SOMETHING_ELSE"), None);
+    assert_eq!(TaskStatus::parse(""), None);
+    assert_eq!(TaskStatus::parse("todo"), None); // case-sensitive
+    assert_eq!(TaskStatus::parse("PENDING"), None); // not a MilestoneStatus value
+    assert_eq!(TaskStatus::parse("IN-PROGRESS"), None); // wrong separator
+}
