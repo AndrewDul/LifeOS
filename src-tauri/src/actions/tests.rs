@@ -414,3 +414,78 @@ fn update_progress_confirmation_floor_is_explicit_add() {
     );
     assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
 }
+
+// =========================================================================
+// GoalRelation / LinkGoals (M2 GoalRelation vertical slice, 2026-09-17) -
+// direct unit tests. `GoalRelationType`'s 11 string mappings, 11 parse
+// round trips, and unknown-text rejection live in `domain::tests`
+// instead (it is a pure domain-type concern, same precedent as
+// `LifecycleStatus`'s tests) - not duplicated here. The `from`/`to`
+// existence and exact-duplicate checks need a database read and are
+// proven in `services::tests` instead.
+// =========================================================================
+
+fn base_link_goals_payload() -> LinkGoalsPayload {
+    LinkGoalsPayload {
+        from_goal_id: GoalId::new(),
+        to_goal_id: GoalId::new(),
+        relation_type: GoalRelationType::Supports,
+        note: None,
+    }
+}
+
+#[test]
+fn link_goals_self_link_is_rejected() {
+    let id = GoalId::new();
+    let payload = LinkGoalsPayload {
+        from_goal_id: id,
+        to_goal_id: id,
+        ..base_link_goals_payload()
+    };
+    let errors =
+        validate_link_goals(&payload).expect_err("linking a goal to itself must be rejected");
+    assert!(errors.contains(&ValidationError::SelfGoalRelation));
+}
+
+#[test]
+fn link_goals_valid_two_goal_payload_is_accepted() {
+    let payload = base_link_goals_payload();
+    assert_ne!(payload.from_goal_id, payload.to_goal_id);
+    assert!(validate_link_goals(&payload).is_ok());
+}
+
+#[test]
+fn link_goals_rejects_overlong_note() {
+    let payload = LinkGoalsPayload {
+        note: Some("x".repeat(DESCRIPTION_MAX_LEN + 1)),
+        ..base_link_goals_payload()
+    };
+    let errors = validate_link_goals(&payload).expect_err("overlong note must be rejected");
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::NoteTooLong { .. })));
+}
+
+#[test]
+fn link_goals_explicit_provenance_is_explicit_add() {
+    // Architecture-freeze report §F confirmation table lists LinkGoals
+    // under EXPLICIT_ADD.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
+}
+
+#[test]
+fn link_goals_inferred_provenance_becomes_inferred_change() {
+    // Same mechanism as CreateGoal/CreateProject + Inferred - the type
+    // floor (ExplicitAdd) is lower severity than Inferred's provenance
+    // floor (InferredChange), so the action must block until confirmed.
+    // See `services::tests` for the end-to-end DB proof of zero writes.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}

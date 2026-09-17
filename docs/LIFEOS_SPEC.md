@@ -8,20 +8,26 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 `../CLAUDE.md`.
 
 Status (2026-09-17): M0/M1 done and accepted. M2's storage foundation is
-proven and hardened for production use. Two real domain entities are
-implemented: **Goal** (implemented, then hardened - validated atomicity,
-typed errors, tri-state patch semantics; see the M2 Goal hardening
-report) and **Project** (implemented directly with the hardened pattern
-- `CreateProject`/`UpdateProgress` only, its first cross-entity
-relationship to `Goal` proven; see the M2 Project vertical-slice
-report). The rest of the M2 domain model (Task, Calendar, Personal
-Knowledge, `GoalRelation`, Goal Intelligence, and the rest of the frozen
+proven and hardened for production use, including genuine SQLite
+foreign-key enforcement. Three real domain entities are implemented:
+**Goal** (implemented, then hardened - validated atomicity, typed
+errors, tri-state patch semantics; see the M2 Goal hardening report),
+**Project** (implemented directly with the hardened pattern -
+`CreateProject`/`UpdateProgress` only, its first direct cross-entity
+foreign key to `Goal` proven; see the M2 Project vertical-slice and
+Project/storage integrity hardening reports), and **GoalRelation**
+(implemented directly with the twice-hardened pattern - `LinkGoals`
+only, the first true relationship-*graph* structure, its frozen
+11-value relation-type enum and direction convention proven; see the M2
+GoalRelation vertical-slice report). The rest of the M2 domain model
+(Task, Calendar, Personal Knowledge, Goal Intelligence *reasoning* over
+the graph GoalRelation now makes available, and the rest of the frozen
 action set, including Project's own `AddMilestone`/`AddTask`) is still
 in progress - not implemented yet. M3 is not started. See
 `PROJECT_STATE.md` for exactly what exists; most of this document still
 describes design targets for later milestones, not built functionality
 — §5.1-§5.6 in particular are a frozen *architecture*, only partially
-code so far (Goal and Project).
+code so far (Goal, Project, and GoalRelation).
 
 ---
 
@@ -288,18 +294,23 @@ primary one.
 
 Status: **architecture frozen at M2** (2026-09-17); the storage layer is
 **PROVEN** (2026-09-17, storage spike) and now **hardened for production
-use**. Two real domain entities are implemented end-to-end: **Goal**
-(2026-09-17, vertical slice + hardening) and **Project** (2026-09-17,
-vertical slice, built directly with the hardened pattern) — the rest of
-the domain model (Task, Calendar, Personal Knowledge, `GoalRelation`,
-Goal Intelligence) is not yet started. Full reasoning, tradeoffs, and
-evidence behind every decision in this section:
+use**, including genuine SQLite foreign-key enforcement. Three real
+domain entities are implemented end-to-end: **Goal** (2026-09-17,
+vertical slice + hardening), **Project** (2026-09-17, vertical slice,
+built directly with the hardened pattern), and **GoalRelation**
+(2026-09-17, vertical slice, the first relationship-graph structure,
+built directly with the twice-hardened pattern) — the rest of the
+domain model (Task, Calendar, Personal Knowledge, Goal Intelligence
+*reasoning*) is not yet started. Full reasoning, tradeoffs, and evidence
+behind every decision in this section:
 `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
 `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`,
 `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
-`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`, and
-`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`. Original
-research: `RESEARCH_DECISIONS.md` §4.
+`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`,
+`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`, and
+`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+Original research: `RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
 OS-native key storage.
@@ -379,12 +390,15 @@ Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
 specifically because the capability API's `log_wellbeing()`, §10.1,
 needed something real to persist — not originally in this list, flagged
 in the M2 report as a deliberate small addition, not scope creep).
-**Implementation status (2026-09-17): `Goal` and `Project` are
-implemented** (Goal with its own hardened vertical slice; Project built
-directly with that hardened pattern - `CreateProject`/`UpdateProgress`
-only, not `AddMilestone`/`AddTask`); every other entity in this list,
-`GoalRelation` included, is schema-frozen only — see §5.2's correction
-and `PROJECT_STATE.md` §9 for which one is next.
+**Implementation status (2026-09-17): `Goal`, `Project`, and
+`GoalRelation` are implemented** (Goal with its own hardened vertical
+slice; Project built directly with that hardened pattern -
+`CreateProject`/`UpdateProgress` only, not `AddMilestone`/`AddTask`;
+GoalRelation built directly with the twice-hardened pattern -
+`LinkGoals` only, its full frozen relation-type enum and direction
+convention); every other entity in this list is schema-frozen only —
+see §5.2 for `GoalRelation`'s detail and correction, and
+`PROJECT_STATE.md` §9 for which entity is next.
 
 **`Project.progress` — canonically resolved (2026-09-17, M2 Project/
 storage integrity hardening report).** The Project vertical slice had
@@ -469,28 +483,62 @@ change must be proposed and confirmed, never silently applied (consistent
 with the "I want to focus less on NeXa this week" example in §2, and with
 the `INFERRED_CHANGE` confirmation class, §5.5).
 
-**Schema frozen, NOT yet implemented (corrected 2026-09-17, M2 Goal
-hardening report).** The `GoalRelation` table and the relation-type enum
-above are part of the M2 domain freeze (M2 report §D) - the *intent* is
-that `Goal` relationship edges never need a breaking migration to add
-later. But the actual production migration shipped with the Goal
-vertical slice (`src-tauri/migrations/V1__create_goals.sql`) deliberately
-implements `Goal` only, not `GoalRelation` - there was no "from the
-start" edge table in that migration, and the earlier wording here
-overclaimed that there was. `GoalRelation` will receive its own
-dedicated vertical slice (its own migration, action(s), and tests)
-before M2 is considered complete, following the same
-`domain → actions → services → services::storage` pattern proven for
-`Goal`. The *intelligence* — proposing priorities, surfacing conflicts,
-reasoning about dependencies — is still implemented starting at M6
-(Personal Intelligence, §12); M2 only freezes where that reasoning will
-eventually store its conclusions.
+**`GoalRelation.relation_type` is a frozen, CLOSED 11-value enum** -
+exactly the eleven values listed above, no more, no fewer
+(`GoalRelationType` in `domain/mod.rs`). This is a completely different
+field from the Personal Knowledge Layer's `Relation.relation_type`
+(§5.3, below), which is an intentionally *free string*, deferred until
+M6 usage patterns exist - the two share a name only by coincidence,
+different entities, different design decision, do not conflate them (a
+factual mix-up made this mistake once already - see the correction note
+at the end of this section).
+
+**Schema frozen AND implemented (2026-09-17, M2 GoalRelation vertical
+slice).** `GoalRelation` (`id`, `from_goal_id`, `to_goal_id`,
+`relation_type`, `note`, `created_at`) and its one frozen action,
+`LinkGoals`, are implemented end to end - production migration V3, both
+FKs into `goals(id)` with `ON DELETE RESTRICT` (Goal has no hard
+`DeleteGoal` action; a relation must never silently disappear because an
+endpoint Goal was removed), a `CHECK` rejecting self-links, and a
+`UNIQUE(from_goal_id, to_goal_id, relation_type)` rejecting exact
+duplicates - all proven at the database level, not just documented. Rows
+are directional and never auto-inverted: `LinkGoals` writes exactly the
+one relation requested; `PARENT_OF(parent -> child)` is the canonical
+hierarchy convention, with "child of" derived by querying the reverse
+direction rather than writing a second `CHILD_OF` row (that value
+remains valid and storable for a caller who deliberately requests it
+directly - the freeze keeps it, `LinkGoals` simply never auto-generates
+it). Full evidence:
+`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+
+The *intelligence* — proposing priorities, surfacing conflicts,
+reasoning about dependencies, graph traversal, cycle detection — is
+still implemented starting at M6 (Personal Intelligence, §12); M2 only
+makes the correct typed graph state available for that reasoning to
+consume later, per this run's own explicit scope limit.
+
+**Correction (2026-09-17, M2 GoalRelation vertical-slice report §2):**
+the M2 Project/storage integrity hardening report previously claimed,
+incorrectly, that `GoalRelation.relation_type`'s taxonomy was an
+architecture-freeze `UNRESOLVED QUESTION`. That was a factual mistake,
+conflating three distinct things: this frozen 11-value enum (not open at
+all); the Personal Knowledge Layer's separate, genuinely-free-string
+`Relation.relation_type` (§5.3); and `Goal.domain_tag`, which is the
+field the architecture-freeze report's table actually flags as
+unresolved ("free string - `UNRESOLVED QUESTION`: no rigid taxonomy
+yet"). Corrected in that report and here.
 
 ### 5.3 Personal Knowledge / Memory
 
 **Schema frozen at M2** (M2 report §B): `Entity`, `Fact`, `Relation`,
 `Episode`, `Evidence`, `Source` — do **not** flatten LifeOS memory into
-one text-memory table. Facts distinguish at least these categories:
+one text-memory table. **This `Relation`'s `relation_type` is an
+intentionally free string, not a constrained enum** — deferred until M6
+usage patterns exist (§13's open questions). It is unrelated to, and
+must not be confused with, `GoalRelation.relation_type` (§5.2), a
+completely different, frozen, closed 11-value enum on a completely
+different entity — the two only share a field name. Facts distinguish
+at least these categories:
 `FACT`, `PREFERENCE`, `EXPERIENCE`, `DECISION`, `OBSERVATION`,
 `HYPOTHESIS`, `EFFECTIVE_SOLUTION`, `INEFFECTIVE_SOLUTION`, `SKILL`,
 `HABIT`, `CURRENT_STATE`, and at least these epistemic states:
@@ -996,17 +1044,25 @@ reordered against `PROJECT_STATE.md`'s current reality).
   `bundled-sqlcipher`, not `sqlite3mc` — see §5 and
   `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`) and hardened for
   production use the same day (spike/production separation, no
-  committed machine-specific config). `Goal` is implemented **and**
-  hardened (atomic mutation+audit, typed `CoreError`, `FieldPatch`
-  semantics — `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+  committed machine-specific config; SQLite foreign-key enforcement
+  genuinely enabled in a later hardening pass —
+  `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`).
+  `Goal` is implemented **and** hardened (atomic mutation+audit, typed
+  `CoreError`, `FieldPatch` semantics —
+  `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
   `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`). `Project` is
   also implemented (`CreateProject`/`UpdateProgress`, its `goal_id` link
   to `Goal` proven — `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`),
-  built directly with the hardened pattern. The remainder of the M2
-  domain model is still in progress — a third entity or `GoalRelation`
-  is next (`docs/PROJECT_STATE.md` §9). Local encrypted SQLite, secure key
-  handling (`keyring`), migrations (`refinery`), core action
-  architecture (§2, §5.4-§5.6), initial profile/settings. No AI
+  built directly with the hardened pattern. `GoalRelation` is also
+  implemented (`LinkGoals`, its 11-value relation-type enum and
+  direction convention proven —
+  `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`),
+  the first relationship-*graph* structure, built directly with the
+  twice-hardened pattern. The remainder of the M2 domain model is still
+  in progress — a fourth entity is next (`docs/PROJECT_STATE.md` §9).
+  Local encrypted SQLite, secure key handling (`keyring`), migrations
+  (`refinery`), core action architecture (§2, §5.4-§5.6), initial
+  profile/settings. No AI
   dependency for CRUD (AI-optional resilience, §2).
 - **M3 — Core life UI.** Today, Goals, Projects, Calendar; Quick Add /
   schema-driven forms; PL/EN UI architecture (§1.3); backend recurrence

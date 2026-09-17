@@ -113,6 +113,22 @@ pub(in crate::services) fn get_active_goals(conn: &Connection) -> rusqlite::Resu
     rows.collect()
 }
 
+/// Plain existence check - used by `services::create_project` (a
+/// supplied `goal_id` must reference a real `Goal`) and
+/// `services::link_goals` (both `from_goal_id`/`to_goal_id` must). Lives
+/// here rather than in `project_repo`/`goal_relation_repo` because it is
+/// fundamentally a Goal-repo concern with now three callers - moved
+/// (not duplicated a second/third time) into its natural home during
+/// the M2 GoalRelation vertical slice, 2026-09-17.
+pub(in crate::services) fn goal_exists(conn: &Connection, id: GoalId) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM goals WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+}
+
 /// Minimum state to support a future Undo (build brief Part C5) -
 /// deliberately not a full event-sourcing system: one row per audited
 /// mutation, with `previous_snapshot` (JSON, NULL for a fresh create)

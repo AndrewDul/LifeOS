@@ -10,7 +10,7 @@ use crate::actions::{
     ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
-use crate::domain::LifecycleStatus;
+use crate::domain::{GoalRelationType, LifecycleStatus};
 use std::fs;
 use std::io::Read;
 
@@ -1519,4 +1519,1098 @@ fn req_i4_valid_direct_project_goal_id_accepted() {
     );
     assert_eq!(project_row_count(&conn), 1);
     println!("[req_i4] PASS - direct raw SQL insert with a valid, existing goal_id succeeded");
+}
+
+// =========================================================================
+// M2 GoalRelation vertical slice (2026-09-17) - new evidence below.
+// Evidence for
+// `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+// =========================================================================
+
+fn mk_link_payload(
+    from: crate::domain::GoalId,
+    to: crate::domain::GoalId,
+    relation_type: GoalRelationType,
+) -> LinkGoalsPayload {
+    LinkGoalsPayload {
+        from_goal_id: from,
+        to_goal_id: to,
+        relation_type,
+        note: None,
+    }
+}
+
+fn goal_relation_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM goal_relations", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn goal_relation_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM goal_relation_audit_log", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// Same forced-failure mechanism as `install_audit_failure_trigger`/
+/// `install_project_audit_failure_trigger`, targeting
+/// `goal_relation_audit_log`.
+fn install_goal_relation_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_goal_relation_audit_failure
+         BEFORE INSERT ON goal_relation_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced goal relation audit failure');
+         END;",
+    )
+    .expect("failed to install the forced goal-relation-audit-failure trigger");
+}
+
+fn remove_goal_relation_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_goal_relation_audit_failure;")
+        .expect("failed to remove the forced goal-relation-audit-failure trigger");
+}
+
+/// Requirement 1: V3 migration creates the GoalRelation schema.
+#[test]
+fn req_gr1_v3_migration_creates_goal_relation_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for table in ["goal_relations", "goal_relation_audit_log"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(exists, "[req_gr1] FAIL - missing table {table}");
+    }
+    println!("[req_gr1] PASS - V3 migration created goal_relations + goal_relation_audit_log");
+}
+
+/// Requirement 2: a fresh V1->V2->V3 database works end to end - Goal,
+/// Project, and GoalRelation all created together in one migration run.
+#[test]
+fn req_gr2_fresh_v1_v2_v3_database_works_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project linked to A", Some(goal_a.id)),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(project.goal_id, Some(goal_a.id));
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(goal_a.id, goal_b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.from_goal_id, goal_a.id);
+            assert_eq!(value.to_goal_id, goal_b.id);
+        }
+        other => panic!("[req_gr2] FAIL - expected Success, got {other:?}"),
+    }
+    println!("[req_gr2] PASS - fresh V1->V2->V3 database supports Goal, Project, and GoalRelation together");
+}
+
+/// Requirement 3: an existing database populated only through V2 (real
+/// Goal rows, a real Project linked to a Goal - the actual shape of an
+/// existing user's database before this update) upgrades cleanly to V3.
+#[test]
+fn req_gr3_v2_populated_database_upgrades_cleanly_to_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation3.db");
+
+    let (goal_id, project_id);
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 2).unwrap();
+        let has_relations_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goal_relations'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_relations_table,
+            "[req_gr3] FAIL - a V2-only database already has goal_relations"
+        );
+
+        let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V3 goal")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = goal.id;
+        let project = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Pre-V3 project", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = project.id;
+    }
+
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+        let goal_after = get_goal(&conn, goal_id).unwrap();
+        assert_eq!(
+            goal_after.as_ref().map(|g| g.title.as_str()),
+            Some("Pre-V3 goal"),
+            "[req_gr3] FAIL - Goal data did not survive the V2 -> V3 upgrade"
+        );
+
+        let project_after = get_project(&conn, project_id).unwrap();
+        assert_eq!(
+            project_after.as_ref().map(|p| p.goal_id),
+            Some(Some(goal_id)),
+            "[req_gr3] FAIL - Project.goal_id did not survive the upgrade"
+        );
+
+        let has_relations_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goal_relations'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            has_relations_table,
+            "[req_gr3] FAIL - goal_relations table missing after upgrade"
+        );
+
+        let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Post-V3 goal"))
+        {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(goal_id, goal_b.id, GoalRelationType::Supports),
+        ) {
+            ActionOutcome::Success { .. } => println!(
+                "[req_gr3] PASS - V2 data survived the upgrade to V3, and a new LinkGoals works between pre-existing Goals"
+            ),
+            other => panic!(
+                "[req_gr3] FAIL - expected LinkGoals to succeed after upgrade, got {other:?}"
+            ),
+        }
+    }
+}
+
+/// Requirements 4 & 5: a valid LinkGoals persists, and the relation
+/// survives a full connection close/reopen.
+#[test]
+fn req_gr4_5_valid_link_goals_persists_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation4.db");
+
+    let (goal_a_id, goal_b_id, relation_id);
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_a_id = goal_a.id;
+        goal_b_id = goal_b.id;
+
+        match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(goal_a_id, goal_b_id, GoalRelationType::DependsOn),
+        ) {
+            ActionOutcome::Success {
+                value,
+                confirmation_class,
+            } => {
+                assert_eq!(value.from_goal_id, goal_a_id);
+                assert_eq!(value.to_goal_id, goal_b_id);
+                assert_eq!(value.relation_type, GoalRelationType::DependsOn);
+                assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+                relation_id = value.id;
+                println!("[req_gr4] PASS - LinkGoals succeeded: {value:?}");
+            }
+            other => panic!("[req_gr4] FAIL - expected Success, got {other:?}"),
+        }
+    }
+
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let fetched = get_goal_relation(&conn, relation_id).unwrap();
+        assert!(
+            fetched.is_some(),
+            "[req_gr5] FAIL - relation not found after reopen"
+        );
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.from_goal_id, goal_a_id);
+        assert_eq!(fetched.to_goal_id, goal_b_id);
+        println!("[req_gr5] PASS - relation survived a full connection close/reopen: {fetched:?}");
+    }
+}
+
+/// Requirement 6: a missing `from_goal_id` is rejected before
+/// persistence with a structured error, zero writes.
+#[test]
+fn req_gr6_from_goal_missing_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation6.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let real_goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Real goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let fake_id = crate::domain::GoalId::new();
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(fake_id, real_goal.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::RelationFromGoalNotFound),
+                "expected RelationFromGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_gr6] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        0,
+        "[req_gr6] FAIL - a relation row was written despite the missing from_goal_id"
+    );
+    println!(
+        "[req_gr6] PASS - missing from_goal_id rejected before persistence, zero rows written"
+    );
+}
+
+/// Requirement 7: a missing `to_goal_id` is rejected before persistence
+/// with a structured error, zero writes.
+#[test]
+fn req_gr7_to_goal_missing_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation7.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let real_goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Real goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let fake_id = crate::domain::GoalId::new();
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(real_goal.id, fake_id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::RelationToGoalNotFound),
+                "expected RelationToGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_gr7] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        0,
+        "[req_gr7] FAIL - a relation row was written despite the missing to_goal_id"
+    );
+    println!("[req_gr7] PASS - missing to_goal_id rejected before persistence, zero rows written");
+}
+
+/// Requirement 8: a self-relation is rejected before persistence
+/// (integration-level proof, complementing the pure unit test).
+#[test]
+fn req_gr8_self_relation_rejected_before_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation8.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Solo goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(goal.id, goal.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::SelfGoalRelation));
+        }
+        other => panic!("[req_gr8] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(goal_relation_row_count(&conn), 0);
+    println!("[req_gr8] PASS - self-relation rejected before persistence, zero rows written");
+}
+
+/// Requirement 9: an exact duplicate `(from, to, relation_type)` is
+/// rejected before persistence.
+#[test]
+fn req_gr9_exact_duplicate_rejected_before_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation9.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateGoalRelation));
+        }
+        other => panic!("[req_gr9] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        1,
+        "[req_gr9] FAIL - expected exactly 1 row (the duplicate must not have been written)"
+    );
+    println!("[req_gr9] PASS - exact duplicate rejected before persistence, still exactly 1 row");
+}
+
+/// Requirement 10: different relation types for the same Goal pair both
+/// succeed (A SUPPORTS B and A DEPENDS_ON B coexist).
+#[test]
+fn req_gr10_different_relation_types_for_same_pair_both_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation10.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_gr10] FAIL - expected Success for SUPPORTS, got {other:?}"),
+    }
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::DependsOn),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_gr10] FAIL - expected Success for DEPENDS_ON, got {other:?}"),
+    }
+
+    assert_eq!(goal_relation_row_count(&conn), 2);
+    println!("[req_gr10] PASS - A SUPPORTS B and A DEPENDS_ON B coexist as 2 distinct rows");
+}
+
+/// Requirement 11: the reversed direction is a distinct stored relation
+/// - A SUPPORTS B is not database-identical to B SUPPORTS A.
+#[test]
+fn req_gr11_reversed_direction_is_a_distinct_stored_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation11.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_gr11] FAIL - expected Success for A->B, got {other:?}"),
+    }
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(b.id, a.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_gr11] FAIL - reversed direction B->A must not be treated as a duplicate, got {other:?}"
+        ),
+    }
+
+    assert_eq!(goal_relation_row_count(&conn), 2);
+    println!("[req_gr11] PASS - A SUPPORTS B and B SUPPORTS A are 2 distinct stored rows, not auto-collapsed");
+}
+
+/// Requirement 12: a direct, raw SQL insert naming a nonexistent
+/// `from_goal_id` is rejected by SQLite's own FK enforcement - bypasses
+/// `LinkGoals` entirely, raw SQL kept local to this test.
+#[test]
+fn req_gr12_raw_sql_missing_from_goal_rejected_by_fk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation12.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let fake_from = crate::domain::GoalId::new().to_string();
+    let relation_id = crate::domain::GoalRelationId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO goal_relations (id, from_goal_id, to_goal_id, relation_type, note, created_at)
+         VALUES (?1, ?2, ?3, 'SUPPORTS', NULL, '2026-09-17T00:00:00Z')",
+        rusqlite::params![relation_id, fake_from, b.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_gr12] PASS - raw SQL insert with a nonexistent from_goal_id rejected by FK: {err:?}"
+            );
+        }
+        other => panic!("[req_gr12] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+    assert_eq!(goal_relation_row_count(&conn), 0);
+}
+
+/// Requirement 13: same as requirement 12, for `to_goal_id`.
+#[test]
+fn req_gr13_raw_sql_missing_to_goal_rejected_by_fk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation13.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let fake_to = crate::domain::GoalId::new().to_string();
+    let relation_id = crate::domain::GoalRelationId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO goal_relations (id, from_goal_id, to_goal_id, relation_type, note, created_at)
+         VALUES (?1, ?2, ?3, 'SUPPORTS', NULL, '2026-09-17T00:00:00Z')",
+        rusqlite::params![relation_id, a.id.to_string(), fake_to],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_gr13] PASS - raw SQL insert with a nonexistent to_goal_id rejected by FK: {err:?}"
+            );
+        }
+        other => panic!("[req_gr13] FAIL - expected an SQLite FK constraint error, got {other:?}"),
+    }
+    assert_eq!(goal_relation_row_count(&conn), 0);
+}
+
+/// Requirement 14: a direct, raw SQL self-edge insert is rejected by the
+/// `CHECK (from_goal_id <> to_goal_id)` constraint.
+#[test]
+fn req_gr14_raw_sql_self_edge_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation14.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let relation_id = crate::domain::GoalRelationId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO goal_relations (id, from_goal_id, to_goal_id, relation_type, note, created_at)
+         VALUES (?1, ?2, ?3, 'SUPPORTS', NULL, '2026-09-17T00:00:00Z')",
+        rusqlite::params![relation_id, a.id.to_string(), a.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_gr14] PASS - raw SQL self-edge insert rejected by CHECK: {err:?}");
+        }
+        other => {
+            panic!("[req_gr14] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(goal_relation_row_count(&conn), 0);
+}
+
+/// Requirement 15: a direct, raw SQL duplicate `(from, to, type)` insert
+/// is rejected by the `UNIQUE` constraint.
+#[test]
+fn req_gr15_raw_sql_duplicate_rejected_by_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation15.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let relation_id = crate::domain::GoalRelationId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO goal_relations (id, from_goal_id, to_goal_id, relation_type, note, created_at)
+         VALUES (?1, ?2, ?3, 'SUPPORTS', NULL, '2026-09-17T00:00:00Z')",
+        rusqlite::params![relation_id, a.id.to_string(), b.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_gr15] PASS - raw SQL duplicate insert rejected by UNIQUE: {err:?}");
+        }
+        other => {
+            panic!("[req_gr15] FAIL - expected an SQLite UNIQUE constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(goal_relation_row_count(&conn), 1);
+}
+
+/// Requirement 16: a direct, raw SQL insert with an invalid
+/// `relation_type` text is rejected by the `CHECK` constraint.
+#[test]
+fn req_gr16_raw_sql_invalid_relation_type_rejected_by_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation16.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let relation_id = crate::domain::GoalRelationId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO goal_relations (id, from_goal_id, to_goal_id, relation_type, note, created_at)
+         VALUES (?1, ?2, ?3, 'NOT_A_REAL_TYPE', NULL, '2026-09-17T00:00:00Z')",
+        rusqlite::params![relation_id, a.id.to_string(), b.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_gr16] PASS - raw SQL insert with an invalid relation_type rejected by CHECK: {err:?}"
+            );
+        }
+        other => {
+            panic!("[req_gr16] FAIL - expected an SQLite CHECK constraint error, got {other:?}")
+        }
+    }
+    assert_eq!(goal_relation_row_count(&conn), 0);
+}
+
+/// Requirement 17: LinkGoals's relation-insert + audit-insert are one
+/// atomic transaction - same forced-failure proof as Goal/Project
+/// hardening.
+#[test]
+fn req_gr17_link_goals_audit_failure_rolls_back_relation_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation17.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    install_goal_relation_audit_failure_trigger(&conn);
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_gr17] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_gr17] FAIL - expected StorageError, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        0,
+        "[req_gr17] FAIL - a relation row survived a rolled-back transaction"
+    );
+    assert_eq!(
+        goal_relation_audit_row_count(&conn),
+        0,
+        "[req_gr17] FAIL - an audit row survived a rolled-back transaction"
+    );
+
+    remove_goal_relation_audit_failure_trigger(&conn);
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {
+            println!("[req_gr17] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[req_gr17] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Requirement 18: the audit row carries the required actor/provenance/
+/// confirmation-class metadata.
+#[test]
+fn req_gr18_audit_row_contains_required_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation18.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let relation = match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let (action_type, actor, provenance, confirmation_class): (String, String, String, String) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class FROM goal_relation_audit_log WHERE goal_relation_id = ?1",
+            [relation.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(action_type, "LinkGoals");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    println!(
+        "[req_gr18] PASS - audit row carries action_type={action_type}, actor={actor}, provenance={provenance}, confirmation_class={confirmation_class}"
+    );
+}
+
+/// Requirements 19 & 20: Inferred LinkGoals blocks before write, then a
+/// confirmed resubmission succeeds.
+#[test]
+fn req_gr19_20_inferred_link_goals_requires_confirmation_then_confirmed_resubmission_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation19.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let payload = mk_link_payload(a.id, b.id, GoalRelationType::Supports);
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match link_goals(&mut conn, meta, payload.clone()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_gr19] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        0,
+        "[req_gr19] FAIL - a relation was written before confirmation"
+    );
+    println!(
+        "[req_gr19] PASS - Inferred LinkGoals blocked with ConfirmationRequired, zero rows written"
+    );
+
+    let mut confirmed_meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    confirmed_meta.confirmed = true;
+    match link_goals(&mut conn, confirmed_meta, payload) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(goal_relation_row_count(&conn), 1);
+            println!("[req_gr20] PASS - resubmission with confirmed=true persisted the relation");
+        }
+        other => {
+            panic!("[req_gr20] FAIL - expected Success on confirmed resubmission, got {other:?}")
+        }
+    }
+}
+
+/// Requirements 21 & 22: `get_goal_relations_for_goal` finds both
+/// incoming and outgoing relations for the queried Goal.
+#[test]
+fn req_gr21_22_get_goal_relations_for_goal_finds_incoming_and_outgoing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation21.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let c = match create_goal(&mut conn, ui_explicit(), mk_create_payload("C")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // Outgoing from A's perspective.
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    // Incoming to A's perspective.
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(c.id, a.id, GoalRelationType::DependsOn),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let relations = get_goal_relations_for_goal(&conn, a.id).unwrap();
+    assert_eq!(
+        relations.len(),
+        2,
+        "[req_gr21/22] FAIL - expected 2 relations involving A, got {}",
+        relations.len()
+    );
+    assert!(
+        relations
+            .iter()
+            .any(|r| r.from_goal_id == a.id && r.to_goal_id == b.id),
+        "[req_gr21] FAIL - outgoing A->B relation not found"
+    );
+    assert!(
+        relations
+            .iter()
+            .any(|r| r.from_goal_id == c.id && r.to_goal_id == a.id),
+        "[req_gr22] FAIL - incoming C->A relation not found"
+    );
+    println!(
+        "[req_gr21/22] PASS - get_goal_relations_for_goal found both the outgoing and incoming relation"
+    );
+}
+
+/// Requirement 23: the frozen PARENT_OF convention stores exactly one
+/// row - `LinkGoals` must never auto-insert a `CHILD_OF` inverse.
+#[test]
+fn req_gr23_parent_of_convention_stores_exactly_one_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation23.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let parent = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Parent")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let child = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Child")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(parent.id, child.id, GoalRelationType::ParentOf),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.from_goal_id, parent.id);
+            assert_eq!(value.to_goal_id, child.id);
+            assert_eq!(value.relation_type, GoalRelationType::ParentOf);
+        }
+        other => panic!("[req_gr23] FAIL - expected Success, got {other:?}"),
+    }
+
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        1,
+        "[req_gr23] FAIL - expected exactly 1 row - LinkGoals must never auto-insert a CHILD_OF inverse"
+    );
+
+    let relations_for_child = get_goal_relations_for_goal(&conn, child.id).unwrap();
+    assert_eq!(relations_for_child.len(), 1);
+    assert_eq!(relations_for_child[0].from_goal_id, parent.id);
+    assert_eq!(relations_for_child[0].to_goal_id, child.id);
+    assert_eq!(
+        relations_for_child[0].relation_type,
+        GoalRelationType::ParentOf
+    );
+    println!(
+        "[req_gr23] PASS - PARENT_OF(parent, child) stored as exactly one row; querying relations for Child returns that same row, not a fabricated CHILD_OF inverse"
+    );
+}
+
+/// Requirement 24: `GoalRelationType::ChildOf` remains a valid,
+/// storable, parseable relation type when deliberately requested - the
+/// freeze keeps it even though `LinkGoals` never auto-generates it.
+#[test]
+fn req_gr24_explicit_child_of_remains_valid_when_deliberately_requested() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation24.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let child = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Child (stated from its own side)"),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let parent = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Parent")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(child.id, parent.id, GoalRelationType::ChildOf),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.relation_type, GoalRelationType::ChildOf);
+            println!(
+                "[req_gr24] PASS - explicit CHILD_OF stored and retrievable when deliberately requested: {value:?}"
+            );
+        }
+        other => panic!(
+            "[req_gr24] FAIL - CHILD_OF must remain a valid, storable relation type, got {other:?}"
+        ),
+    }
+}
+
+/// Requirement 25: LinkGoals is never blocked by LifecycleStatus -
+/// relations involving PAUSED/COMPLETED/ABANDONED goals all succeed
+/// (guards against accidentally inventing an "active-only graph").
+#[test]
+fn req_gr25_relations_work_with_paused_completed_abandoned_goals() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation25.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let active = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Active")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let paused = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Paused")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let completed = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Completed")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let abandoned = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Abandoned")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    for (goal, status) in [
+        (&paused, LifecycleStatus::Paused),
+        (&completed, LifecycleStatus::Completed),
+        (&abandoned, LifecycleStatus::Abandoned),
+    ] {
+        match update_goal(
+            &mut conn,
+            ui_explicit(),
+            UpdateGoalPayload {
+                id: goal.id,
+                status: Some(status),
+                ..Default::default()
+            },
+        ) {
+            ActionOutcome::Success { .. } => {}
+            other => panic!("setup failed: {other:?}"),
+        }
+    }
+
+    for (other_goal, label) in [
+        (&paused, "paused"),
+        (&completed, "completed"),
+        (&abandoned, "abandoned"),
+    ] {
+        match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(active.id, other_goal.id, GoalRelationType::Supports),
+        ) {
+            ActionOutcome::Success { .. } => {}
+            other_outcome => panic!(
+                "[req_gr25] FAIL - LinkGoals involving a {label} goal should succeed, got {other_outcome:?}"
+            ),
+        }
+    }
+
+    assert_eq!(goal_relation_row_count(&conn), 3);
+    println!(
+        "[req_gr25] PASS - LinkGoals succeeded for relations involving PAUSED, COMPLETED, and ABANDONED goals - no active-only restriction exists"
+    );
+}
+
+/// Requirement 26: a direct, raw SQL hard delete of a Goal referenced by
+/// a relation is rejected by `ON DELETE RESTRICT`.
+#[test]
+fn req_gr26_raw_hard_delete_of_referenced_goal_is_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "relation26.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(a.id, b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let result = conn.execute(
+        "DELETE FROM goals WHERE id = ?1",
+        rusqlite::params![a.id.to_string()],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "expected a constraint-violation error, got {err:?}"
+            );
+            println!(
+                "[req_gr26] PASS - raw DELETE of a referenced Goal rejected by ON DELETE RESTRICT: {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_gr26] FAIL - expected an SQLite FK constraint error blocking the delete, got {other:?}"
+        ),
+    }
+
+    let goal_still_exists = get_goal(&conn, a.id).unwrap();
+    assert!(
+        goal_still_exists.is_some(),
+        "[req_gr26] FAIL - Goal A was deleted despite the RESTRICT constraint"
+    );
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        1,
+        "[req_gr26] FAIL - relation row disappeared despite the delete being rejected"
+    );
+    println!(
+        "[req_gr26] PASS - Goal A remains, and the relation remains - no dangling relation exists"
+    );
 }

@@ -1,13 +1,14 @@
 //! LifeOS domain types (M2 Goal vertical slice, 2026-09-17; Project
 //! vertical slice added 2026-09-17; Project/storage integrity hardening
 //! 2026-09-17 - see that report for the `LifecycleStatus` rename and
-//! the canonical `Project.progress` resolution below).
+//! the canonical `Project.progress` resolution; GoalRelation vertical
+//! slice added 2026-09-17 - the first true relationship-graph entity).
 //!
 //! Pure data, no I/O, no SQL - matches `LIFEOS_SPEC.md` §5.6's module
-//! boundaries. Only `Goal` and `Project` are implemented so far
-//! (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model has more;
-//! `GoalRelation`/`Milestone`/`Task`/`Fact`/etc. are explicitly out of
-//! scope for this run).
+//! boundaries. `Goal`, `Project`, and `GoalRelation` are implemented so
+//! far (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model has more;
+//! `Milestone`/`Task`/`Fact`/etc. are explicitly out of scope for this
+//! run).
 
 // Not wired into `run()` yet this run (no capability/Tauri-command
 // layer exists) - only exercised by services::tests, hence dead_code
@@ -199,6 +200,121 @@ pub(crate) struct Project {
     pub progress: Progress,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A stable, globally unique GoalRelation identifier - same UUID v7
+/// design as `GoalId`/`ProjectId` (M2 GoalRelation vertical slice,
+/// 2026-09-17). Its own newtype for the same type-safety reason
+/// `ProjectId` is not `GoalId`: a `GoalRelationId` must never be usable
+/// where a `GoalId` is expected, and vice versa.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct GoalRelationId(pub Uuid);
+
+impl GoalRelationId {
+    pub(crate) fn new() -> Self {
+        GoalRelationId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(GoalRelationId)
+    }
+}
+
+impl std::fmt::Display for GoalRelationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The frozen, closed 11-value `GoalRelation` relation-type enum
+/// (architecture-freeze report §D / `LIFEOS_SPEC.md` §5.2). **Distinct
+/// from, and not to be confused with, the Personal Knowledge Layer's
+/// separate `Relation.relation_type`** (`LIFEOS_SPEC.md` §5.3), which
+/// is an intentionally free string deferred until M6 usage patterns
+/// exist - the two are unrelated fields on unrelated entities that
+/// happen to share a name. This one is closed and frozen: do not add or
+/// remove variants without `LIFEOS_SPEC.md` re-freezing the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum GoalRelationType {
+    Supports,
+    ConflictsWith,
+    DependsOn,
+    Blocks,
+    ContributesTo,
+    Requires,
+    /// Canonical hierarchy direction: write `ParentOf(parent -> child)`.
+    /// The application derives "child of" by querying the reverse
+    /// direction - never auto-insert the `ChildOf` inverse row (M2
+    /// GoalRelation vertical-slice report §5).
+    ParentOf,
+    /// Kept as a valid, storable, parseable enum value because the
+    /// freeze explicitly retains it - not a dead variant. Only ever
+    /// written when a caller *deliberately* states `ChildOf` directly
+    /// (e.g. recording "B is a child of A" from B's perspective without
+    /// restating it as `ParentOf` from A's) - `LinkGoals` never
+    /// auto-generates it as an inverse of `ParentOf`.
+    ChildOf,
+    Duplicates,
+    Supersedes,
+    CompetesForResource,
+}
+
+impl GoalRelationType {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            GoalRelationType::Supports => "SUPPORTS",
+            GoalRelationType::ConflictsWith => "CONFLICTS_WITH",
+            GoalRelationType::DependsOn => "DEPENDS_ON",
+            GoalRelationType::Blocks => "BLOCKS",
+            GoalRelationType::ContributesTo => "CONTRIBUTES_TO",
+            GoalRelationType::Requires => "REQUIRES",
+            GoalRelationType::ParentOf => "PARENT_OF",
+            GoalRelationType::ChildOf => "CHILD_OF",
+            GoalRelationType::Duplicates => "DUPLICATES",
+            GoalRelationType::Supersedes => "SUPERSEDES",
+            GoalRelationType::CompetesForResource => "COMPETES_FOR_RESOURCE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "SUPPORTS" => Some(GoalRelationType::Supports),
+            "CONFLICTS_WITH" => Some(GoalRelationType::ConflictsWith),
+            "DEPENDS_ON" => Some(GoalRelationType::DependsOn),
+            "BLOCKS" => Some(GoalRelationType::Blocks),
+            "CONTRIBUTES_TO" => Some(GoalRelationType::ContributesTo),
+            "REQUIRES" => Some(GoalRelationType::Requires),
+            "PARENT_OF" => Some(GoalRelationType::ParentOf),
+            "CHILD_OF" => Some(GoalRelationType::ChildOf),
+            "DUPLICATES" => Some(GoalRelationType::Duplicates),
+            "SUPERSEDES" => Some(GoalRelationType::Supersedes),
+            "COMPETES_FOR_RESOURCE" => Some(GoalRelationType::CompetesForResource),
+            _ => None,
+        }
+    }
+}
+
+/// `GoalRelation` (M2 GoalRelation vertical slice, 2026-09-17) - the
+/// first true relationship-graph entity in production M2, distinct from
+/// `Project.goal_id`'s single direct foreign key. Field set is exactly
+/// the frozen model: `id`, `from_goal_id`, `to_goal_id`, `relation_type`,
+/// `note` (nullable), `created_at`. Deliberately **excludes**
+/// `status`/`updated_at`/`confidence`/`weight`/an AI score/an "inferred"
+/// flag/`priority`/any other hidden metadata - none of those are in the
+/// frozen model, and provenance belongs to `ActionMeta`/the audit log,
+/// not this entity itself. A row is a directional, stored fact: one
+/// `LinkGoals` call produces exactly one row, never an automatic
+/// inverse (`GoalRelationType::ParentOf`'s doc comment, above).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GoalRelation {
+    pub id: GoalRelationId,
+    pub from_goal_id: GoalId,
+    pub to_goal_id: GoalId,
+    pub relation_type: GoalRelationType,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

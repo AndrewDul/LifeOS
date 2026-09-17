@@ -18,8 +18,9 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, LifecycleStatus, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN,
-    DOMAIN_TAG_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
+    Goal, GoalId, GoalRelationType, LifecycleStatus, Priority, Progress, ProjectId,
+    DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX,
+    PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -196,6 +197,35 @@ pub(crate) enum ValidationError {
     /// rather than relying solely on the SQL foreign-key constraint
     /// failing (M2 Project vertical slice, 2026-09-17).
     ReferencedGoalNotFound,
+    /// Free-text length bound reusing the same `DESCRIPTION_MAX_LEN`
+    /// policy Goal/Project descriptions already use - not a new,
+    /// invented taxonomy, just the existing generic bound applied to
+    /// `LinkGoals`'s `note` field (M2 GoalRelation vertical slice,
+    /// 2026-09-17). Named `NoteTooLong` rather than reusing
+    /// `DescriptionTooLong` so a caller matching on this error isn't
+    /// told about a "description" that does not exist on `GoalRelation`.
+    NoteTooLong {
+        max: usize,
+        actual: usize,
+    },
+    /// `LinkGoals`'s `from_goal_id == to_goal_id` - a Goal cannot be
+    /// linked to itself in `GoalRelation` v0.1 (deterministic structural
+    /// rule, checked here with no database read needed).
+    SelfGoalRelation,
+    /// `LinkGoals`'s `from_goal_id` does not reference an existing
+    /// `Goal` - needs a database read, so `services::link_goals`
+    /// performs the check and reports it here.
+    RelationFromGoalNotFound,
+    /// `LinkGoals`'s `to_goal_id` does not reference an existing `Goal` -
+    /// same reasoning as `RelationFromGoalNotFound`.
+    RelationToGoalNotFound,
+    /// The exact `(from_goal_id, to_goal_id, relation_type)` triple
+    /// `LinkGoals` was asked to create already exists - needs a database
+    /// read, checked before persistence rather than left to the SQL
+    /// `UNIQUE` constraint to catch (M2 GoalRelation vertical slice,
+    /// 2026-09-17). A different `relation_type` for the same pair, or
+    /// the same type in the reverse direction, is NOT a duplicate.
+    DuplicateGoalRelation,
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +480,58 @@ pub(crate) fn validate_update_progress(
     match validate_progress(payload.progress) {
         Ok(()) => Ok(()),
         Err(e) => Err(vec![e]),
+    }
+}
+
+// --- GoalRelation (M2 GoalRelation vertical slice, 2026-09-17) ----------
+//
+// The frozen M2 action for this graph is LinkGoals only - do not invent
+// a second CreateGoalRelation action alongside it.
+
+fn validate_note(note: &str) -> Result<(), ValidationError> {
+    if note.chars().count() > DESCRIPTION_MAX_LEN {
+        return Err(ValidationError::NoteTooLong {
+            max: DESCRIPTION_MAX_LEN,
+            actual: note.chars().count(),
+        });
+    }
+    Ok(())
+}
+
+/// `LinkGoals` payload. `from_goal_id`/`to_goal_id` existence and the
+/// exact-duplicate check all need a database read, so they cannot
+/// happen in this pure module - `services::link_goals` performs them.
+#[derive(Debug, Clone)]
+pub(crate) struct LinkGoalsPayload {
+    pub from_goal_id: GoalId,
+    pub to_goal_id: GoalId,
+    pub relation_type: GoalRelationType,
+    pub note: Option<String>,
+}
+
+/// Pure structural validation only: `from_goal_id != to_goal_id`.
+/// `relation_type` is already a typed `GoalRelationType` - an invalid
+/// enum value cannot be constructed through normal Rust action
+/// construction, so there is nothing to validate there. `note`, if
+/// present, reuses the same `DESCRIPTION_MAX_LEN` bound Goal/Project
+/// descriptions already use (`validate_note`, above) - not a new,
+/// invented taxonomy.
+pub(crate) fn validate_link_goals(payload: &LinkGoalsPayload) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    if payload.from_goal_id == payload.to_goal_id {
+        errors.push(ValidationError::SelfGoalRelation);
+    }
+    if let Some(note) = &payload.note {
+        if let Err(e) = validate_note(note) {
+            errors.push(e);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 

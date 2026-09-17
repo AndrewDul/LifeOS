@@ -389,14 +389,33 @@ resolving them silently in code has now been exercised twice (Goal's
 terminal-status removal, this run's action-set-gap documentation) and
 held both times.
 
-**One live caveat specific to `GoalRelation`:** unlike `Project.goal_id`
-(a single nullable FK), `GoalRelation` is an edge table with **two**
-foreign keys (`from_goal_id`, `to_goal_id`) into the *same* `goals`
-table, plus a `relation_type` enum the architecture freeze already flags
-as an `UNRESOLVED QUESTION` (no rigid taxonomy yet - `LIFEOS_SPEC.md`
-§5.1's Goal entity row). That taxonomy question is unrelated to this
-run's storage-integrity work and remains genuinely open - whoever starts
-`GoalRelation` should expect to either implement it against the freeze's
-listed relation-type enum as-is, or explicitly flag broadening it, the
-same way this run flagged `Project.progress` and the action-set gap
-rather than silently deciding either.
+**One live structural note specific to `GoalRelation`:** unlike
+`Project.goal_id` (a single nullable FK), `GoalRelation` is an edge
+table with **two** foreign keys (`from_goal_id`, `to_goal_id`) into the
+*same* `goals` table - a genuinely new shape this codebase has not
+built yet, worth attention when it's implemented, but not itself an
+open question.
+
+**Correction (2026-09-17, M2 GoalRelation vertical-slice report §2):**
+this section originally claimed here that `GoalRelation.relation_type`
+was an `UNRESOLVED QUESTION` per the architecture freeze's "no rigid
+taxonomy yet" note - that was a factual mistake, conflating three
+distinct things:
+
+1. `GoalRelation.relation_type` - a **frozen, closed 11-value enum**
+   (`SUPPORTS`/`CONFLICTS_WITH`/`DEPENDS_ON`/`BLOCKS`/`CONTRIBUTES_TO`/
+   `REQUIRES`/`PARENT_OF`/`CHILD_OF`/`DUPLICATES`/`SUPERSEDES`/
+   `COMPETES_FOR_RESOURCE`), not open at all.
+2. The Personal Knowledge Layer's separate `Relation.relation_type`
+   (`LIFEOS_SPEC.md` §5.3) - genuinely an intentionally free string,
+   deferred until M6 usage patterns exist. Unrelated entity, unrelated
+   field, same name only by coincidence.
+3. `Goal.domain_tag` - the field the architecture freeze's own table
+   actually flags "(free string - `UNRESOLVED QUESTION`: no rigid
+   taxonomy yet)." That note was never about any `relation_type` at
+   all.
+
+`GoalRelation` was always safe to start on this specific point - see
+`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md` for
+the vertical slice that implements it against the frozen enum exactly
+as listed above.

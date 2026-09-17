@@ -5,14 +5,14 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 Project/storage integrity hardening —
-SQLite foreign-key enforcement genuinely enabled and proven at the
-database level, `Project.progress` canonically resolved in
-`LIFEOS_SPEC.md`, `GoalStatus` renamed to `LifecycleStatus`
-(behavior-preserving), and an open action-set gap documented rather
-than silently resolved in code - on top of the same day's Goal vertical
-slice/storage hardening, Goal hardening pass, and Project vertical
-slice).
+Last updated: 2026-09-17 (M2 GoalRelation vertical slice — the third
+real domain entity and the first true relationship-graph structure,
+implemented via the frozen `LinkGoals` action, directly with the
+already-hardened pattern; also corrects a factual GoalRelation-vs-
+Personal-Knowledge-Relation taxonomy confusion in the previous run's
+report - on top of the same day's Goal vertical slice/storage
+hardening, Goal hardening pass, Project vertical slice, and Project/
+storage integrity hardening).
 
 ---
 
@@ -22,27 +22,27 @@ slice).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal (implemented + hardened) and Project (implemented) vertical slices done** 2026-09-17 (§4); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, and GoalRelation (the first relationship graph) all implemented** 2026-09-17 (§4); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
 
-**M2 now has two real, working, tested domain entities: Goal and
-Project**, end to end through `domain → actions → services → private
-services/storage → encrypted SQLCipher`. Four runs on 2026-09-17 built
-this: the Goal vertical slice (storage foundation hardening + Goal
-implemented), a dedicated Goal hardening pass (fixed 7 issues before the
-pattern was reused), the **Project vertical slice** (second entity,
-built directly with the already-hardened pattern), and a **Project/
-storage integrity hardening pass** - not a new entity, a cross-cutting
-fix: SQLite foreign-key enforcement is now genuinely ON (previously
-declared in schema but never enabled at runtime), `Project.progress` is
-canonically resolved rather than an open interpretation, the shared
-status type is honestly named (`LifecycleStatus`, not `GoalStatus`), and
-a real architecture gap (no action edits a Project's title/description/
-status/priority/goal_id) is documented instead of silently invented.
-See §4b-§4f. Next step is a third entity or `GoalRelation` - not the
-rest of the domain model at once, and still not M3.
+**M2 now has three real, working, tested domain entities: Goal,
+Project, and GoalRelation**, end to end through
+`domain → actions → services → private services/storage → encrypted
+SQLCipher`. Five runs on 2026-09-17 built this: the Goal vertical slice
+(storage foundation hardening + Goal implemented), a dedicated Goal
+hardening pass (fixed 7 issues before the pattern was reused), the
+**Project vertical slice** (second entity, built directly with the
+already-hardened pattern), a **Project/storage integrity hardening
+pass** (SQLite FK enforcement genuinely enabled, `Project.progress`
+canonically resolved, `GoalStatus` renamed to `LifecycleStatus`, an
+action-set gap documented), and the **GoalRelation vertical slice**
+(third entity, the first true relationship-graph structure - two
+foreign keys into `goals`, a frozen 11-value relation-type enum, the
+`LinkGoals` action - built directly with the twice-hardened pattern, no
+separate hardening pass needed). See §4b-§4h. Next step is a fourth
+entity - not the rest of the domain model at once, and still not M3.
 
 ---
 
@@ -50,7 +50,7 @@ rest of the domain model at once, and still not M3.
 
 A Tauri 2 + React + TypeScript desktop app that launches in a real
 window (accepted M1 shell, untouched), plus a working, hardened
-encrypted store for two domain entities:
+encrypted store for three domain entities:
 
 - **Goal**: create and update goals with deterministic validation,
   atomic mutation+audit transactions, tri-state patch semantics
@@ -59,23 +59,34 @@ encrypted store for two domain entities:
 - **Project**: create projects (optionally linked to an existing Goal by
   `goal_id`, validated to actually exist before persistence) and update
   their progress, same atomic-transaction/typed-error discipline from
-  the start, its own `project_audit_log`, and a read API. The first real
-  cross-entity relationship in production M2 (`Project.goal_id ->
-  Goal.id`) - not the future `GoalRelation` graph, which remains
-  unimplemented.
+  the start, its own `project_audit_log`, and a read API. The first
+  *direct foreign key* cross-entity relationship in production M2
+  (`Project.goal_id -> Goal.id`).
+- **GoalRelation**: link two existing Goals via `LinkGoals` with one of
+  11 frozen relation types (`SUPPORTS`/`CONFLICTS_WITH`/`DEPENDS_ON`/
+  `BLOCKS`/`CONTRIBUTES_TO`/`REQUIRES`/`PARENT_OF`/`CHILD_OF`/
+  `DUPLICATES`/`SUPERSEDES`/`COMPETES_FOR_RESOURCE`) and an optional
+  note - the first true relationship-*graph* structure (two foreign keys
+  into `goals`, both `ON DELETE RESTRICT`), directional (no automatic
+  inverse rows), self-links and exact duplicates rejected before
+  persistence, same atomic-transaction/typed-error discipline, its own
+  `goal_relation_audit_log`, and a narrow read API
+  (`get_goal_relation(id)`/`get_goal_relations_for_goal(goal_id)`).
 
-Both are backed by a database that now genuinely enforces referential
+All three are backed by a database that genuinely enforces referential
 integrity at the SQLite level (`PRAGMA foreign_keys = ON`, set on every
-connection `open_encrypted` produces - not just declared in the
-`projects.goal_id` schema and left unenforced, §4e), on top of the
-already-proven SQLCipher encryption and keyring master-key lifecycle.
+connection `open_encrypted` produces - not just declared in schema and
+left unenforced, §4e), on top of the already-proven SQLCipher encryption
+and keyring master-key lifecycle.
 
-73 automated tests prove all of this (9 storage-spike regression, 17
+104 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
-storage integrity integration, 3 direct `LifecycleStatus` unit). **Not
-wired into the running app yet** - no Tauri command layer exists, so the
-UI cannot create/see real goals or projects yet.
+storage integrity integration, 3 direct `LifecycleStatus` unit, 23
+GoalRelation integration, 5 direct `LinkGoals` action-layer unit, 3
+direct `GoalRelationType` unit). **Not wired into the running app yet** -
+no Tauri command layer exists, so the UI cannot create/see real goals,
+projects, or relations yet.
 
 Repository contents as of this run:
 
@@ -94,55 +105,70 @@ LiFeOS/
 │                    REPORT_M2_GOAL_HARDENING_2026-09-17.md
 │                    REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md
 │                    REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md
+│                    REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
     ├── migrations/V1__create_goals.sql          (PRODUCTION schema - Goal only, untouched)
-    │              V2__create_projects.sql        (PRODUCTION schema - Project only, untouched
-    │                                              this run - FK enforcement is a Rust/
-    │                                              connection-level change, not a schema one)
+    │              V2__create_projects.sql        (PRODUCTION schema - Project only, untouched)
+    │              V3__create_goal_relations.sql  (PRODUCTION schema - GoalRelation only, new)
     ├── src/
     │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 modules, all private)
     │   ├── core_error.rs          CoreError/CoreErrorKind - typed Core-boundary error model
     │   │                          (Storage/Migration/Security/Internal)
     │   ├── domain/
-    │   │   ├── mod.rs              Goal, GoalId, Project, ProjectId (both UUID v7),
-    │   │   │                       LifecycleStatus (renamed from GoalStatus this run -
-    │   │   │                       shared by Goal.status and Project.status, "same 4
-    │   │   │                       values as Goal" per the freeze, not a duplicate
-    │   │   │                       ProjectStatus), Progress, Priority (shared)
-    │   │   └── tests.rs             3 new LifecycleStatus round-trip unit tests
+    │   │   ├── mod.rs              Goal, GoalId, Project, ProjectId, GoalRelation,
+    │   │   │                       GoalRelationId (all UUID v7), LifecycleStatus (shared
+    │   │   │                       by Goal.status/Project.status), GoalRelationType (new -
+    │   │   │                       frozen closed 11-value enum, NOT the same thing as the
+    │   │   │                       Personal Knowledge Layer's separate free-string
+    │   │   │                       Relation.relation_type), Progress, Priority (shared)
+    │   │   └── tests.rs             6 round-trip unit tests (3 LifecycleStatus, 3 new
+    │   │                            GoalRelationType - all 11 values/parse round trips)
     │   ├── actions/
     │   │   ├── mod.rs              Actor, Provenance, ActionMeta, ConfirmationClass,
     │   │   │                       ActionOutcome<T>, ValidationError (+
-    │   │   │                       ReferencedGoalNotFound), FieldPatch<T>,
-    │   │   │                       CreateProjectPayload/UpdateProgressPayload,
-    │   │   │                       blocks_until_confirmed (renamed from
-    │   │   │                       goal_blocks_until_confirmed - now entity-generic)
-    │   │   └── tests.rs             26 direct action-layer unit tests (16 Goal, 10 Project)
+    │   │   │                       ReferencedGoalNotFound, SelfGoalRelation,
+    │   │   │                       RelationFromGoalNotFound, RelationToGoalNotFound,
+    │   │   │                       DuplicateGoalRelation, NoteTooLong), FieldPatch<T>,
+    │   │   │                       CreateProjectPayload/UpdateProgressPayload/
+    │   │   │                       LinkGoalsPayload (new), blocks_until_confirmed
+    │   │   └── tests.rs             31 direct action-layer unit tests (16 Goal, 10
+    │   │                            Project, 5 new LinkGoals)
     │   ├── security/mod.rs        OS-keyring master-key lifecycle
     │   └── services/
     │       ├── mod.rs              bootstrap_production_db, create_goal/update_goal,
-    │       │                       create_project/update_progress/get_project - all
-    │       │                       atomic (&mut Connection + rusqlite transaction) -
-    │       │                       capability API contract's names, no dedicated
-    │       │                       capability/ module yet (LIFEOS_SPEC.md §5.6/§10.1)
-    │       ├── tests.rs            35 integration tests against a real encrypted DB
-    │       │                       (17 Goal, 14 Project, 4 Project/storage integrity -
-    │       │                       incl. 4 forced-audit-failure transaction-rollback
-    │       │                       tests, a V1-only-database upgrades-to-V2 migration-
-    │       │                       compatibility test, and 2 direct raw-SQL FK proofs)
+    │       │                       create_project/update_progress/get_project,
+    │       │                       link_goals/get_goal_relation/
+    │       │                       get_goal_relations_for_goal (new) - all atomic
+    │       │                       (&mut Connection + rusqlite transaction) - capability
+    │       │                       API contract's names, no dedicated capability/
+    │       │                       module yet (LIFEOS_SPEC.md §5.6/§10.1)
+    │       ├── tests.rs            58 integration test functions against a real
+    │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
+    │       │                       storage integrity, 23 new GoalRelation functions
+    │       │                       covering 26 numbered requirements - incl. 6
+    │       │                       forced-audit-failure/raw-SQL-FK-bypass proofs
+    │       │                       across all 3 entities, a V2-populated-database
+    │       │                       upgrades-to-V3 migration-compatibility test, 5
+    │       │                       raw-SQL DB-defense-in-depth proofs for
+    │       │                       GoalRelation's FK/CHECK/UNIQUE constraints, and a
+    │       │                       raw hard-DELETE RESTRICT proof)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
-    │           │                    open_encrypted now also calls enable_foreign_keys
-    │           │                    (new, sets + verifies PRAGMA foreign_keys = ON on
-    │           │                    every connection - production, test, and spike
-    │           │                    alike, since all go through this one primitive);
-    │           │                    also hosts actor_str/provenance_str/
-    │           │                    confirmation_class_str/parse_rfc3339 shared by both
-    │           │                    repo modules (moved out of goal_repo, not duplicated)
-    │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services)
+    │           │                    open_encrypted calls enable_foreign_keys (sets +
+    │           │                    verifies PRAGMA foreign_keys = ON on every
+    │           │                    connection - production, test, and spike alike,
+    │           │                    since all go through this one primitive); also
+    │           │                    hosts actor_str/provenance_str/
+    │           │                    confirmation_class_str/parse_rfc3339 shared by all
+    │           │                    3 repo modules (not duplicated per-module)
+    │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services) - also now
+    │           │                    hosts goal_exists (moved from project_repo, now
+    │           │                    shared by project_repo AND goal_relation_repo)
     │           ├── project_repo.rs  Project SQL access, pub(in crate::services)
+    │           ├── goal_relation_repo.rs  GoalRelation SQL access, pub(in
+    │           │                    crate::services) (new)
     │           └── spike/           #[cfg(test)] only - old storage-spike suite, moved
     │               ├── mod.rs, tests.rs, migrations/V1__init.sql, V2__add_note_column.sql
     ├── Cargo.toml, Cargo.lock, tauri.conf.json, build.rs
@@ -467,30 +493,129 @@ behavior, and the V1→V2 migration-compatibility guarantee.
 
 Full evidence: `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
 
-### 4f. What's still architecturally frozen but not yet implemented
+### 4f. GoalRelation vertical slice implemented (2026-09-17)
 
-Personal Knowledge Layer, `GoalRelation`/goal relations, `Milestone`/
-`Task`/`Challenge`/`Plan`/`SolutionAttempt`/`Outcome`/`CalendarEvent`/
-`Reminder`/`Question`/`ProgressUpdate`/`WellbeingCheckin`, the rest of
-the frozen action list (`AddMilestone`/`AddTask` for Project included,
-plus the still-undecided `UpdateProject`-or-narrower-actions gap, §4e
-point 6), `ForgetMemory`'s corrected (hard-delete) semantics, the
-`knowledge`/`backup` modules, a real `capability` module, NeXa
-transport. Full detail: `docs/LIFEOS_SPEC.md` §5.1-§5.6.
+The third real domain entity - and the first true relationship-*graph*
+structure in production M2, built directly with the twice-hardened
+Goal/Project pattern (no separate hardening pass needed):
+
+- **Domain** (`domain::GoalRelation`): `id` (UUID v7, own
+  `GoalRelationId` newtype), `from_goal_id`/`to_goal_id` (both
+  `GoalId`), `relation_type` (`GoalRelationType` - a frozen, closed
+  11-value enum: `SUPPORTS`/`CONFLICTS_WITH`/`DEPENDS_ON`/`BLOCKS`/
+  `CONTRIBUTES_TO`/`REQUIRES`/`PARENT_OF`/`CHILD_OF`/`DUPLICATES`/
+  `SUPERSEDES`/`COMPETES_FOR_RESOURCE`), `note` (nullable), `created_at`.
+  Deliberately excludes `status`/`updated_at`/`confidence`/`weight`/an
+  AI score/an "inferred" flag/`priority` - none are in the frozen model;
+  provenance belongs to `ActionMeta`/the audit log, not the entity.
+- **Action**: `LinkGoals` only - the entire frozen action for this
+  graph, confirmation floor `EXPLICIT_ADD` per the architecture-freeze
+  report §F's table (same mechanism as `CreateGoal`/`CreateProject`:
+  `Provenance::Inferred` raises it to `INFERRED_CHANGE` and blocks until
+  confirmed, proven end-to-end with zero writes before confirmation).
+- **Direction is frozen, never fabricated.** One `LinkGoals` call
+  produces exactly one directional row; no automatic inverse is ever
+  written. `A SUPPORTS B` and `B SUPPORTS A` are two distinct rows if
+  both are explicitly requested - neither auto-creates nor auto-collapses
+  into the other. The canonical hierarchy convention -
+  `PARENT_OF(parent -> child)`, deriving "child of" by querying the
+  reverse direction - is proven to store exactly one row; `CHILD_OF`
+  remains a valid, storable, parseable enum value when a caller
+  deliberately requests it directly (the freeze keeps it; `LinkGoals`
+  never auto-generates it as `PARENT_OF`'s inverse).
+- **Three deterministic structural rules, frozen before coding, not
+  invented mid-implementation:** (1) self-links (`from_goal_id ==
+  to_goal_id`) rejected - every frozen relation type describes a
+  relationship between distinct Goals; (2) exact duplicates (the same
+  `from`/`to`/`relation_type` triple) rejected before persistence -
+  different relation types or reversed direction for the same pair are
+  NOT duplicates; (3) relations may reference Goals in **any**
+  `LifecycleStatus` (ACTIVE/PAUSED/COMPLETED/ABANDONED) - no
+  "active-only graph" rule was invented, proven by a dedicated test for
+  all three non-active statuses.
+- **Hard-delete resolution for GoalRelation's two foreign keys: `ON
+  DELETE RESTRICT`, not cascade.** Goal has no hard `DeleteGoal` action
+  today; a relation must never silently disappear because an endpoint
+  Goal was removed, and any future real Goal deletion must explicitly
+  deal with its relations first. Proven with a raw SQL `DELETE FROM
+  goals` against a referenced Goal - genuinely rejected by SQLite, not
+  merely documented.
+- **Database defense-in-depth, all proven with raw SQL bypassing
+  `LinkGoals` entirely** (kept local to tests, never exposed as
+  production API): nonexistent `from_goal_id`/`to_goal_id` both rejected
+  by the FK constraint; a self-edge rejected by `CHECK (from_goal_id <>
+  to_goal_id)`; a duplicate triple rejected by `UNIQUE(from_goal_id,
+  to_goal_id, relation_type)`; an invalid `relation_type` string
+  rejected by its `CHECK (... IN (...))` list of exactly the 11 frozen
+  values.
+- **Application-level validation kept alongside the real DB constraints**
+  (same pattern established for `Project.goal_id` in §4e): `LinkGoals`
+  checks `from`/`to` existence and exact-duplicate-ness itself first,
+  returning friendly typed errors (`RelationFromGoalNotFound`/
+  `RelationToGoalNotFound`/`DuplicateGoalRelation`/`SelfGoalRelation`)
+  through the normal `ValidationFailed` channel, never leaving a caller
+  to interpret a raw SQL constraint failure.
+- **Atomicity from day one, proven again**: `link_goals` uses the exact
+  same `&mut Connection` + `rusqlite::Transaction` +
+  `CoreError`-on-any-failure shape as Goal/Project - proven with a
+  forced-audit-failure test targeting the new `goal_relation_audit_log`
+  table, not assumed to transfer automatically.
+- **Migration compatibility proven, not assumed**: a dedicated test
+  builds a database populated only through V2 (real Goal rows, a real
+  Project linked to a Goal), then reopens it normally (applying only the
+  newly-pending V3 migration) and confirms all prior data is unchanged
+  and a new `LinkGoals` works between the pre-existing Goals. Neither
+  `V1__create_goals.sql` nor `V2__create_projects.sql` was edited.
+- **DRY cleanup carried out alongside, not deferred**: the Goal-
+  existence check (`goal_exists`) that `create_project` already needed
+  moved from `project_repo` into `goal_repo` (its natural home) rather
+  than being duplicated a third time in `goal_relation_repo` - both
+  `project_repo`/`goal_relation_repo` now call `goal_repo::goal_exists`.
+- **Read side stays narrow**: `get_goal_relation(id)` and
+  `get_goal_relations_for_goal(goal_id)` (querying both `from_goal_id`
+  and `to_goal_id` - the actual stored direction, never a fabricated
+  inverse) only - no public capability transport added this run.
+
+Full evidence, exact SQL, and every test result:
+`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+
+**Documentation correction made before implementation began**: the
+Project/storage hardening report (§14) had incorrectly claimed
+`GoalRelation.relation_type` was an architecture-freeze
+`UNRESOLVED QUESTION` - it is not; that note was actually about
+`Goal.domain_tag`, and was separately conflated with the *different*,
+genuinely-free-string Personal Knowledge Layer `Relation.relation_type`
+(§5.3). `GoalRelation.relation_type` has always been a frozen, closed
+11-value enum. Corrected in that report and in `LIFEOS_SPEC.md` - see
+the GoalRelation vertical-slice report §2 for the full correction.
+
+### 4g. What's still architecturally frozen but not yet implemented
+
+Personal Knowledge Layer, `Milestone`/`Task`/`Challenge`/`Plan`/
+`SolutionAttempt`/`Outcome`/`CalendarEvent`/`Reminder`/`Question`/
+`ProgressUpdate`/`WellbeingCheckin`, the rest of the frozen action list
+(`AddMilestone`/`AddTask` for Project, plus the still-undecided
+`UpdateProject`-or-narrower-actions gap, §4e point 6), `ForgetMemory`'s
+corrected (hard-delete) semantics, the `knowledge`/`backup` modules, a
+real `capability` module, NeXa transport. Full detail:
+`docs/LIFEOS_SPEC.md` §5.1-§5.6.
 
 ### Next implementation step (M2)
 
-A third domain entity or `GoalRelation` (the first cross-entity
-relationship *graph*, distinct from the `Goal`/`Project` direct foreign
-keys already proven and now genuinely DB-enforced). Whichever is
-chosen, reuse `domain → actions → services →
+A fourth domain entity - `Milestone`/`Task` (both need Project's
+`AddMilestone`/`AddTask` actions, not yet implemented) or the Personal
+Knowledge Layer (`Entity`/`Fact`/`Relation`/`Episode`/`Evidence`/
+`Source` - note: that `Relation` is the genuinely-free-string one, not
+`GoalRelation`, §4f's correction) are the most natural next candidates.
+Whichever is chosen, reuse `domain → actions → services →
 services::storage::<entity>_repo` with the same atomicity/typed-error
-discipline applied from the start (as Project did, not retrofitted
-afterward like Goal needed). Do not implement Milestone/Task in the same
-pass as whatever is chosen, and do not invent product rules inside the
-implementation - flag them as open questions instead (§4c's lesson from
-the removed terminal-status rule, reinforced by §4e's action-set-gap
-documentation rather than a silently invented `UpdateProject`).
+discipline applied from the start (as Project and GoalRelation both
+did, not retrofitted afterward like Goal needed). Do not invent product
+rules inside the implementation - flag them as open questions instead
+(§4c's lesson from the removed terminal-status rule; §4e's action-set-
+gap documentation; §4f's three relation-integrity rules being frozen
+*before* coding rather than invented mid-implementation, and its
+taxonomy correction being caught and fixed rather than left standing).
 
 ---
 
@@ -550,9 +675,10 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   13. `feat: implement first M2 Goal vertical slice`
   14. `fix: harden M2 Goal action atomicity and patch semantics`
   15. `feat: implement M2 Project vertical slice`
-  16. (this run) `fix: harden M2 project integrity and shared lifecycle types`
-      — see this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-16 were not
+  16. `fix: harden M2 project integrity and shared lifecycle types`
+  17. (this run) `feat: implement M2 GoalRelation graph slice` — see
+      this run's report and chat reply for the exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8-17 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -566,44 +692,49 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 ## 8. What can the user actually do right now?
 
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
-unchanged, no real goals or projects visible there yet (no Tauri command
-wiring). Separately, `cd src-tauri && cargo test -- --test-threads=1`
-runs 73 tests proving: the storage foundation (9, regression from the
-spike), a full CreateGoal/UpdateGoal/get_active_goals lifecycle
-including atomic-rollback-under-forced-failure and tri-state patch
-semantics (17 integration + 16 direct action-layer unit), a full
-CreateProject/UpdateProgress/get_project lifecycle including its own
-atomic-rollback proof, cross-entity `goal_id` reference validation, and
-a V1-to-V2 migration-compatibility check (14 integration + 10 direct
-action-layer unit), that SQLite itself now genuinely enforces
-`projects.goal_id`'s foreign key - proven by a direct raw-SQL insert
-bypassing Core's own validation (4 integration), and that the
-`GoalStatus` → `LifecycleStatus` rename changed nothing observable (3
-direct unit) - all passing against temp databases, never the user's real
-data.
+unchanged, no real goals, projects, or relations visible there yet (no
+Tauri command wiring). Separately,
+`cd src-tauri && cargo test -- --test-threads=1` runs 104 tests proving:
+the storage foundation (9, regression from the spike), a full
+CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
+rollback-under-forced-failure and tri-state patch semantics (17
+integration + 16 direct action-layer unit), a full CreateProject/
+UpdateProgress/get_project lifecycle including its own atomic-rollback
+proof and a V1-to-V2 migration-compatibility check (14 integration + 10
+direct action-layer unit), that SQLite itself genuinely enforces
+`projects.goal_id`'s foreign key (4 integration), that the `GoalStatus`
+→ `LifecycleStatus` rename changed nothing observable (3 direct unit),
+and a full LinkGoals lifecycle - directional storage, self-link/
+duplicate rejection, all 5 database-level FK/CHECK/UNIQUE/RESTRICT
+proofs via raw SQL, the PARENT_OF convention, and a V2-to-V3 migration-
+compatibility check (23 integration test functions covering 26 numbered
+requirements + 5 direct action-layer unit + 3 direct `GoalRelationType`
+unit) - all passing against temp databases, never the user's real data.
 
 ---
 
 ## 9. Next recommended step
 
-A third domain entity or `GoalRelation` - see §4f for the exact
-reasoning (this duplicates §4f's "Next implementation step" so it is
-visible without scrolling past the M2 detail section).
+A fourth domain entity - see §4g for the exact reasoning (this
+duplicates §4g's "Next implementation step" so it is visible without
+scrolling past the M2 detail section).
 
 ---
 
 ## 10. Known problems / risks / unresolved questions
 
-- **Neither Goal nor Project (nor the storage bootstrap) is wired into
-  the running app** — no Tauri command layer exists yet; `services`'
-  functions are only reachable from tests.
+- **Neither Goal, Project, nor GoalRelation (nor the storage bootstrap)
+  is wired into the running app** — no Tauri command layer exists yet;
+  `services`' functions are only reachable from tests.
 - **OPEN M2 ACTION-SET GAP: no frozen action edits an existing
   Project's `title`/`description`/`status`/`priority`/`goal_id`** — the
   frozen set is only `CreateProject`/`AddMilestone`/`AddTask`/
   `UpdateProgress`. Documented explicitly (`LIFEOS_SPEC.md` §5.1/§13,
   §4e point 6 above) rather than resolved in code this run - needs a
   conscious architecture decision (`UpdateProject` vs. narrower actions)
-  before M3/UI wiring needs to let a user edit a project.
+  before M3/UI wiring needs to let a user edit a project. Same gap does
+  not exist for `GoalRelation` - `LinkGoals` is its entire frozen action
+  set, there is no expectation of an "UpdateGoalRelation."
 - **`bundled-sqlcipher`'s build-time OpenSSL dependency is real but no
   longer hardcoded** — any machine building this needs
   `scripts/setup-windows-storage-env.ps1` run once (§4a).
@@ -622,17 +753,21 @@ visible without scrolling past the M2 detail section).
   `Display`/`kind()`, never `{:?}`, or the "no arbitrary database string
   as the authoritative error" guarantee leaks back in through the side
   door.
-- **`GoalRelation` is still schema-frozen only, not implemented** - it
-  needs its own vertical slice before M2 is complete (§4f); `Project`'s
-  `goal_id` is a plain FK on Project itself, not the `GoalRelation`
-  graph, and does not substitute for it.
 - **`PRAGMA foreign_keys = ON` enforcement depends on every connection
   going through `storage::open_encrypted`** — true today (production
   bootstrap, version-targeted migration tests, and the storage spike all
-  share this one primitive), but a future code path that opens a raw
+  share this one primitive, and `GoalRelation`'s two FKs benefit from
+  this automatically), but a future code path that opens a raw
   `rusqlite::Connection` some other way would silently not get FK
   enforcement. Worth a lint/review note if the storage layer ever grows
   a second connection-opening path.
+- **`GoalRelation` has no read capability beyond the two narrow
+  functions implemented** (`get_goal_relation`/
+  `get_goal_relations_for_goal`) - no graph traversal (e.g. "all
+  ancestors via PARENT_OF"), no cycle detection, no conflict surfacing.
+  Deliberately out of scope - that is M6 Goal Intelligence *reasoning*
+  over the graph structure this run only makes available, not this
+  run's job (M2 GoalRelation vertical-slice report §19 note).
 - **Exact NeXa transport, exact confirmation-class UX (modal/inline/
   toast)** — both deferred, unchanged.
 - Everything already listed as pending from M1/M2-freeze (local/cloud

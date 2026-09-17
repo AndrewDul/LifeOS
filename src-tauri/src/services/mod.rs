@@ -19,11 +19,13 @@ mod storage;
 
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, ConfirmationClass,
-    CreateGoalPayload, CreateProjectPayload, FieldPatch, UpdateGoalPayload, UpdateProgressPayload,
-    ValidationError,
+    CreateGoalPayload, CreateProjectPayload, FieldPatch, LinkGoalsPayload, UpdateGoalPayload,
+    UpdateProgressPayload, ValidationError,
 };
 use crate::core_error::CoreError;
-use crate::domain::{Goal, GoalId, LifecycleStatus, Project, ProjectId};
+use crate::domain::{
+    Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Project, ProjectId,
+};
 use crate::security;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -355,7 +357,7 @@ pub(crate) fn create_project(
     };
 
     if let Some(goal_id) = payload.goal_id {
-        match storage::project_repo::goal_exists(conn, goal_id) {
+        match storage::goal_repo::goal_exists(conn, goal_id) {
             Ok(true) => {}
             Ok(false) => {
                 return ActionOutcome::ValidationFailed(vec![
@@ -500,6 +502,135 @@ pub(crate) fn get_project(
     id: ProjectId,
 ) -> Result<Option<Project>, rusqlite::Error> {
     storage::project_repo::get_project(conn, id)
+}
+
+// --- GoalRelation (M2 GoalRelation vertical slice, 2026-09-17) ----------
+//
+// The first true relationship-graph entity in production M2 - two
+// foreign keys into the same `goals` table, ON DELETE RESTRICT on both
+// (Goal has no hard DeleteGoal action; a relation must never silently
+// disappear because an endpoint Goal was removed). Only `LinkGoals` is
+// implemented - it is the entire frozen action for this graph, there is
+// no separate `CreateGoalRelation`. Same atomic-mutation-plus-audit,
+// typed-`CoreError` pattern as Goal/Project above - see
+// `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+
+/// `LinkGoals`'s confirmation floor is `EXPLICIT_ADD` per the
+/// architecture-freeze report §F's confirmation table. Validation order
+/// is pure-first: `validate_link_goals` (self-link, note length) runs
+/// before any database read; then `from_goal_id` existence, then
+/// `to_goal_id` existence, then the exact-duplicate
+/// `(from, to, relation_type)` check - each a real database read,
+/// reported through the same deterministic `ValidationFailed` channel
+/// as the structural checks rather than left to SQLite's FK/UNIQUE
+/// constraints to catch first (those constraints are still real and
+/// enforced - see `migrations/V3__create_goal_relations.sql` - this is
+/// the friendlier first line of defense, the same relationship
+/// `create_project`'s `ReferencedGoalNotFound` check has with the FK
+/// constraint on `projects.goal_id`).
+pub(crate) fn link_goals(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: LinkGoalsPayload,
+) -> ActionOutcome<GoalRelation> {
+    if let Err(errors) = crate::actions::validate_link_goals(&payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    match storage::goal_repo::goal_exists(conn, payload.from_goal_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ActionOutcome::ValidationFailed(vec![
+                ValidationError::RelationFromGoalNotFound,
+            ]);
+        }
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    }
+    match storage::goal_repo::goal_exists(conn, payload.to_goal_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ActionOutcome::ValidationFailed(vec![ValidationError::RelationToGoalNotFound]);
+        }
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    }
+    match storage::goal_relation_repo::relation_exists(
+        conn,
+        payload.from_goal_id,
+        payload.to_goal_id,
+        payload.relation_type,
+    ) {
+        Ok(false) => {}
+        Ok(true) => {
+            return ActionOutcome::ValidationFailed(vec![ValidationError::DuplicateGoalRelation]);
+        }
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+    let relation = GoalRelation {
+        id: GoalRelationId::new(),
+        from_goal_id: payload.from_goal_id,
+        to_goal_id: payload.to_goal_id,
+        relation_type: payload.relation_type,
+        note: payload.note,
+        created_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::goal_relation_repo::insert_goal_relation(&tx, &relation) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::goal_relation_repo::insert_audit_entry(
+        &tx,
+        relation.id,
+        "LinkGoals",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: relation,
+        confirmation_class: class,
+    }
+}
+
+/// Narrow internal read, same reasoning as `get_goal`/`get_project`.
+pub(crate) fn get_goal_relation(
+    conn: &Connection,
+    id: GoalRelationId,
+) -> Result<Option<GoalRelation>, rusqlite::Error> {
+    storage::goal_relation_repo::get_goal_relation(conn, id)
+}
+
+/// Relations involving `goal_id` on either side (`from_goal_id` OR
+/// `to_goal_id`) - the actual stored direction, never a fabricated
+/// inverse row.
+pub(crate) fn get_goal_relations_for_goal(
+    conn: &Connection,
+    goal_id: GoalId,
+) -> Result<Vec<GoalRelation>, rusqlite::Error> {
+    storage::goal_relation_repo::get_goal_relations_for_goal(conn, goal_id)
 }
 
 #[cfg(test)]
