@@ -62,17 +62,39 @@ definition: `docs/LIFEOS_SPEC.md`.
 
 ## Documentation policy
 
-Maintain ONLY these primary living documents:
+Maintain these living documents, kept current rather than rewritten from
+scratch:
 
 - `CLAUDE.md` — this file, permanent operating rules.
 - `docs/LIFEOS_SPEC.md` — canonical product, UX, architecture, requirements.
 - `docs/RESEARCH_DECISIONS.md` — research, alternatives, sources, decisions.
-- `docs/PROJECT_STATE.md` — current engineering truth.
+- `docs/PROJECT_STATE.md` — current engineering truth. Update it whenever
+  project state actually changes (a milestone closes, a decision is made,
+  a blocker appears or clears) — not only as a formality at the end of a
+  run.
 
-`README.md` may remain minimal (a short pointer to these docs), if it exists
-at all. Do **not** create `report_001.md`, dated audit files, or any other
-one-off documentation file. Git history is the historical archive — commit
-messages and diffs are where "what happened when" lives, not new files.
+`README.md` may remain minimal (a short pointer to these docs), if it
+exists at all.
+
+**Every substantial run also produces a dedicated report** under
+`docs/reports/`, named `REPORT_<SUBJECT>_<YYYY-MM-DD>.md` (e.g.
+`REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`). A run is "substantial" if
+it does real architecture, implementation, or debugging work — a trivial
+edit (a typo fix, a one-line config change, a single doc correction) does
+not need one. When genuinely in doubt, write the report: a stray report
+costs little, but a missing one loses reasoning that is expensive to
+reconstruct later.
+
+The report is where the full reasoning lives — what was done, why, files
+touched, decisions and tradeoffs, validation results, and what's still
+open. `PROJECT_STATE.md` and `LIFEOS_SPEC.md` stay short and current —
+they should point to the relevant report(s) for detail rather than
+duplicate it. The chat/terminal response at the end of a run is a summary
+for the user in the moment, never the only record — if that conversation
+is later lost, `PROJECT_STATE.md` plus the reports must still tell the
+full story on their own. Git history (commits and diffs) remains the
+record of *what changed in the code*; reports are the record of *why*,
+which git history alone does not capture.
 
 ## Git policy
 
@@ -116,7 +138,9 @@ messages and diffs are where "what happened when" lives, not new files.
 6. Update `docs/PROJECT_STATE.md` to reflect the new engineering truth.
 7. Update `CLAUDE.md`, `docs/LIFEOS_SPEC.md`, or `docs/RESEARCH_DECISIONS.md`
    if decisions changed — these are living documents, not one-time writes.
-8. Provide the full mandatory RUN REPORT (below).
+8. For substantial runs, write the dedicated report under `docs/reports/`
+   (Documentation policy, above).
+9. Provide the full mandatory RUN REPORT (below) in the chat response.
 
 ## Never silently hide
 

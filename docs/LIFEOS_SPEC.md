@@ -7,9 +7,11 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 `PROJECT_STATE.md`. Operating rules for working in this repo live in
 `../CLAUDE.md`.
 
-Status: implementation started (M0/M1). See `PROJECT_STATE.md` for
-exactly what exists; most of this document still describes design targets
-for later milestones, not built functionality.
+Status: M0/M1 done and accepted; M2 architecture frozen but not
+implemented. See `PROJECT_STATE.md` for exactly what exists; most of this
+document still describes design targets for later milestones, not built
+functionality — §5.1-§5.6 in particular are a frozen *architecture*, not
+yet code.
 
 ---
 
@@ -272,24 +274,36 @@ primary one.
 
 ---
 
-## 5. Local database
+## 5. Local database and LifeOS Core architecture
+
+Status: **architecture frozen at M2** (2026-09-17) — not yet
+implemented. Full reasoning, tradeoffs, and the storage-spike
+requirements behind every decision in this section:
+`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`. Original
+research: `RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
-OS-native key storage. Full evaluation and reasoning: 
-`RESEARCH_DECISIONS.md` §4.
+OS-native key storage.
 
 - **Encryption**: `sqlite3mc` (SQLite3 Multiple Ciphers, ChaCha20-Poly1305)
-  rather than SQLCipher. This is a deliberate deviation from the initially
-  proposed SQLCipher — sqlite3mc is actively maintained, format-compatible
-  with SQLCipher (low switching risk), uses a faster AEAD cipher, and has
-  no external OpenSSL/libcrypto build dependency (a real advantage before
-  the Rust/MSVC toolchain is even installed on this machine).
-- **Encryption key storage**: the OS-native secure credential store via the
-  `keyring` Rust crate (Windows Credential Manager/DPAPI today; macOS
-  Keychain and Linux Secret Service later, same code). **Not** Tauri's
-  Stronghold plugin — Tauri's own maintainers have confirmed Stronghold is
-  deprecated and slated for removal in v3 (see `RESEARCH_DECISIONS.md`
-  §4), so it must not be adopted as new infrastructure now.
+  rather than SQLCipher — actively maintained, format-compatible with
+  SQLCipher (low switching risk), a faster AEAD cipher, no external
+  OpenSSL/libcrypto build dependency. **This is a research recommendation,
+  not a proven implementation** — it is not declared final until an
+  executable storage spike proves it end-to-end (create, reopen after
+  restart, wrong-key rejection, migration, rekey, backup, restore,
+  corruption handling, and a real Windows Tauri *release*-build
+  compatibility check — see the M2 report §H). If it fails that spike,
+  the documented fallback is SQLCipher.
+- **DB master key**: randomly generated, created on first run, stored via
+  the OS-native secure credential store via the `keyring` Rust crate
+  (Windows Credential Manager/DPAPI today; macOS Keychain and Linux
+  Secret Service later, same code). **Not** Tauri's Stronghold plugin —
+  deprecated upstream (`RESEARCH_DECISIONS.md` §4). A *separate* future
+  password/recovery-key-wrapped portable backup key is a target design
+  for later (not built at M2) — the backup format must not preclude it.
+  No plaintext secrets (keys, sensitive field values) may ever appear in
+  logs.
 - **Driver/migrations**: `rusqlite` (with `sqlite3mc` bundled) +
   `refinery` for versioned schema migrations. Not the official
   `tauri-plugin-sql` (sqlx-based) — it lacks first-class
@@ -304,32 +318,41 @@ OS-native key storage. Full evaluation and reasoning:
   `sqlite-vss` — reserved for later long-term-memory retrieval features,
   not needed for the initial structured domains.
 
-### 5.1 Preliminary domain concepts (not a frozen schema)
+### 5.1 Domain model (frozen, M2 — minimum v0.1, not exhaustive)
 
-The following domain concepts are very likely, based on the product
-definition, but domain boundaries should be finalized during actual schema
-design, not frozen here:
+Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
+(§5.2), `Project`, `Milestone`, `Task`, `Challenge`, `Plan`,
+`SolutionAttempt`, `Outcome`, `CalendarEvent`, `Reminder`, `Question`,
+`ProgressUpdate`, and a minimal `WellbeingCheckin` (added at freeze time
+specifically because the capability API's `log_wellbeing()`, §10.1,
+needed something real to persist — not originally in this list, flagged
+in the M2 report as a deliberate small addition, not scope creep).
 
-`UserProfile`, `Goal`, `Project`, `Task`, `CalendarEvent`, `Reminder`,
-`RecurringRule`, `Transaction`, `IncomeSource`, `Budget`,
-`WellbeingCheckin`, `JournalEntry`, `Problem`, `SolutionAttempt`,
-`Decision`, `Idea`, `Review`, `Memory`, `Observation`, `Recommendation`,
-`Notification`, `ConversationAction`.
+Deliberately **not** modeled yet (future milestones, not a frozen
+schema): `UserProfile`/settings, `Transaction`/`IncomeSource`/`Budget`
+(Money, M8), `JournalEntry` (folds into the Personal Knowledge Layer,
+§5.3, as `Episode`/`Fact` rather than its own table), `Decision`/`Idea`/
+`Review` (likely also Personal Knowledge Layer entries rather than
+dedicated tables — revisit if that turns out to be the wrong fit),
+`Notification` (M7), `ConversationAction` (M5).
 
-Prior-art research (`RESEARCH_DECISIONS.md` §5) suggests two schema
-patterns worth carrying forward when the schema is actually designed:
+Deliberate omission worth stating plainly: v0.1 favors soft-state
+transitions (`PauseGoal`, `CompleteGoal`, etc.) over hard deletion for
+most domain objects — the only true deletions in the frozen action set
+(§5.4) are `ForgetMemory` and `CancelEvent`.
 
-- **Rust crate separation by domain** (adapted from Wealthfolio's
-  architecture): split the backend into independent crates per domain
-  (core, storage-sqlite, money, calendar, memory, ...) rather than one
-  monolith, so each domain is independently testable and the future
-  plugin/extensibility boundary is already in place.
-- **Scored memory mirrored to a human-readable form** (adapted from
-  OpenHuman's "Memory Tree" pattern): keep the authoritative long-term
-  memory store in SQLite, but mirror it to a readable/editable form so the
-  user can audit and correct what the system "remembers" about them.
+Two prior-art patterns from `RESEARCH_DECISIONS.md` §5 inform this
+freeze without being contradicted by it:
+- **Rust crate separation by domain** (Wealthfolio-inspired) — refined at
+  M2 into a one-crate, clear-modules structure (§5.6) rather than
+  multiple crates immediately; splitting any module into its own crate
+  remains a valid future step once a real plugin boundary exists.
+- **Scored memory mirrored to a human-readable form** (OpenHuman-
+  inspired) — the §5.3 schema (`Fact` + `Evidence`) is built to support
+  this later (M6) without a breaking change; the actual markdown-mirror
+  mechanism is not built at M2.
 
-### 5.2 Goal Intelligence (design target — not implemented this run)
+### 5.2 Goal Intelligence
 
 Goals must not be isolated TODO records. LifeOS will eventually understand
 relationships between goals such as: `SUPPORTS`, `CONFLICTS_WITH`,
@@ -345,35 +368,102 @@ risk, and user motivation.
 discussable with the user; the user has final authority. This is a hard
 product constraint, not a UI nicety — any future automatic priority
 change must be proposed and confirmed, never silently applied (consistent
-with the "I want to focus less on NeXa this week" example in §2).
+with the "I want to focus less on NeXa this week" example in §2, and with
+the `INFERRED_CHANGE` confirmation class, §5.5).
 
-Implemented starting at M6 (Personal Intelligence, §12) — recorded here
-now so the initial `Goal` schema (M2+) leaves room for relationship edges
-instead of needing a breaking migration later.
+**Schema frozen at M2**: the `GoalRelation` table and the relation-type
+enum above are part of the M2 domain freeze (M2 report §D), so the
+initial `Goal` schema has relationship edges from the start rather than
+needing a breaking migration later. The *intelligence* — proposing
+priorities, surfacing conflicts, reasoning about dependencies — is still
+implemented starting at M6 (Personal Intelligence, §12); M2 only freezes
+where that reasoning will store its conclusions.
 
-### 5.3 Personal Knowledge / Memory (design target — not implemented this run)
+### 5.3 Personal Knowledge / Memory
 
-Future memory must distinguish at minimum these kinds: `FACT`,
-`PREFERENCE`, `EXPERIENCE`, `DECISION`, `OBSERVATION`, `HYPOTHESIS`,
-`EFFECTIVE_SOLUTION`, `INEFFECTIVE_SOLUTION`, `SKILL`, `HABIT`,
-`CURRENT_STATE`. Do **not** flatten LifeOS memory into one text-memory
-table — the design must support relationships between memories/entities
-and temporal change, not just a growing list of strings.
-
-Important knowledge requires provenance. Conceptually every memory record
-carries: `source`, `source_reference`, `created_at`, `valid_from`,
-`valid_until`, `confidence`, a confirmation/evidence state, `sensitivity`,
-and related entities. Confirmation/evidence states distinguish at least:
+**Schema frozen at M2** (M2 report §B): `Entity`, `Fact`, `Relation`,
+`Episode`, `Evidence`, `Source` — do **not** flatten LifeOS memory into
+one text-memory table. Facts distinguish at least these categories:
+`FACT`, `PREFERENCE`, `EXPERIENCE`, `DECISION`, `OBSERVATION`,
+`HYPOTHESIS`, `EFFECTIVE_SOLUTION`, `INEFFECTIVE_SOLUTION`, `SKILL`,
+`HABIT`, `CURRENT_STATE`, and at least these epistemic states:
 `USER_CONFIRMED`, `OBSERVED`, `INFERRED`, `DISPUTED`, `STALE`.
 
-This directly extends the "scored memory mirrored to a human-readable
-form" pattern in §5.1 — the mirror should be legible enough that a user
-can see *why* LifeOS believes something about them, not just *what*.
+Provenance is structural, not conventional: every `Fact` carries
+`source_id`, `created_at`, `valid_from`, `valid_until`, `confidence`,
+`sensitivity`, and an `epistemic_state`. **Facts are never overwritten in
+place** — updates insert a new row and set the old row's `valid_until` +
+`superseded_by_fact_id`, so full temporal history is the data model
+itself, not a bolted-on audit log.
 
-Implemented starting at M6 (Personal Intelligence, §12); the local helper
-model (§4) is the mechanism that produces memory candidates from
-conversation/journal input, which the user (or confidence thresholds)
-then moves toward `USER_CONFIRMED` or `OBSERVED`.
+This directly extends the "scored memory mirrored to a human-readable
+form" pattern noted in §5.1 — the mirror should be legible enough that a
+user can see *why* LifeOS believes something about them, not just *what*
+— though the mirror mechanism itself is not built at M2.
+
+The *intelligence* — producing memory candidates from conversation/
+journal input via the local helper model (§4), and the UI for reviewing/
+confirming them — is implemented starting at M6 (Personal Intelligence,
+§12); M2 only freezes the schema those candidates will be written into.
+
+### 5.4 Action layer (frozen, M2)
+
+Every mutation to LifeOS Core state is a typed action, validated
+deterministically before persistence — never by an LLM (§4.1: anything
+not requiring judgment must not go through an LLM, and validation never
+requires judgment). Frozen minimum v0.1 action set (M2 report §E):
+
+- **Goal**: `CreateGoal`, `UpdateGoal`, `PauseGoal`, `CompleteGoal`,
+  `LinkGoals`, `ChangePriority`
+- **Project**: `CreateProject`, `AddMilestone`, `AddTask`,
+  `UpdateProgress`
+- **Calendar**: `CreateEvent`, `MoveEvent`, `CancelEvent`, `AddReminder`
+- **Challenge**: `CreateChallenge`, `AddHypothesis`, `TrySolution`,
+  `RecordOutcome`
+- **Memory**: `AddMemory`, `CorrectMemory`, `ForgetMemory`,
+  `ConfirmMemory`
+- **Question**: `AnswerQuestion`, `SnoozeQuestion`
+- **Plan**: `CreatePlan`, `UpdatePlan`, `RebalancePlan`
+
+Every action carries `{actor: UI|CloudLLM|NeXa, requested_at, payload}`
+and returns a typed result or a structured validation error — never a
+bare string. This is the literal implementation of the guarded-action-
+layer principle (§2): forms, chat, and (later) voice/NeXa all resolve to
+calls on this exact same set of functions.
+
+### 5.5 Confirmation policy (frozen, M2)
+
+Six classes (M2 report §F): `SAFE_READ`, `EXPLICIT_ADD`,
+`INFERRED_CHANGE`, `IMPORTANT_CHANGE`, `DELETE`, `SENSITIVE`. An action's
+effective class is `max(type_floor(action), provenance_class)`, where
+`provenance_class` is `EXPLICIT_ADD` when the user directly and
+unambiguously requested the change and `INFERRED_CHANGE` when the AI is
+*proposing* something the user didn't literally ask for; `SENSITIVE` is
+an orthogonal overlay (Privacy-Firewall-tagged content, §4.3) that only
+ever raises logging/visibility requirements, never lowers confirmation.
+
+Default behavior: `SAFE_READ` executes silently; `EXPLICIT_ADD` executes
+immediately with inline confirmation + Undo; `INFERRED_CHANGE` always
+blocks on explicit user confirmation before persisting; `IMPORTANT_CHANGE`
+executes with an acknowledgement step and is always Undo-able and
+audit-logged; `DELETE` always requires a blocking confirmation and is a
+soft-delete/tombstone in storage, never a hard SQL delete. Exact UI
+treatment per class (modal vs. inline vs. toast) is an M3 decision, not
+frozen here.
+
+### 5.6 Module boundaries (Core architecture, M2)
+
+One Rust crate (the existing `lifeos` in `src-tauri/`), organized into
+clear modules rather than split into multiple crates yet (M2 report §G —
+a deliberate sequencing of the crate-separation idea in §5.1, not a
+reversal of it): `domain/`, `actions/`, `services/`, `storage/`,
+`knowledge/`, `security/`, `backup/`, `migrations/`, `capability/`.
+`services/` is the only module allowed to call `storage/` — enforced by
+Rust module visibility (`storage/`'s functions are not `pub` outside
+`services/`), so "UI/LLM/NeXa never mutate SQL directly" is a compile-time
+guarantee, not just a convention. `capability/` is the thin, stable
+surface that Tauri commands, the cloud LLM's tool-handlers, and (later)
+NeXa all sit behind — see §10.1.
 
 ---
 
@@ -642,11 +732,13 @@ NeXa should later be able to call capability operations such as
 `record_solution_attempt`, `record_outcome`, `create_calendar_event`,
 `change_priority`, `log_wellbeing`, `get_progress` — **without directly
 manipulating LifeOS database tables.** This is the same guarded action
-layer (§2) the desktop UI and the cloud LLM already use; a NeXa
-capability boundary is a third caller of that one layer, not a new
-integration point into the database. No NeXa-specific code is written in
-this build phase — this subsection records the constraint so the action
-layer isn't accidentally designed as desktop-UI-only.
+layer (§2, §5.4-§5.6) the desktop UI and the cloud LLM already use; a
+NeXa capability boundary is a third caller of that one layer, not a new
+integration point into the database. **Frozen at M2** as concrete Rust
+function signatures in `capability/` (M2 report §I) — what's still
+undecided is only the transport NeXa will eventually use to reach them
+(local socket, embedded HTTP, or otherwise); no NeXa-specific code is
+written yet.
 
 ---
 
@@ -694,10 +786,14 @@ reordered against `PROJECT_STATE.md`'s current reality).
   menu; basic screen/navigation shell; left/bottom/top drawer
   architecture. No fake backend functionality. **End of M1: the user must
   be able to launch and see the real app.**
-- **M2 — LifeOS Core + encrypted storage.** Local encrypted SQLite
-  (`sqlite3mc`), secure key handling (`keyring`), migrations (`refinery`),
-  core action architecture (§2), initial profile/settings. No AI
-  dependency for CRUD (AI-optional resilience, §2).
+- **M2 — LifeOS Core + encrypted storage.** Architecture frozen
+  2026-09-17 (§5.1-§5.6, `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`);
+  implementation not started. First step is the storage spike proving
+  `sqlite3mc` (M2 report §H) before any schema/action code is written.
+  Local encrypted SQLite, secure key handling (`keyring`), migrations
+  (`refinery`), core action architecture (§2, §5.4-§5.6), initial
+  profile/settings. No AI dependency for CRUD (AI-optional resilience,
+  §2).
 - **M3 — Core life UI.** Today, Goals, Projects, Calendar; Quick Add /
   schema-driven forms; PL/EN UI architecture (§1.3); backend recurrence
   authority (the Rust `rrule` crate, §6).
@@ -754,6 +850,16 @@ REPORT.
 
 These are genuinely unresolved and should not be treated as decided:
 
+- Whether `sqlite3mc` survives the M2 storage spike (§5, M2 report §H) —
+  the architecture is frozen around it as the leading candidate, but it
+  is explicitly not proven yet; SQLCipher is the documented fallback.
+- `Relation.relation_type` (Personal Knowledge Layer, §5.3) is an
+  intentionally free string rather than a constrained enum — revisit
+  once M6 usage patterns exist.
+- Exact NeXa transport mechanism (§10.1) — the capability function
+  boundary is frozen, the transport that will carry calls to it is not.
+- Exact confirmation-class UI treatment (§5.5: modal vs. inline vs.
+  toast per class) — deferred to M3.
 - Qwen3 4B and GPT-5.6 Luna are now the chosen v0.1 models (§3, §4) — but
   chosen is not the same as *validated*. The benchmark plan in
   `RESEARCH_DECISIONS.md` §2 still needs to run against Qwen3 4B at M4,
