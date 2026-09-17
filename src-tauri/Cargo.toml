@@ -41,12 +41,27 @@ serde_json = "1"
 # external OpenSSL) with a prebuilt Windows OpenSSL dev package
 # (winget: ShiningLight.OpenSSL.Dev) instead - see
 # docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md Phase B for the
-# full evidence trail. Requires OPENSSL_LIB_DIR/OPENSSL_INCLUDE_DIR set
-# when building (see .cargo/config.toml).
+# full evidence trail. Build-time only: `dumpbin /dependents` on the
+# release binary confirms OpenSSL is statically linked, so the shipped
+# app has NO runtime DLL dependency on it - see
+# docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md. Requires
+# OPENSSL_DIR/OPENSSL_LIB_DIR/OPENSSL_INCLUDE_DIR set when building -
+# run scripts/setup-windows-storage-env.ps1 once per dev machine
+# (no hardcoded path committed to the repo).
 rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher", "backup"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
 keyring = "4"
 rand = "0.10"
+# Goal vertical slice (M2, 2026-09-17): stable globally-unique IDs
+# (UUID v7 - time-ordered, suitable for future multi-device/NeXa sync)
+# and UTC timestamps.
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+# Platform app-data directory resolution for the production DB path -
+# the same underlying mechanism Tauri's own `app.path()` API uses, used
+# directly here since there is no running AppHandle yet (nothing wires
+# this into a Tauri command this run).
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"

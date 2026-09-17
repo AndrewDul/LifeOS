@@ -1,14 +1,17 @@
-// LifeOS Core (Rust). M1 scope: visual shell only - no domain commands,
-// no database, no AI. Real Tauri commands arrive with M2 (LifeOS Core +
-// encrypted storage) via the guarded action layer (LIFEOS_SPEC.md §2).
+// LifeOS Core (Rust). M1 scope: visual shell only. M2 (this run) adds
+// the first real domain vertical slice: Goal, through
+// domain -> actions -> services -> private services::storage ->
+// encrypted SQLCipher (LIFEOS_SPEC.md §5.4-§5.6). Real Tauri commands
+// (a `capability` module) are not added yet - nothing here is wired
+// into `run()` this run ("No React wiring yet. No UI changes yet.").
 //
-// `services` currently holds only the M2 encrypted-storage spike
-// (2026-09-17) - a proof of the storage architecture, not real domain
-// commands. Not wired into `run()` yet; exercised by its own tests.
-// Not `pub` from the crate root - nothing needs to call it from outside
-// this crate yet (there is no `capability` layer or Tauri command using
-// it), and it must not be reachable as a shortcut around the eventual
-// capability boundary.
+// None of these modules are `pub` from the crate root - nothing needs
+// to call them from outside this crate yet (there is no Tauri command
+// layer or NeXa transport using them), and they must not be reachable
+// as a shortcut around the eventual capability boundary.
+mod actions;
+mod domain;
+mod security;
 mod services;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

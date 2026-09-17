@@ -1,122 +1,244 @@
-//! LifeOS Core service layer — M2 storage spike (2026-09-17).
+//! LifeOS Core service layer (M2 Goal vertical slice, 2026-09-17).
 //!
-//! This is a proof of the encrypted-storage architecture, not the real
-//! LifeOS domain. It only knows about a `spike_records` table; Goal/
-//! Project/Fact and the real action layer are not implemented here.
-//!
-//! `storage` is declared as a private submodule below (no `pub`) - this
-//! is the corrected M2 module-boundary enforcement (see
-//! `docs/LIFEOS_SPEC.md` §5.6 and the storage-spike report's errata):
-//! nothing outside this file can reach `services::storage` at all,
+//! `storage` is a private submodule (no `pub` at all) - this is the
+//! corrected M2 module-boundary enforcement (`docs/LIFEOS_SPEC.md`
+//! §5.6): nothing outside this file can reach `services::storage`,
 //! proven by deliberately attempting it and capturing the compiler's
-//! rejection (see the report, section "A1 proof").
+//! rejection (`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`).
+//! `services` is the only module allowed to call `storage`; `domain`
+//! and `actions` are pure and never touch SQL. Nothing outside this
+//! crate calls any of this yet - there is no Tauri command layer this
+//! run ("No React wiring yet. No UI changes yet.").
 
-// Spike code isn't called from `run()` yet (no capability/Tauri-command
-// layer exists this run) - only from its own tests, hence `dead_code`
-// would otherwise warn on every non-test build.
+// Not wired into `run()` yet this run - only exercised by
+// services::tests, hence dead_code would otherwise warn on every
+// non-test build.
 #![allow(dead_code)]
 
 mod storage;
 
-#[cfg(test)]
-mod tests;
+use crate::actions::{
+    effective_class, goal_blocks_until_confirmed, ActionMeta, ActionOutcome, ConfirmationClass,
+    CreateGoalPayload, UpdateGoalPayload,
+};
+use crate::domain::{Goal, GoalId, GoalStatus};
+use crate::security;
+use rusqlite::Connection;
+use std::path::PathBuf;
 
-use rand::Rng;
-use std::path::Path;
+/// Matches `tauri.conf.json`'s `identifier` - used as the app-data
+/// subdirectory name via the same convention Tauri's own path resolver
+/// uses (there is no running `AppHandle` to ask this run, since nothing
+/// wires this into `run()` yet - see the module doc above).
+const APP_IDENTIFIER: &str = "com.lifeos.app";
+const DB_FILE_NAME: &str = "lifeos.db";
 
-/// A typed error for spike operations - never a bare string, matching
-/// the frozen action-layer convention (`LIFEOS_SPEC.md` §5.4).
 #[derive(Debug)]
-pub(crate) enum SpikeError {
+pub(crate) enum BootstrapError {
+    NoDataDir,
+    Io(std::io::Error),
+    Key(security::KeyError),
     Storage(rusqlite::Error),
     Migration(refinery::Error),
-    Keyring(String),
 }
 
-impl std::fmt::Display for SpikeError {
+impl std::fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpikeError::Storage(e) => write!(f, "storage error: {e}"),
-            SpikeError::Migration(e) => write!(f, "migration error: {e}"),
-            SpikeError::Keyring(e) => write!(f, "keyring error: {e}"),
+            BootstrapError::NoDataDir => {
+                write!(f, "could not determine the platform app-data directory")
+            }
+            BootstrapError::Io(e) => write!(f, "filesystem error: {e}"),
+            BootstrapError::Key(e) => write!(f, "{e}"),
+            BootstrapError::Storage(e) => write!(f, "storage error: {e}"),
+            BootstrapError::Migration(e) => write!(f, "migration error: {e}"),
         }
     }
 }
 
-impl From<rusqlite::Error> for SpikeError {
+impl From<rusqlite::Error> for BootstrapError {
     fn from(e: rusqlite::Error) -> Self {
-        SpikeError::Storage(e)
+        BootstrapError::Storage(e)
     }
 }
 
-impl From<refinery::Error> for SpikeError {
+impl From<refinery::Error> for BootstrapError {
     fn from(e: refinery::Error) -> Self {
-        SpikeError::Migration(e)
+        BootstrapError::Migration(e)
     }
 }
 
-/// Generates a random 256-bit key, hex-encoded (64 chars) for use both
-/// as the SQLCipher raw key material and as the string stored in the OS
-/// keyring.
-pub(crate) fn generate_key_hex() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Resolves the real production database path via the platform's
+/// user-data directory (`dirs::data_dir()` - the same underlying
+/// mechanism Tauri's `app.path().app_data_dir()` uses). Windows:
+/// `%APPDATA%\com.lifeos.app\lifeos.db`.
+pub(crate) fn production_db_path() -> Result<PathBuf, BootstrapError> {
+    let base = dirs::data_dir().ok_or(BootstrapError::NoDataDir)?;
+    Ok(base.join(APP_IDENTIFIER).join(DB_FILE_NAME))
 }
 
-pub(crate) fn create_and_seed(
-    path: &Path,
-    key_hex: &str,
-    secret_text: &str,
-) -> Result<i64, SpikeError> {
-    let conn = storage::open_encrypted(path, key_hex)?;
-    storage::verify_key(&conn)?;
-    let mut conn = conn;
-    storage::run_migrations(&mut conn)?;
-    let id = storage::insert_record(&conn, secret_text)?;
-    Ok(id)
-}
-
-pub(crate) fn reopen_and_read(path: &Path, key_hex: &str) -> Result<Vec<(i64, String)>, SpikeError> {
-    let conn = storage::open_encrypted(path, key_hex)?;
-    storage::verify_key(&conn)?;
-    Ok(storage::read_all_records(&conn)?)
-}
-
-pub(crate) fn run_migrations_only(path: &Path, key_hex: &str) -> Result<Vec<String>, SpikeError> {
+/// The reusable bootstrap core: create the parent directory if needed,
+/// open (or create) the encrypted database at `path` with `key_hex`,
+/// verify the key, and apply production migrations. Parameterized by
+/// path and key so it is independently testable against a temp
+/// location/key, never the real production path/keyring entry, in
+/// automated tests.
+fn bootstrap_db_at(path: &std::path::Path, key_hex: &str) -> Result<Connection, BootstrapError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(BootstrapError::Io)?;
+    }
     let mut conn = storage::open_encrypted(path, key_hex)?;
     storage::verify_key(&conn)?;
-    Ok(storage::run_migrations(&mut conn)?)
+    storage::run_production_migrations(&mut conn)?;
+    Ok(conn)
 }
 
-pub(crate) fn rekey_db(path: &Path, old_key_hex: &str, new_key_hex: &str) -> Result<(), SpikeError> {
-    let conn = storage::open_encrypted(path, old_key_hex)?;
-    storage::verify_key(&conn)?;
-    storage::rekey(&conn, new_key_hex)?;
-    Ok(())
+/// Full production bootstrap: resolves the real DB path, obtains/
+/// generates the real master key via the OS credential store
+/// (`LifeOS` / `database-master-key-v1`), opens the encrypted database,
+/// and applies migrations. This is what a future Tauri command / app
+/// setup hook calls - nothing calls it yet this run.
+#[allow(dead_code)]
+pub(crate) fn bootstrap_production_db() -> Result<Connection, BootstrapError> {
+    let path = production_db_path()?;
+    let key_hex = security::get_or_create_production_master_key().map_err(BootstrapError::Key)?;
+    bootstrap_db_at(&path, &key_hex)
 }
 
-pub(crate) fn check_integrity(path: &Path, key_hex: &str) -> Result<String, SpikeError> {
-    let conn = storage::open_encrypted(path, key_hex)?;
-    storage::verify_key(&conn)?;
-    Ok(storage::integrity_check(&conn)?)
+pub(crate) fn create_goal(
+    conn: &Connection,
+    meta: ActionMeta,
+    payload: CreateGoalPayload,
+) -> ActionOutcome<Goal> {
+    let normalized_title = match crate::actions::validate_create_goal(&payload) {
+        Ok(t) => t,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if goal_blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+    let goal = Goal {
+        id: GoalId::new(),
+        title: normalized_title,
+        description: payload.description,
+        status: GoalStatus::Active,
+        target_date: payload.target_date,
+        priority_user: payload.priority_user,
+        priority_system: None,
+        progress: 0,
+        domain_tag: payload.domain_tag,
+        created_at: now,
+        updated_at: now,
+    };
+
+    if let Err(e) = storage::goal_repo::insert_goal(conn, &goal) {
+        return ActionOutcome::StorageError(e.to_string());
+    }
+
+    let _ = storage::goal_repo::insert_audit_entry(
+        conn,
+        goal.id,
+        "CreateGoal",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    );
+
+    ActionOutcome::Success {
+        value: goal,
+        confirmation_class: class,
+    }
 }
 
-/// Stores `key_hex` in the OS credential store under a spike-specific
-/// service/username pair (never a real LifeOS key path).
-pub(crate) fn keyring_store(service: &str, username: &str, key_hex: &str) -> Result<(), SpikeError> {
-    let entry = keyring::Entry::new(service, username).map_err(|e| SpikeError::Keyring(e.to_string()))?;
-    entry
-        .set_password(key_hex)
-        .map_err(|e| SpikeError::Keyring(e.to_string()))
+pub(crate) fn update_goal(
+    conn: &Connection,
+    meta: ActionMeta,
+    payload: UpdateGoalPayload,
+) -> ActionOutcome<Goal> {
+    let existing = match storage::goal_repo::get_goal(conn, payload.id) {
+        Ok(Some(g)) => g,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(e.to_string()),
+    };
+
+    if let Err(errors) = crate::actions::validate_update_goal(&existing, &payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    let class = effective_class(ConfirmationClass::ImportantChange, meta.provenance);
+    if goal_blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let previous_snapshot = serde_json::to_string(&existing).ok();
+
+    let mut updated = existing;
+    if let Some(title) = payload.title {
+        updated.title = title.trim().to_string();
+    }
+    if let Some(description) = payload.description {
+        updated.description = Some(description);
+    }
+    if let Some(status) = payload.status {
+        updated.status = status;
+    }
+    if let Some(target_date) = payload.target_date {
+        updated.target_date = Some(target_date);
+    }
+    if let Some(priority_user) = payload.priority_user {
+        updated.priority_user = Some(priority_user);
+    }
+    if let Some(progress) = payload.progress {
+        updated.progress = progress;
+    }
+    updated.updated_at = meta.requested_at;
+
+    if let Err(e) = storage::goal_repo::update_goal(conn, &updated) {
+        return ActionOutcome::StorageError(e.to_string());
+    }
+
+    let _ = storage::goal_repo::insert_audit_entry(
+        conn,
+        updated.id,
+        "UpdateGoal",
+        meta.actor,
+        meta.provenance,
+        class,
+        previous_snapshot.as_deref(),
+        meta.requested_at,
+    );
+
+    ActionOutcome::Success {
+        value: updated,
+        confirmation_class: class,
+    }
 }
 
-pub(crate) fn keyring_retrieve(service: &str, username: &str) -> Result<String, SpikeError> {
-    let entry = keyring::Entry::new(service, username).map_err(|e| SpikeError::Keyring(e.to_string()))?;
-    entry.get_password().map_err(|e| SpikeError::Keyring(e.to_string()))
+/// `SAFE_READ` - the frozen v0.1 capability API's `get_active_goals()`
+/// (`LIFEOS_SPEC.md` §10.1). This function (and `get_goal` below) *is*
+/// the capability boundary for this slice - a dedicated `capability`
+/// module is not added until a real Tauri command/NeXa transport exists
+/// to sit behind it (would be a premature, empty pass-through today).
+pub(crate) fn get_active_goals(conn: &Connection) -> Result<Vec<Goal>, rusqlite::Error> {
+    storage::goal_repo::get_active_goals(conn)
 }
 
-pub(crate) fn keyring_delete(service: &str, username: &str) -> Result<(), SpikeError> {
-    let entry = keyring::Entry::new(service, username).map_err(|e| SpikeError::Keyring(e.to_string()))?;
-    entry.delete_credential().map_err(|e| SpikeError::Keyring(e.to_string()))
+/// Narrow internal read, useful for testing `create_goal`/`update_goal`
+/// without growing the public capability surface beyond what the frozen
+/// API actually lists.
+pub(crate) fn get_goal(conn: &Connection, id: GoalId) -> Result<Option<Goal>, rusqlite::Error> {
+    storage::goal_repo::get_goal(conn, id)
 }
+
+#[cfg(test)]
+mod tests;

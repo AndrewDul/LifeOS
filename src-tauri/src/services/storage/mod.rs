@@ -1,18 +1,35 @@
-//! Encrypted SQLite access for the M2 storage spike (2026-09-17).
+//! Encrypted SQLite access (M2 Goal vertical slice, 2026-09-17).
 //!
 //! PRIVATE by construction: this module is declared as a plain `mod
 //! storage;` in `services/mod.rs` (no `pub`), so nothing outside the
 //! `services` module tree can name `services::storage` at all - not
-//! `capability`, not `domain`, not an external crate. Every function
-//! here is additionally `pub(super)` (visible only to `services/mod.rs`
-//! itself) as defense in depth, in case a future edit ever loosens the
-//! module declaration. See docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md
-//! for the captured compiler error proving this boundary for real.
+//! `domain`, not `actions`, not an external crate, not a Tauri command
+//! or future capability layer. Every function here is additionally
+//! `pub(super)` (visible only to `services/mod.rs` itself) as defense
+//! in depth. Verified for real, not just claimed - see
+//! `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` (original
+//! compiler-error proof) and
+//! `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
+//! (re-verified after this restructuring).
 //!
-//! `spike_records` only - this is NOT the real LifeOS schema.
+//! `open_encrypted`/`verify_key`/`rekey`/`integrity_check` are generic
+//! encrypted-SQLite primitives, proven in the storage spike and reused
+//! here unchanged for production. Production migrations
+//! (`../../../migrations/`) create ONLY the real `goals` table - the
+//! spike's `spike_records` schema lives under `spike/`, compiled for
+//! `#[cfg(test)]` only, and is never reachable from a non-test build.
+
+// Not wired into `run()` yet this run - only exercised by tests, hence
+// dead_code would otherwise warn on every non-test build.
+#![allow(dead_code)]
 
 use rusqlite::Connection;
 use std::path::Path;
+
+pub(super) mod goal_repo;
+
+#[cfg(test)]
+pub(super) mod spike;
 
 /// Opens (creating if absent) an encrypted database at `path` using a
 /// raw 256-bit hex key (`PRAGMA key = "x'<64 hex chars>'"` - the raw-key
@@ -35,35 +52,28 @@ pub(super) fn verify_key(conn: &Connection) -> rusqlite::Result<()> {
     .map(|_| ())
 }
 
-pub(super) fn insert_record(conn: &Connection, secret_text: &str) -> rusqlite::Result<i64> {
-    conn.execute(
-        "INSERT INTO spike_records (secret_text, created_at) VALUES (?1, datetime('now'))",
-        [secret_text],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-pub(super) fn read_all_records(conn: &Connection) -> rusqlite::Result<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare("SELECT id, secret_text FROM spike_records ORDER BY id")?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn rekey(conn: &Connection, new_key_hex: &str) -> rusqlite::Result<()> {
     conn.pragma_update(None, "rekey", format!("x'{new_key_hex}'"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn integrity_check(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
 }
 
+/// Production migrations only - `src-tauri/migrations/`. Must never
+/// create `spike_records` (proven by a test - see
+/// `services::tests::req_production_db_has_no_spike_records`).
 mod migrations {
     refinery::embed_migrations!("./migrations");
 }
 
-/// Runs pending versioned migrations (refinery) against `conn`.
-/// Returns the applied migration versions for evidence purposes.
-pub(super) fn run_migrations(conn: &mut Connection) -> Result<Vec<String>, refinery::Error> {
+/// Runs pending PRODUCTION versioned migrations (refinery) against
+/// `conn`. Returns the applied migration versions for evidence/logging.
+pub(super) fn run_production_migrations(
+    conn: &mut Connection,
+) -> Result<Vec<String>, refinery::Error> {
     let report = migrations::migrations::runner().run(conn)?;
     Ok(report
         .applied_migrations()

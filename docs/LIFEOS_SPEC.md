@@ -276,13 +276,16 @@ primary one.
 
 ## 5. Local database and LifeOS Core architecture
 
-Status: **architecture frozen at M2** (2026-09-17); the storage layer
-specifically is **PROVEN** (2026-09-17, storage spike) — schema/action
-implementation not yet started. Full reasoning, tradeoffs, and evidence
-behind every decision in this section:
-`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md` and
-`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`. Original research:
-`RESEARCH_DECISIONS.md` §4.
+Status: **architecture frozen at M2** (2026-09-17); the storage layer is
+**PROVEN** (2026-09-17, storage spike) and now **hardened for production
+use**, and the first real domain entity, **Goal, is implemented**
+end-to-end (2026-09-17, Goal vertical slice) — the rest of the domain
+model (Project, Task, Calendar, Personal Knowledge, Goal Intelligence)
+is not yet started. Full reasoning, tradeoffs, and evidence behind every
+decision in this section: `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
+`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`, and
+`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`. Original
+research: `RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
 OS-native key storage.
@@ -305,17 +308,26 @@ OS-native key storage.
   (`cargo build --release` and `npm run tauri build`, producing actual
   MSI and NSIS installers, not just `cargo check`). Full evidence:
   `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`.
-- **Known Windows build dependency:** `bundled-sqlcipher` links against
-  an *external* OpenSSL rather than building one from source (the
-  Perl bundled with Git for Windows on this machine cannot build
-  OpenSSL — a real, evidenced blocker, not a theoretical one). A
-  prebuilt Windows OpenSSL dev package (`winget install
-  ShiningLight.OpenSSL.Dev`) is required, with its path set in
-  `src-tauri/.cargo/config.toml` (currently a machine-specific absolute
-  path — any other machine continuing this work needs the same package
-  installed, or that config updated). Revisit
-  `bundled-sqlcipher-vendored-openssl` (avoids this external dependency
-  entirely) if a working Perl is ever set up on the build machine.
+- **Known Windows build-time dependency, confirmed *not* a runtime one
+  (corrected 2026-09-17, Goal vertical slice report Part A2):**
+  `bundled-sqlcipher` links against an *external* OpenSSL rather than
+  building one from source (the Perl bundled with Git for Windows on
+  this machine cannot build OpenSSL — a real, evidenced blocker, not a
+  theoretical one). A prebuilt Windows OpenSSL dev package (`winget
+  install ShiningLight.OpenSSL.Dev`) is required **to build** `lifeos`.
+  `dumpbin /dependents` on the release binary shows it links OpenSSL
+  **statically** — no `libcrypto`/`libssl` DLL appears in its import
+  table — so a machine that only *runs* the shipped installer has no
+  OpenSSL dependency at all; only a machine that *builds* the crate
+  does. The path to that dev package is **no longer committed**: the
+  prior machine-specific hardcoded `src-tauri/.cargo/config.toml` was
+  deleted and replaced with `scripts/setup-windows-storage-env.ps1`,
+  which sets `OPENSSL_DIR`/`OPENSSL_LIB_DIR`/`OPENSSL_INCLUDE_DIR` as
+  persistent user environment variables (no admin needed) after
+  checking the package is actually installed. Revisit
+  `bundled-sqlcipher-vendored-openssl` (avoids the external build-time
+  dependency entirely) if a working Perl is ever set up on the build
+  machine.
 - **DB master key**: randomly generated, created on first run, stored via
   the OS-native secure credential store via the `keyring` Rust crate
   (Windows Credential Manager/DPAPI today; macOS Keychain and Linux
@@ -539,6 +551,23 @@ an illegal `services::storage::...` call from outside `services` and
 capturing the exact compiler rejection — see
 `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the literal
 error output, not just this description.
+
+**Re-verified after a deeper nesting (Goal vertical slice, 2026-09-17).**
+`storage` now has real internal structure — `storage::goal_repo` (Goal's
+SQL access) and, test-only, `storage::spike` (the original spike suite,
+relocated so it can never reach a release build; its migrations create
+`spike_records`, which must never appear in a production database — a
+dedicated test proves this, not just directory placement). A per-entity
+repo module like `goal_repo` is a *grandchild* of `services`, not an
+immediate child, so `pub(super)` on its functions is not enough to reach
+`services/mod.rs` two levels up; it uses `pub(in crate::services)`
+instead, which names the exact ancestor module explicitly and still
+denies every sibling of `services` outside that path. The "add an
+illegal access, capture the compiler error, remove it" proof was
+re-run against this deeper shape (not assumed to still hold after the
+refactor) and produced the same `error[E0603]: module 'storage' is
+private` result — see
+`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
 
 `capability/` is the thin, stable surface that Tauri commands, the cloud
 LLM's tool-handlers, and (later) NeXa all sit behind — it calls only

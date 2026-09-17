@@ -1,369 +1,528 @@
-//! M2 storage spike test suite (2026-09-17).
+//! M2 Goal vertical slice tests (2026-09-17).
 //!
-//! Evidence for `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`.
-//! Run with: `cargo test --manifest-path src-tauri/Cargo.toml services::tests -- --nocapture`
-//!
-//! Each test proves exactly one numbered requirement from the build
-//! brief. Nothing here is the real LifeOS schema - `spike_records` only.
+//! Evidence for `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
+//! Run with:
+//! `cargo test --manifest-path src-tauri/Cargo.toml services::tests -- --nocapture --test-threads=1`
+//! (`--test-threads=1` matters for the keyring-touching test.)
 
 use super::*;
+use crate::actions::{
+    ActionMeta, ActionOutcome, Actor, ConfirmationClass, Provenance, ValidationError,
+};
+use crate::domain::GoalStatus;
 use std::fs;
 use std::io::Read;
 
-const MARKER: &str = "LIFEOS_STORAGE_SPIKE_SECRET_7F3A91";
-
-fn temp_db_path(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
-    dir.path().join(name)
+/// Independent of `storage::spike`'s key helper on purpose - this test
+/// module should not depend on the spike's internals, which are a
+/// separate, self-contained regression suite (and are only visible
+/// within `services::storage`'s own subtree, not to `services::tests`,
+/// a sibling - the module-privacy boundary working exactly as intended).
+fn generate_test_key_hex() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Requirement 1: encrypted database creation, write, read back through
-/// the correct key.
-#[test]
-fn req1_encrypted_database_creation_and_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req1.db");
-    let key = generate_key_hex();
-
-    let id = create_and_seed(&path, &key, MARKER).expect("create_and_seed should succeed");
-    assert!(id > 0);
-
-    let rows = reopen_and_read(&path, &key).expect("read with correct key should succeed");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, MARKER);
-    println!("[req1] PASS - wrote and read back 1 row with correct key: {rows:?}");
+fn temp_db(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, String) {
+    (dir.path().join(name), generate_test_key_hex())
 }
 
-/// Requirement 2: persistence across "restart". For an embedded,
-/// file-based database there is no separate server process to restart -
-/// the meaningful proof is that a brand-new `Connection` (no shared
-/// in-memory state with the one that wrote the data) opened against the
-/// same file later recovers the same data using only the persisted key.
-/// This test explicitly drops the first connection/scope before opening
-/// a second, independent one to make that boundary real, not implicit.
-#[test]
-fn req2_persistence_across_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req2.db");
-    let key = generate_key_hex();
-
-    {
-        let id = create_and_seed(&path, &key, "phase-1-data").unwrap();
-        assert!(id > 0);
-        // end of scope: no Connection value survives past this point
-    }
-
-    // A later, independent phase: new Connection, same file, same key.
-    let rows = reopen_and_read(&path, &key).expect("reopen should recover persisted data");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, "phase-1-data");
-    println!("[req2] PASS - data recovered after full connection teardown and reopen: {rows:?}");
+fn ui_explicit() -> ActionMeta {
+    ActionMeta::now(Actor::Ui, Provenance::Explicit)
 }
 
-/// Requirement 3: wrong key fails cleanly - typed error, no panic, no
-/// garbage/partial data.
+/// Requirement 1 & 2: fresh production database initializes encrypted
+/// and contains the real Goal schema.
 #[test]
-fn req3_wrong_key_fails_cleanly() {
+fn req1_2_fresh_production_db_encrypted_with_goal_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req3.db");
-    let right_key = generate_key_hex();
-    let wrong_key = generate_key_hex();
-    assert_ne!(right_key, wrong_key);
+    let (path, key) = temp_db(&dir, "prod1.db");
 
-    create_and_seed(&path, &right_key, MARKER).unwrap();
+    let conn = bootstrap_db_at(&path, &key).expect("bootstrap should succeed");
 
-    let result = reopen_and_read(&path, &wrong_key);
-    match result {
-        Err(SpikeError::Storage(e)) => {
-            println!("[req3] PASS - wrong key rejected with typed error: {e}");
-        }
-        Err(other) => panic!("[req3] FAIL - wrong error variant: {other}"),
-        Ok(rows) => panic!("[req3] FAIL - wrong key returned data instead of failing: {rows:?}"),
-    }
-}
+    let has_goals_table: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goals'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap();
+    assert!(
+        has_goals_table,
+        "[req1/2] FAIL - production DB missing the goals table"
+    );
 
-/// Requirement 4: encrypted at rest. The planted plaintext marker must
-/// not appear anywhere in the raw database file bytes.
-#[test]
-fn req4_encrypted_at_rest_no_plaintext() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req4.db");
-    let key = generate_key_hex();
+    let has_audit_table: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goal_audit_log'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap();
+    assert!(
+        has_audit_table,
+        "[req1/2] FAIL - production DB missing goal_audit_log"
+    );
 
-    {
-        create_and_seed(&path, &key, MARKER).unwrap();
-        // Connection dropped here - fully closed before raw inspection.
-    }
-
+    drop(conn);
     let mut raw = Vec::new();
     fs::File::open(&path)
         .unwrap()
         .read_to_end(&mut raw)
         .unwrap();
-
-    let marker_bytes = MARKER.as_bytes();
-    let found = raw
-        .windows(marker_bytes.len())
-        .any(|window| window == marker_bytes);
-
     assert!(
-        !found,
-        "[req4] FAIL - plaintext marker found in raw database bytes!"
+        !raw.windows(6).any(|w| w == b"SQLite"),
+        "[req1] FAIL - file starts with the plaintext SQLite header, not encrypted"
     );
-    println!(
-        "[req4] PASS - {} byte database file does not contain the {}-byte plaintext marker anywhere",
-        raw.len(),
-        marker_bytes.len()
-    );
+    println!("[req1/2] PASS - fresh production DB ({} bytes) is encrypted (no plaintext SQLite header) and has goals + goal_audit_log tables", raw.len());
 }
 
-/// Requirement 5: migration V1 -> V2 applies to an existing populated
-/// encrypted database, data survives, and re-running is a safe no-op
-/// (refinery tracks applied versions itself).
+/// Requirement 3: production DB never contains spike_records.
 #[test]
-fn req5_migration_v1_to_v2() {
+fn req3_production_db_has_no_spike_records() {
     let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req5.db");
-    let key = generate_key_hex();
+    let (path, key) = temp_db(&dir, "prod3.db");
 
-    // create_and_seed already runs migrations as part of first open,
-    // so the DB starts at the latest schema (V1+V2) with one row.
-    create_and_seed(&path, &key, MARKER).unwrap();
-
-    let rows_before = reopen_and_read(&path, &key).unwrap();
-    assert_eq!(rows_before.len(), 1);
-
-    // Explicitly re-run the migration runner against the already-
-    // migrated database - must be a safe no-op, not reapply/duplicate.
-    let applied_again = run_migrations_only(&path, &key).unwrap();
-    let rows_after = reopen_and_read(&path, &key).unwrap();
-
-    assert_eq!(
-        rows_before, rows_after,
-        "[req5] FAIL - data changed across a repeated migration run"
-    );
-    println!(
-        "[req5] PASS - schema at V1+V2, data intact across repeat migration run \
-         (second run applied {} new migrations - expected 0)",
-        applied_again.len()
-    );
-    assert_eq!(
-        applied_again.len(),
-        0,
-        "[req5] FAIL - re-running migrations against an up-to-date DB reapplied something"
-    );
-
-    // Prove V2's column actually exists (the ALTER TABLE really ran).
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.pragma_update(None, "key", format!("x'{key}'")).unwrap();
-    let has_note_column: bool = conn
-        .prepare("SELECT note FROM spike_records LIMIT 1")
-        .is_ok();
-    assert!(has_note_column, "[req5] FAIL - V2's `note` column is missing");
-    println!("[req5] PASS - V2 `note` column present, confirming the ALTER TABLE migration ran");
-}
-
-/// Requirement 6: rekey. Old key must stop working, new key must work,
-/// data must be identical.
-#[test]
-fn req6_rekey() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req6.db");
-    let old_key = generate_key_hex();
-    let new_key = generate_key_hex();
-
-    create_and_seed(&path, &old_key, MARKER).unwrap();
-    let rows_before = reopen_and_read(&path, &old_key).unwrap();
-
-    rekey_db(&path, &old_key, &new_key).expect("rekey should succeed");
-
-    let old_key_result = reopen_and_read(&path, &old_key);
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let has_spike_table: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='spike_records'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap();
     assert!(
-        old_key_result.is_err(),
-        "[req6] FAIL - old key still works after rekey"
+        !has_spike_table,
+        "[req3] FAIL - production database contains spike_records!"
     );
-
-    let rows_after = reopen_and_read(&path, &new_key).expect("new key should work after rekey");
-    assert_eq!(
-        rows_before, rows_after,
-        "[req6] FAIL - data changed across rekey"
-    );
-    println!(
-        "[req6] PASS - old key rejected post-rekey ({old_key_result:?}), \
-         new key works, data identical: {rows_after:?}"
-    );
+    println!("[req3] PASS - production database schema does not contain spike_records");
 }
 
-/// Requirements 7 & 8: same-installation encrypted backup and restore.
-/// (Cross-machine password/recovery-key portable backup is a future
-/// capability, not built here - `LIFEOS_SPEC.md` §5 / M2 report §H.)
+/// Requirement 4: master key survives reopen through the real `keyring`
+/// integration - a TEST-specific service/account, never the real
+/// production credential.
 #[test]
-fn req7_8_backup_and_restore() {
-    let dir = tempfile::tempdir().unwrap();
-    let source_path = temp_db_path(&dir, "req7_source.db");
-    let backup_path = temp_db_path(&dir, "req7_backup.db");
-    let restore_path = temp_db_path(&dir, "req7_restore.db");
-    let key = generate_key_hex();
+fn req4_master_key_survives_reopen_via_keyring() {
+    let account = "vertical-slice-test-key";
+    let _ = security::delete_key_for_test(account);
 
-    create_and_seed(&source_path, &key, MARKER).unwrap();
-    create_and_seed_extra(&source_path, &key, "second-row").unwrap();
-
-    // Backup with the CURRENT M2 key model: SQLite's own backup API,
-    // still encrypted with the same key (not a plaintext export).
-    {
-        let src_conn = rusqlite::Connection::open(&source_path).unwrap();
-        src_conn.pragma_update(None, "key", format!("x'{key}'")).unwrap();
-        verify_open(&src_conn);
-
-        let mut dst_conn = rusqlite::Connection::open(&backup_path).unwrap();
-        dst_conn.pragma_update(None, "key", format!("x'{key}'")).unwrap();
-
-        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).unwrap();
-        backup.run_to_completion(5, std::time::Duration::from_millis(50), None).unwrap();
-    }
-
-    // The backup file itself must not expose plaintext either.
-    let mut raw = Vec::new();
-    fs::File::open(&backup_path).unwrap().read_to_end(&mut raw).unwrap();
-    let marker_bytes = MARKER.as_bytes();
-    let found = raw.windows(marker_bytes.len()).any(|w| w == marker_bytes);
-    assert!(!found, "[req7] FAIL - backup file contains plaintext marker");
-    println!("[req7] PASS - encrypted backup created, {} bytes, no plaintext found", raw.len());
-
-    // Restore = copy the backup file to a fresh location and open it.
-    fs::copy(&backup_path, &restore_path).unwrap();
-    let restored_rows = reopen_and_read(&restore_path, &key).expect("restored DB should open with the same key");
-    let original_rows = reopen_and_read(&source_path, &key).unwrap();
-
-    assert_eq!(restored_rows.len(), 2, "[req8] FAIL - row count mismatch after restore");
-    assert_eq!(
-        restored_rows, original_rows,
-        "[req8] FAIL - restored content differs from original"
-    );
-
-    let original_hash = content_hash(&original_rows);
-    let restored_hash = content_hash(&restored_rows);
-    assert_eq!(original_hash, restored_hash, "[req8] FAIL - content hash mismatch");
-    println!(
-        "[req8] PASS - restored {} rows, content hash matches: {original_hash:x}",
-        restored_rows.len()
-    );
-}
-
-fn create_and_seed_extra(path: &std::path::Path, key_hex: &str, secret_text: &str) -> Result<i64, SpikeError> {
-    let conn = storage::open_encrypted(path, key_hex)?;
-    storage::verify_key(&conn)?;
-    Ok(storage::insert_record(&conn, secret_text)?)
-}
-
-fn verify_open(conn: &rusqlite::Connection) {
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
-        .expect("verify_open failed");
-}
-
-fn content_hash(rows: &[(i64, String)]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (id, text) in rows {
-        id.hash(&mut hasher);
-        text.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Requirement 9: corruption is detected and fails safely. Corrupts a
-/// COPY only; the original database must remain untouched and usable.
-#[test]
-fn req9_corruption_detected_safely() {
-    let dir = tempfile::tempdir().unwrap();
-    let original_path = temp_db_path(&dir, "req9_original.db");
-    let corrupt_path = temp_db_path(&dir, "req9_corrupt.db");
-    let key = generate_key_hex();
-
-    create_and_seed(&original_path, &key, MARKER).unwrap();
-    fs::copy(&original_path, &corrupt_path).unwrap();
-
-    // Corrupt bytes in the COPY only - flip a chunk in the middle of the
-    // file, well past the SQLite header, to hit real page data.
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = fs::OpenOptions::new().write(true).open(&corrupt_path).unwrap();
-        let len = f.metadata().unwrap().len();
-        let offset = len / 2;
-        f.seek(SeekFrom::Start(offset)).unwrap();
-        f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x00, 0xFF]).unwrap();
-    }
-
-    // Opening/reading/integrity-checking the corrupt copy must fail
-    // safely (typed error), not panic and not return silently-wrong data.
-    let corrupt_result = std::panic::catch_unwind(|| check_integrity(&corrupt_path, &key));
-    match corrupt_result {
-        Ok(Ok(report)) if report.to_lowercase() != "ok" => {
-            println!("[req9] PASS - corruption detected via PRAGMA integrity_check: {report}");
-        }
-        Ok(Err(e)) => {
-            println!("[req9] PASS - corruption caused a clean typed error (failed before/at integrity_check): {e}");
-        }
-        Ok(Ok(report)) => {
-            panic!("[req9] FAIL - corrupted copy reported integrity_check = '{report}' (expected a failure)");
-        }
-        Err(panic_payload) => {
-            panic!("[req9] FAIL - corruption caused a PANIC instead of a clean error: {panic_payload:?}");
-        }
-    }
-
-    // The ORIGINAL must be completely unaffected.
-    let original_rows = reopen_and_read(&original_path, &key).expect("original DB must remain usable");
-    assert_eq!(original_rows.len(), 1);
-    assert_eq!(original_rows[0].1, MARKER);
-    println!("[req9] PASS - original database untouched and fully readable after corrupting only the copy");
-}
-
-/// Requirement 10: OS key-store round trip via the `keyring` crate.
-/// Generates a random key, stores it, closes everything, retrieves it
-/// again, uses it to open a database, then cleans up the credential.
-///
-/// This genuinely touches Windows Credential Manager on this machine -
-/// if that's unavailable in whatever context runs this test, the test
-/// reports BLOCKED with the exact error rather than a false PASS.
-#[test]
-fn req10_keyring_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = temp_db_path(&dir, "req10.db");
-    let service = "lifeos-m2-storage-spike";
-    let username = "spike-test-key";
-
-    // Clean up any leftover credential from a prior failed run.
-    let _ = keyring_delete(service, username);
-
-    let key = generate_key_hex();
-
-    match keyring_store(service, username, &key) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("[req10] BLOCKED - could not write to OS credential store: {e}");
-            return;
-        }
-    }
-
-    create_and_seed(&path, &key, MARKER).unwrap();
-
-    // Simulate "closing and reopening" by retrieving the key fresh from
-    // the OS store rather than reusing the in-memory `key` variable.
-    let retrieved_key = match keyring_retrieve(service, username) {
+    let key1 = match security::get_or_create_master_key_for_test(account) {
         Ok(k) => k,
         Err(e) => {
-            println!("[req10] BLOCKED - could not read back from OS credential store: {e}");
-            let _ = keyring_delete(service, username);
+            println!("[req4] BLOCKED - could not write to OS credential store: {e}");
             return;
         }
     };
-    assert_eq!(retrieved_key, key, "[req10] FAIL - retrieved key does not match stored key");
 
-    let rows = reopen_and_read(&path, &retrieved_key).expect("DB should open with the OS-retrieved key");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, MARKER);
+    // "Reopen": call the same get-or-create again - it must retrieve the
+    // SAME key, not generate a new one.
+    let key2 = match security::get_or_create_master_key_for_test(account) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("[req4] BLOCKED - could not read back from OS credential store: {e}");
+            let _ = security::delete_key_for_test(account);
+            return;
+        }
+    };
 
-    keyring_delete(service, username).expect("cleanup: failed to delete test credential");
+    assert_eq!(
+        key1, key2,
+        "[req4] FAIL - key changed across a simulated reopen"
+    );
+    security::delete_key_for_test(account).expect("cleanup: failed to delete test credential");
+    println!(
+        "[req4] PASS - master key survived a simulated reopen via the real OS credential store"
+    );
+}
 
-    println!("[req10] PASS - key generated, stored in OS credential store, retrieved after a simulated restart, used to open the DB, credential cleaned up");
+/// Requirement 5 & 6: valid CreateGoal succeeds and persists across
+/// close/reopen.
+#[test]
+fn req5_6_create_goal_succeeds_and_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod5.db");
+
+    let goal_id;
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let payload = CreateGoalPayload {
+            title: "  Get first paying client  ".to_string(),
+            description: Some("DeVDul freelance".to_string()),
+            target_date: None,
+            priority_user: Some(3),
+            domain_tag: Some("career".to_string()),
+        };
+        match create_goal(&conn, ui_explicit(), payload) {
+            ActionOutcome::Success {
+                value,
+                confirmation_class,
+            } => {
+                assert_eq!(
+                    value.title, "Get first paying client",
+                    "[req5] FAIL - title was not trimmed"
+                );
+                assert_eq!(value.status, GoalStatus::Active);
+                assert_eq!(value.progress, 0);
+                assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+                goal_id = value.id;
+                println!(
+                    "[req5] PASS - CreateGoal succeeded: {value:?}, class={confirmation_class:?}"
+                );
+            }
+            other => panic!("[req5] FAIL - expected Success, got {other:?}"),
+        }
+    }
+
+    // Reopen with a fresh Connection - proves persistence, not an
+    // in-memory artifact of the first connection.
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let fetched = get_goal(&conn, goal_id).unwrap();
+        assert!(
+            fetched.is_some(),
+            "[req6] FAIL - goal not found after reopen"
+        );
+        assert_eq!(fetched.unwrap().title, "Get first paying client");
+        println!("[req6] PASS - goal persisted across a full connection close/reopen");
+    }
+}
+
+/// Requirement 7: empty/whitespace title rejected before write.
+#[test]
+fn req7_empty_and_whitespace_title_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod7.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for bad_title in ["", "   ", "\t\n"] {
+        let payload = CreateGoalPayload {
+            title: bad_title.to_string(),
+            description: None,
+            target_date: None,
+            priority_user: None,
+            domain_tag: None,
+        };
+        match create_goal(&conn, ui_explicit(), payload) {
+            ActionOutcome::ValidationFailed(errors) => {
+                assert!(
+                    errors.contains(&ValidationError::EmptyTitle),
+                    "[req7] FAIL - expected EmptyTitle for {bad_title:?}, got {errors:?}"
+                );
+            }
+            other => {
+                panic!("[req7] FAIL - expected ValidationFailed for {bad_title:?}, got {other:?}")
+            }
+        }
+    }
+
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM goals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "[req7] FAIL - a row was written despite validation failure"
+    );
+    println!(
+        "[req7] PASS - empty/whitespace-only titles rejected before any write (0 rows in goals)"
+    );
+}
+
+/// Requirement 8: overlong/invalid fields rejected deterministically.
+#[test]
+fn req8_overlong_fields_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod8.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let overlong_title = "x".repeat(201);
+    let payload = CreateGoalPayload {
+        title: overlong_title,
+        description: None,
+        target_date: None,
+        priority_user: Some(99),
+        domain_tag: None,
+    };
+    match create_goal(&conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::TitleTooLong { .. })),
+                "[req8] FAIL - expected TitleTooLong, got {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::PriorityOutOfBounds { .. })),
+                "[req8] FAIL - expected PriorityOutOfBounds, got {errors:?}"
+            );
+            println!("[req8] PASS - overlong title AND out-of-bounds priority both reported in one call: {errors:?}");
+        }
+        other => panic!("[req8] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM goals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "[req8] FAIL - a row was written despite validation failure"
+    );
+}
+
+/// Requirement 9: valid UpdateGoal succeeds.
+#[test]
+fn req9_valid_update_goal_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod9.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(
+        &conn,
+        ui_explicit(),
+        CreateGoalPayload {
+            title: "Ship M2".to_string(),
+            description: None,
+            target_date: None,
+            priority_user: None,
+            domain_tag: None,
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let update = UpdateGoalPayload {
+        id: created.id,
+        progress: Some(40),
+        status: Some(GoalStatus::Active),
+        ..Default::default()
+    };
+    match update_goal(&conn, ui_explicit(), update) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(value.progress, 40);
+            assert_eq!(confirmation_class, ConfirmationClass::ImportantChange);
+            println!(
+                "[req9] PASS - UpdateGoal succeeded: progress=40, class={confirmation_class:?}"
+            );
+        }
+        other => panic!("[req9] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// Requirement 10: UpdateGoal on a nonexistent ID returns structured
+/// NotFound.
+#[test]
+fn req10_update_nonexistent_goal_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod10.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_id = crate::domain::GoalId::new();
+    let update = UpdateGoalPayload {
+        id: fake_id,
+        progress: Some(10),
+        ..Default::default()
+    };
+    match update_goal(&conn, ui_explicit(), update) {
+        ActionOutcome::NotFound => {
+            println!("[req10] PASS - UpdateGoal on a nonexistent id returned structured NotFound")
+        }
+        other => panic!("[req10] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+/// Requirement 11: an invalid UpdateGoal makes ZERO DB changes.
+#[test]
+fn req11_invalid_update_makes_zero_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod11.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(
+        &conn,
+        ui_explicit(),
+        CreateGoalPayload {
+            title: "Stable title".to_string(),
+            description: None,
+            target_date: None,
+            priority_user: None,
+            domain_tag: None,
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // First, mark it COMPLETED (a valid transition)...
+    let complete = UpdateGoalPayload {
+        id: created.id,
+        status: Some(GoalStatus::Completed),
+        ..Default::default()
+    };
+    let completed = match update_goal(&conn, ui_explicit(), complete) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(completed.status, GoalStatus::Completed);
+
+    // ...then attempt an invalid transition out of a terminal state.
+    let invalid = UpdateGoalPayload {
+        id: created.id,
+        status: Some(GoalStatus::Active),
+        ..Default::default()
+    };
+    match update_goal(&conn, ui_explicit(), invalid) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidStatusTransition { .. })));
+            println!("[req11] PASS - invalid COMPLETED -> ACTIVE transition rejected: {errors:?}");
+        }
+        other => panic!("[req11] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    let fetched = get_goal(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        fetched.status,
+        GoalStatus::Completed,
+        "[req11] FAIL - status changed despite validation failure"
+    );
+    assert_eq!(
+        fetched.updated_at, completed.updated_at,
+        "[req11] FAIL - updated_at changed despite validation failure"
+    );
+    println!(
+        "[req11] PASS - zero changes persisted after the invalid update (status still COMPLETED)"
+    );
+}
+
+/// Requirement 12: get_active_goals returns only ACTIVE goals.
+#[test]
+fn req12_get_active_goals_filters_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod12.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let mk = |title: &str| CreateGoalPayload {
+        title: title.to_string(),
+        description: None,
+        target_date: None,
+        priority_user: None,
+        domain_tag: None,
+    };
+
+    let a = match create_goal(&conn, ui_explicit(), mk("Active goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let b = match create_goal(&conn, ui_explicit(), mk("Will be paused")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    update_goal(
+        &conn,
+        ui_explicit(),
+        UpdateGoalPayload {
+            id: b.id,
+            status: Some(GoalStatus::Paused),
+            ..Default::default()
+        },
+    );
+
+    let active = get_active_goals(&conn).unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "[req12] FAIL - expected exactly 1 active goal, got {}",
+        active.len()
+    );
+    assert_eq!(active[0].id, a.id);
+    println!("[req12] PASS - get_active_goals returned exactly the 1 ACTIVE goal, excluding the paused one");
+}
+
+/// Requirement 13: SQLCipher wrong-key protection remains intact for
+/// the production bootstrap path specifically (not just the spike's).
+#[test]
+fn req13_wrong_key_rejected_for_production_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "prod13.db");
+    let wrong_key = generate_test_key_hex();
+    assert_ne!(key, wrong_key);
+
+    bootstrap_db_at(&path, &key).unwrap();
+
+    match bootstrap_db_at(&path, &wrong_key) {
+        Err(BootstrapError::Storage(e)) => {
+            println!("[req13] PASS - wrong key rejected on the production bootstrap path: {e}");
+        }
+        other => panic!("[req13] FAIL - expected a Storage error for the wrong key, got {other:?}"),
+    }
+}
+
+/// Requirement 15: static safety net - no source file prints a variable
+/// that looks like key material. Not a runtime capture test (no
+/// logging framework is wired up in this slice; the key only ever
+/// exists as a local `String` passed directly between `security::` and
+/// `storage::` functions, never stored in a struct with a Display/Debug
+/// impl) - this is documented explicitly rather than overclaimed.
+#[test]
+fn req15_no_key_material_in_source_prints() {
+    let suspicious = [
+        "{key}",
+        "{key_hex}",
+        "{master_key}",
+        "{new_key_hex}",
+        "{old_key_hex}",
+        "{retrieved_key}",
+    ];
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    scan_dir(&src_dir, &mut offenders, &suspicious);
+    assert!(
+        offenders.is_empty(),
+        "[req15] FAIL - possible key material in a print statement: {offenders:?}"
+    );
+    println!("[req15] PASS - no print!/println!/eprintln! call in src/ interpolates a key-shaped variable (static scan)");
+}
+
+fn scan_dir(dir: &std::path::Path, offenders: &mut Vec<String>, patterns: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir(&path, offenders, patterns);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (i, line) in contents.lines().enumerate() {
+                let is_print_call = line.contains("println!")
+                    || line.contains("print!")
+                    || line.contains("eprintln!");
+                if is_print_call {
+                    for pat in patterns {
+                        if line.contains(pat) {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                i + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
