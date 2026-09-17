@@ -13,9 +13,12 @@ foreign-key enforcement. Five real domain entities are implemented:
 **Goal** (implemented, then hardened - validated atomicity, typed
 errors, tri-state patch semantics; see the M2 Goal hardening report),
 **Project** (implemented directly with the hardened pattern -
-`CreateProject`/`UpdateProgress` only, its first direct cross-entity
-foreign key to `Goal` proven; see the M2 Project vertical-slice and
-Project/storage integrity hardening reports), **GoalRelation**
+`CreateProject`/`UpdateProgress`, and now `UpdateProject` too (all
+mutable fields except `progress`, floor `IMPORTANT_CHANGE`, closing the
+Project action-set gap in code - see the M2 UpdateProject report), its
+first direct cross-entity foreign key to `Goal` proven; see the M2
+Project vertical-slice and Project/storage integrity hardening
+reports), **GoalRelation**
 (implemented directly with the twice-hardened pattern - `LinkGoals`
 only, the first true relationship-*graph* structure, its frozen
 11-value relation-type enum and direction convention proven; see the M2
@@ -30,8 +33,9 @@ deliberately deferred behind a database-enforced `NULL`-only `CHECK`
 until `RecurringRule` itself is designed; see the M2 Task vertical-slice
 report). The rest of the M2 domain model (Calendar, `RecurringRule`,
 Personal Knowledge, Goal Intelligence *reasoning* over the graph
-GoalRelation now makes available, and the rest of the frozen action set,
-including `UpdateProject`) is still in progress - not implemented yet.
+GoalRelation now makes available) is still in progress - not
+implemented yet; the frozen v0.1 action set on existing entities is now
+fully implemented.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -415,18 +419,24 @@ implicit freeze of `RecurringRule` itself.
 **Implementation status (2026-09-17): `Goal`, `Project`, `GoalRelation`,
 `Milestone`, and `Task` are implemented** (Goal with its own hardened
 vertical slice; Project built directly with that hardened pattern -
-`CreateProject`/`UpdateProgress` only, not `UpdateProject`; GoalRelation
-built directly with the twice-hardened pattern - `LinkGoals` only, its
-full frozen relation-type enum and direction convention; Milestone
-built directly with the pattern - `AddMilestone`/`UpdateMilestone` both,
-its `(project_id, order_index)` UNIQUE rule resolved and enforced both
-in Core and the database; Task built directly with the pattern -
+`CreateProject`/`UpdateProgress`, and now `UpdateProject` too (M2
+UpdateProject implementation, 2026-09-17 - closes the Project
+action-set gap in code, not just design; required an unplanned but
+user-authorized V6 migration to widen `project_audit_log.action_type`'s
+CHECK constraint, since it had only ever allowed `'CreateProject'`/
+`'UpdateProgress'` - see that report §3a); GoalRelation built directly
+with the twice-hardened pattern - `LinkGoals` only, its full frozen
+relation-type enum and direction convention; Milestone built directly
+with the pattern - `AddMilestone`/`UpdateMilestone` both, its
+`(project_id, order_index)` UNIQUE rule resolved and enforced both in
+Core and the database; Task built directly with the pattern -
 `AddTask`/`UpdateTask` both, the first entity with two independent
 nullable parent references, `recurring_rule_id` deliberately deferred);
 every other entity in this list is schema-frozen only — see §5.2 for
 `GoalRelation`'s detail and correction, §5.1 below for `Milestone`'s/
-`Task`'s detail, and `PROJECT_STATE.md` §9 for what is next
-(`UpdateProject` or `RecurringRule`).
+`Task`'s/`UpdateProject`'s detail, and `PROJECT_STATE.md` §9 for what is
+next (`RecurringRule`'s design/freeze pass, or the Personal Knowledge
+Layer).
 
 **`Project.progress` — canonically resolved (2026-09-17, M2 Project/
 storage integrity hardening report).** The Project vertical slice had
@@ -452,19 +462,20 @@ open question:
   built.
 
 **M2 ACTION-SET GAP — RESOLVED (2026-09-17, M2 Project Child Action
-Freeze report).** `Project` stores `title`/`description`/`status`/
-`priority`/`goal_id` in addition to `progress`; the frozen Project
-action set (§5.4, below) now includes **`UpdateProject`** (floor
-`IMPORTANT_CHANGE`, `FieldPatch<T>` patch semantics for the nullable
-fields — same shape as `UpdateGoal`) to edit all five, as a single typed
-update action rather than several narrow ones (`RenameProject`,
-`ChangeProjectPriority`, etc. were considered and rejected — see the
-freeze report §3 for the reasoning). **`UpdateProgress` stays
-completely separate** — it still owns `progress` alone, floor
-`EXPLICIT_ADD`, unchanged; `UpdateProject` never touches `progress`.
-This is a documentation-only freeze — no code implementing
-`UpdateProject` was written this run; it exists so implementation has
-an unambiguous target when Project editing is actually built.
+Freeze report; IMPLEMENTED 2026-09-17, M2 UpdateProject implementation).**
+`Project` stores `title`/`description`/`status`/`priority`/`goal_id` in
+addition to `progress`; the frozen Project action set (§5.4, below) now
+includes **`UpdateProject`** (floor `IMPORTANT_CHANGE`, `FieldPatch<T>`
+patch semantics for the nullable fields — same shape as `UpdateGoal`) to
+edit all five, as a single typed update action rather than several
+narrow ones (`RenameProject`, `ChangeProjectPriority`, etc. were
+considered and rejected — see the freeze report §3 for the reasoning).
+**`UpdateProgress` stays completely separate** — it still owns
+`progress` alone, floor `EXPLICIT_ADD`, unchanged; `UpdateProject` never
+touches `progress`, proven by a dedicated regression test. **This is no
+longer documentation-only** — `UpdateProject` is real, tested code (see
+`docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`), closing the gap
+in both design and code.
 
 **Project child action set (Milestone, Task) — both implemented
 (2026-09-17, M2 Project Child Action Freeze report for the original
@@ -686,13 +697,12 @@ requires judgment). Frozen minimum v0.1 action set (M2 report §E):
   `LinkGoals`, `ChangePriority`
 - **Project** (and its children `Milestone`/`Task`): `CreateProject`,
   `UpdateProject`, `UpdateProgress`, `AddMilestone`, `UpdateMilestone`,
-  `AddTask`, `UpdateTask` — `AddMilestone`/`UpdateMilestone` are
-  **implemented** (2026-09-17, M2 Milestone vertical slice), and
-  `AddTask`/`UpdateTask` are now **implemented** too (2026-09-17, M2
-  Task vertical slice); `UpdateProject`/`UpdateMilestone`/`UpdateTask`
-  were frozen 2026-09-17 (M2 Project Child Action Freeze report),
-  documentation-only at the time - `UpdateProject` is the only action in
-  this set that remains implemented-ready but not yet coded
+  `AddTask`, `UpdateTask` — **every action in this set is now
+  implemented** (2026-09-17): `AddMilestone`/`UpdateMilestone` (M2
+  Milestone vertical slice), `AddTask`/`UpdateTask` (M2 Task vertical
+  slice), and `UpdateProject` (M2 UpdateProject implementation, closing
+  the action-set gap the M2 Project Child Action Freeze report had only
+  frozen in documentation)
 - **Calendar**: `CreateEvent`, `MoveEvent`, `CancelEvent`, `AddReminder`
 - **Challenge**: `CreateChallenge`, `AddHypothesis`, `TrySolution`,
   `RecordOutcome`
@@ -1274,13 +1284,15 @@ These are genuinely unresolved and should not be treated as decided:
 - Exact bilingual detection/normalisation mechanism (which layer decides
   the response language, how mixed-language utterances are handled) —
   design target stated in §1.3, mechanism not yet designed.
-- **Resolved 2026-09-17 (M2 Project Child Action Freeze report):** the
+- **Resolved 2026-09-17 (M2 Project Child Action Freeze report, then
+  implemented the same date, M2 UpdateProject implementation):** the
   previously-open Project action-set gap (no frozen action to edit a
   `Project`'s `title`/`description`/`status`/`priority`/`goal_id`) is
-  closed — `UpdateProject` is now frozen, floor `IMPORTANT_CHANGE`. The
-  same gap for `Milestone`/`Task` was closed pre-emptively, before either
-  is implemented — `UpdateMilestone`/`UpdateTask`, both floor
-  `EXPLICIT_ADD`. Full detail in §5.1.
+  closed both in design and in code — `UpdateProject` (floor
+  `IMPORTANT_CHANGE`) is real, tested code. The same gap for
+  `Milestone`/`Task` is likewise closed in code —
+  `UpdateMilestone`/`UpdateTask`, both floor `EXPLICIT_ADD`. Full detail
+  in §5.1.
 - **Resolved 2026-09-17 (M2 Milestone vertical-slice report §3):**
   `Milestone.order_index` uniqueness within a Project (§5.1) — YES,
   `(project_id, order_index)` must be unique; different Projects may

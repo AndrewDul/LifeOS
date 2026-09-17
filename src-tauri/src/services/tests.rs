@@ -1396,6 +1396,946 @@ fn req_p16_inferred_create_project_requires_confirmation_and_does_not_write() {
 }
 
 // =========================================================================
+// M2 UpdateProject implementation (2026-09-17) - new evidence below.
+// Evidence for `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`.
+// Closes the M2 Project action-set gap both in design (already frozen,
+// M2 Project Child Action Freeze report) and now in code.
+// =========================================================================
+
+/// Same forced-failure mechanism as every other entity's audit-failure
+/// trigger, reusing `project_audit_log` (no new audit table) -
+/// `install_project_audit_failure_trigger`/
+/// `remove_project_audit_failure_trigger` above are shared verbatim with
+/// `CreateProject`'s own hardening tests.
+
+/// Requirements 1, 19: a valid title UpdateProject succeeds; `id` never
+/// changes across the update.
+#[test]
+fn req_up1_19_valid_title_update_succeeds_and_id_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Original title", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let updated = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("  Renamed  ".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::ImportantChange);
+            value
+        }
+        other => panic!("[req_up1] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(
+        updated.title, "Renamed",
+        "[req_up1] FAIL - title was not trimmed/set"
+    );
+    assert_eq!(
+        updated.id, created.id,
+        "[req_up19] FAIL - id changed across update"
+    );
+    println!(
+        "[req_up1/19] PASS - UpdateProject title succeeded, id unchanged, class=IMPORTANT_CHANGE"
+    );
+}
+
+/// Requirements 2, 3, 5, 6, 7, 8: `description` Set/Clear, `priority`
+/// Set/Clear, and `goal_id` Set(valid)/Clear all succeed and persist.
+#[test]
+fn req_up2_3_5_6_7_8_full_field_patch_semantics_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Real goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert!(created.description.is_none());
+    assert!(created.priority.is_none());
+    assert!(created.goal_id.is_none());
+
+    // Requirement 2: description Set.
+    let with_desc = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            description: FieldPatch::Set("A real description".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up2] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(with_desc.description.as_deref(), Some("A real description"));
+    println!("[req_up2] PASS - description Set succeeded");
+
+    // Requirement 3: description Clear -> SQL NULL.
+    let cleared_desc = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            description: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up3] FAIL - expected Success, got {other:?}"),
+    };
+    assert!(cleared_desc.description.is_none());
+    let refetched = get_project(&conn, created.id).unwrap().unwrap();
+    assert!(
+        refetched.description.is_none(),
+        "[req_up3] FAIL - description Clear did not persist as NULL"
+    );
+    println!("[req_up3] PASS - description Clear persisted as NULL");
+
+    // Requirement 5: priority Set.
+    let with_priority = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            priority: FieldPatch::Set(4),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up5] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(with_priority.priority, Some(4));
+    println!("[req_up5] PASS - priority Set succeeded");
+
+    // Requirement 6: priority Clear -> SQL NULL.
+    let cleared_priority = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            priority: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up6] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(cleared_priority.priority, None);
+    println!("[req_up6] PASS - priority Clear succeeded");
+
+    // Requirement 7: goal_id Set to a valid Goal.
+    let with_goal = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            goal_id: FieldPatch::Set(goal.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up7] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(with_goal.goal_id, Some(goal.id));
+    println!("[req_up7] PASS - goal_id Set to a valid Goal succeeded");
+
+    // Requirement 8: goal_id Clear -> SQL NULL.
+    let cleared_goal = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            goal_id: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up8] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(cleared_goal.goal_id, None);
+    println!("[req_up8] PASS - goal_id Clear succeeded");
+}
+
+/// Requirement 4: a status update succeeds (paired with the dedicated
+/// transition-matrix proof, req_up14_to_18, below).
+#[test]
+fn req_up4_status_update_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject4.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.status, LifecycleStatus::Active);
+
+    let updated = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            status: Some(LifecycleStatus::Paused),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up4] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(updated.status, LifecycleStatus::Paused);
+    println!("[req_up4] PASS - status update succeeded");
+}
+
+/// Requirement 9: `goal_id` Set to a nonexistent Goal is rejected with
+/// zero mutation.
+#[test]
+fn req_up9_goal_id_set_nonexistent_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject9.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_project(&conn, created.id).unwrap().unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new();
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            goal_id: FieldPatch::Set(fake_goal_id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedGoalNotFound));
+        }
+        other => panic!("[req_up9] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_up9] FAIL - project changed despite the dangling goal_id"
+    );
+    println!("[req_up9] PASS - goal_id Set to a nonexistent Goal rejected, zero mutation");
+}
+
+/// Requirement 10: UpdateProject on a nonexistent Project returns
+/// structured NotFound.
+#[test]
+fn req_up10_update_nonexistent_project_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject10.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_id = crate::domain::ProjectId::new();
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: fake_id,
+            title: Some("Doesn't matter".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::NotFound => {
+            println!(
+                "[req_up10] PASS - UpdateProject on a nonexistent id returned structured NotFound"
+            )
+        }
+        other => panic!("[req_up10] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+/// Requirement 11: a no-fields UpdateProject payload is rejected.
+#[test]
+fn req_up11_no_fields_payload_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject11.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+        }
+        other => panic!("[req_up11] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    println!("[req_up11] PASS - no-op UpdateProject rejected with NoFieldsToUpdate");
+}
+
+/// Requirements 12, 13: an invalid title, and an overlong description,
+/// both make zero mutation.
+#[test]
+fn req_up12_13_invalid_title_and_overlong_description_make_zero_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject12.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Stable title", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_project(&conn, created.id).unwrap().unwrap();
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("   ".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::EmptyTitle));
+        }
+        other => panic!("[req_up12] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after_title = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after_title,
+        "[req_up12] FAIL - project changed despite the invalid title"
+    );
+    println!("[req_up12] PASS - invalid title rejected, zero mutation");
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            description: FieldPatch::Set("x".repeat(crate::domain::DESCRIPTION_MAX_LEN + 1)),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DescriptionTooLong { .. })));
+        }
+        other => panic!("[req_up13] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    let after_description = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after_description,
+        "[req_up13] FAIL - project changed despite the overlong description"
+    );
+    println!("[req_up13] PASS - overlong description rejected, zero mutation");
+}
+
+/// Requirements 14-18: representative real-DB status transitions prove
+/// no terminal-state rule exists - ACTIVE -> PAUSED -> COMPLETED ->
+/// ACTIVE (reopen) -> ABANDONED -> ACTIVE (reopen again).
+#[test]
+fn req_up14_to_18_representative_status_transitions_all_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject14.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Transitions", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.status, LifecycleStatus::Active);
+
+    let transitions = [
+        (LifecycleStatus::Paused, "req_up14", "ACTIVE -> PAUSED"),
+        (
+            LifecycleStatus::Completed,
+            "req_up15",
+            "PAUSED -> COMPLETED",
+        ),
+        (LifecycleStatus::Active, "req_up16", "COMPLETED -> ACTIVE"),
+        (
+            LifecycleStatus::Abandoned,
+            "req_up17",
+            "ACTIVE -> ABANDONED",
+        ),
+        (LifecycleStatus::Active, "req_up18", "ABANDONED -> ACTIVE"),
+    ];
+
+    for (target, tag, label) in transitions {
+        let updated = match update_project(
+            &mut conn,
+            ui_explicit(),
+            UpdateProjectPayload {
+                id: created.id,
+                status: Some(target),
+                ..Default::default()
+            },
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("[{tag}] FAIL - {label} should succeed, got {other:?}"),
+        };
+        assert_eq!(
+            updated.status, target,
+            "[{tag}] FAIL - status did not update for {label}"
+        );
+        println!("[{tag}] PASS - {label} succeeded");
+    }
+}
+
+/// Requirements 20, 21, 22: `created_at` never changes, `updated_at`
+/// advances on a successful update, and a rejected update leaves both
+/// timestamps unchanged.
+#[test]
+fn req_up20_21_22_timestamp_behavior_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject20.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Timestamped", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let original_created_at = created.created_at;
+    let original_updated_at = created.updated_at;
+
+    // Requirement 22: a rejected update (no fields touched) leaves both
+    // timestamps unchanged.
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::ValidationFailed(_) => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let after_rejected = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(after_rejected.created_at, original_created_at);
+    assert_eq!(
+        after_rejected.updated_at, original_updated_at,
+        "[req_up22] FAIL - a rejected update must not change updated_at"
+    );
+    println!("[req_up22] PASS - rejected update left both timestamps unchanged");
+
+    // Requirements 20, 21: a successful update preserves created_at and
+    // advances updated_at.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let updated = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Timestamped, renamed".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up20/21] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(
+        updated.created_at, original_created_at,
+        "[req_up20] FAIL - created_at must never change"
+    );
+    assert!(
+        updated.updated_at > original_updated_at,
+        "[req_up21] FAIL - updated_at must advance on a successful update"
+    );
+    println!("[req_up20/21] PASS - created_at preserved, updated_at advanced on successful update");
+}
+
+/// Requirements 23, 24: `Project.progress` is completely unaffected by
+/// `UpdateProject`, and `UpdateProgress` continues to work independently
+/// after `UpdateProject` has run - the core regression proof that the
+/// two actions' ownership of `progress` stays separate (§2/§12/§21 of
+/// the UpdateProject brief).
+#[test]
+fn req_up23_24_progress_preserved_across_update_project_and_update_progress_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject23.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Progress-bearing project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.progress, 0);
+
+    let with_progress = match update_progress(
+        &mut conn,
+        ui_explicit(),
+        UpdateProgressPayload {
+            id: created.id,
+            progress: 63,
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(with_progress.progress, 63);
+
+    // Requirement 23: UpdateProject changing structural fields must not
+    // touch progress.
+    let after_update_project = match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Renamed via UpdateProject".to_string()),
+            status: Some(LifecycleStatus::Paused),
+            priority: FieldPatch::Set(2),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up23] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(
+        after_update_project.progress, 63,
+        "[req_up23] FAIL - UpdateProject must never change progress"
+    );
+    assert_eq!(after_update_project.title, "Renamed via UpdateProject");
+    assert_eq!(after_update_project.status, LifecycleStatus::Paused);
+    println!("[req_up23] PASS - Project.progress (63) unchanged after UpdateProject touched title/status/priority");
+
+    // Requirement 24: UpdateProgress must still work independently
+    // after UpdateProject has run against the same Project.
+    let after_update_progress_again = match update_progress(
+        &mut conn,
+        ui_explicit(),
+        UpdateProgressPayload {
+            id: created.id,
+            progress: 80,
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_up24] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(after_update_progress_again.progress, 80);
+    // UpdateProgress must not revert the structural fields UpdateProject set.
+    assert_eq!(
+        after_update_progress_again.title,
+        "Renamed via UpdateProject"
+    );
+    assert_eq!(after_update_progress_again.status, LifecycleStatus::Paused);
+    println!("[req_up24] PASS - UpdateProgress still works independently after UpdateProject, and does not revert UpdateProject's own changes");
+}
+
+/// Requirements 25, 26: the audit row carries the required metadata,
+/// and its `previous_snapshot` contains the exact pre-update Project
+/// state.
+#[test]
+fn req_up25_26_audit_metadata_and_previous_snapshot_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject25.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Pre-update title", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Post-update title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let (action_type, actor, provenance, confirmation_class, previous_snapshot): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot FROM project_audit_log WHERE project_id = ?1 AND action_type = 'UpdateProject'",
+            [created.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+
+    assert_eq!(action_type, "UpdateProject");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "IMPORTANT_CHANGE");
+    let snapshot = previous_snapshot
+        .expect("[req_up26] FAIL - UpdateProject audit row must have a previous_snapshot");
+    assert!(
+        snapshot.contains("Pre-update title"),
+        "[req_up26] FAIL - previous_snapshot does not contain the pre-update title, got {snapshot}"
+    );
+    println!("[req_up25] PASS - audit row carries action_type={action_type}, actor={actor}, provenance={provenance}, confirmation_class={confirmation_class}");
+    println!("[req_up26] PASS - previous_snapshot contains the pre-update state: {snapshot}");
+}
+
+/// Requirements 27, 28, 29, 30: UpdateProject's project-update +
+/// audit-insert are one atomic transaction. A forced audit-insert
+/// failure must leave the Project byte/logically identical - including
+/// `updated_at` and `progress` - and the connection must remain usable
+/// afterward.
+#[test]
+fn req_up27_28_29_30_forced_audit_failure_rolls_back_full_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject27.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Stable", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match update_progress(
+        &mut conn,
+        ui_explicit(),
+        UpdateProgressPayload {
+            id: created.id,
+            progress: 42,
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let before = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(before.progress, 42);
+
+    install_project_audit_failure_trigger(&conn);
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Should not persist".to_string()),
+            description: FieldPatch::Set("Should not persist either".to_string()),
+            status: Some(LifecycleStatus::Completed),
+            priority: FieldPatch::Set(5),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_up27] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_up27] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_project_audit_failure_trigger(&conn);
+
+    let after = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_up27] FAIL - project mutated despite a rolled-back transaction"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "[req_up28] FAIL - updated_at leaked from a rolled-back update"
+    );
+    assert_eq!(
+        after.progress, 42,
+        "[req_up29] FAIL - progress leaked/changed from a rolled-back update"
+    );
+
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM project_audit_log WHERE project_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 2, // CreateProject + UpdateProgress, no orphan UpdateProject row
+        "[req_up27] FAIL - expected exactly 2 prior audit rows (CreateProject, UpdateProgress), got {audit_count}"
+    );
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Now it works".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {
+            println!("[req_up30] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[req_up30] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Requirements 31, 32: `Project.goal_id` Set/Clear must never create,
+/// delete, or otherwise modify a `Goal` or any `GoalRelation` row - the
+/// two concepts remain fully separate.
+#[test]
+fn req_up31_32_goal_id_changes_do_not_affect_goal_or_goal_relations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject31.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal_a = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal A")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let goal_b = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal B")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    // An unrelated GoalRelation must be unaffected by anything Project-side.
+    match link_goals(
+        &mut conn,
+        ui_explicit(),
+        mk_link_payload(goal_a.id, goal_b.id, GoalRelationType::Supports),
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    let relation_count_before = goal_relation_row_count(&conn);
+    let goal_a_before = get_goal(&conn, goal_a.id).unwrap().unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    // goal_id Set.
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            goal_id: FieldPatch::Set(goal_a.id),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_up31] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        relation_count_before,
+        "[req_up32] FAIL - goal_id Set must not create a GoalRelation row"
+    );
+    assert_eq!(
+        get_goal(&conn, goal_a.id).unwrap().unwrap(),
+        goal_a_before,
+        "[req_up31] FAIL - goal_id Set must not modify the Goal itself"
+    );
+
+    // goal_id Clear (unlink).
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            goal_id: FieldPatch::Clear,
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_up31] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        goal_relation_row_count(&conn),
+        relation_count_before,
+        "[req_up32] FAIL - goal_id Clear must not delete a GoalRelation row"
+    );
+    assert_eq!(
+        get_goal(&conn, goal_a.id).unwrap().unwrap(),
+        goal_a_before,
+        "[req_up31] FAIL - goal_id Clear (unlink) must not modify or delete the Goal itself"
+    );
+    println!("[req_up31/32] PASS - Project.goal_id Set/Clear left the Goal and every GoalRelation row completely untouched");
+}
+
+/// V6 migration compatibility (not in the original UpdateProject brief's
+/// numbered list - added because this run required an unplanned V6
+/// migration, and every other migration in this codebase has a
+/// dedicated non-destructive-upgrade proof; see
+/// `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md` §3a). Builds a
+/// database frozen at V5 (real `project_audit_log` rows using only the
+/// pre-V6 `action_type` values `'CreateProject'`/`'UpdateProgress'` -
+/// the actual shape of an existing user's database before this update),
+/// then reopens it normally (applying only the newly-pending V6
+/// migration) and confirms: the pre-existing audit rows survive with
+/// their original `action_type` values intact, the Project/Goal data
+/// they reference is unchanged, and a new `UpdateProject` call - which
+/// needs the widened `action_type` CHECK - now succeeds against the
+/// pre-existing Project.
+#[test]
+fn req_up_v6_v5_populated_database_upgrades_cleanly_to_v6() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "updateproject_v6.db");
+
+    let (project_id, pre_v6_audit_count);
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 5).unwrap();
+
+        let created = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Pre-V6 project", None),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = created.id;
+        match update_progress(
+            &mut conn,
+            ui_explicit(),
+            UpdateProgressPayload {
+                id: project_id,
+                progress: 55,
+            },
+        ) {
+            ActionOutcome::Success { .. } => {}
+            other => panic!("setup failed: {other:?}"),
+        }
+        pre_v6_audit_count = project_audit_row_count(&conn);
+        assert_eq!(
+            pre_v6_audit_count, 2,
+            "[req_up_v6] FAIL - expected exactly 2 pre-V6 audit rows (CreateProject, UpdateProgress)"
+        );
+    }
+
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+        let project_after = get_project(&conn, project_id).unwrap();
+        assert_eq!(
+            project_after.as_ref().map(|p| p.progress),
+            Some(55),
+            "[req_up_v6] FAIL - pre-V6 Project data did not survive the V5 -> V6 upgrade"
+        );
+
+        let audit_count_after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_audit_log WHERE project_id = ?1",
+                [project_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count_after, pre_v6_audit_count,
+            "[req_up_v6] FAIL - pre-V6 audit rows were lost during the upgrade"
+        );
+        let action_types: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT action_type FROM project_audit_log WHERE project_id = ?1 ORDER BY occurred_at")
+                .unwrap();
+            stmt.query_map([project_id.to_string()], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            action_types,
+            vec!["CreateProject".to_string(), "UpdateProgress".to_string()],
+            "[req_up_v6] FAIL - pre-V6 audit action_type values were not preserved exactly"
+        );
+
+        match update_project(
+            &mut conn,
+            ui_explicit(),
+            UpdateProjectPayload {
+                id: project_id,
+                title: Some("Post-V6 rename".to_string()),
+                ..Default::default()
+            },
+        ) {
+            ActionOutcome::Success { .. } => println!(
+                "[req_up_v6] PASS - V5 data (incl. pre-existing audit rows) survived the upgrade to V6, and a new UpdateProject now works against the pre-existing Project"
+            ),
+            other => panic!(
+                "[req_up_v6] FAIL - expected UpdateProject to succeed after the V6 upgrade, got {other:?}"
+            ),
+        }
+    }
+}
+
+// =========================================================================
 // M2 Project/storage integrity hardening (2026-09-17) - new evidence
 // below. Evidence for
 // `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.

@@ -21,7 +21,7 @@ use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMilestonePayload,
     AddTaskPayload, ConfirmationClass, CreateGoalPayload, CreateProjectPayload, FieldPatch,
     LinkGoalsPayload, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
-    UpdateTaskPayload, ValidationError,
+    UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::CoreError;
 use crate::domain::{
@@ -327,13 +327,15 @@ pub(crate) fn get_goal(conn: &Connection, id: GoalId) -> Result<Option<Goal>, ru
     storage::goal_repo::get_goal(conn, id)
 }
 
-// --- Project (M2 Project vertical slice, 2026-09-17) --------------------
+// --- Project (M2 Project vertical slice, 2026-09-17; UpdateProject
+// added 2026-09-17, M2 UpdateProject implementation) --------------------
 //
 // Same atomic-mutation-plus-audit, typed-`CoreError`, module-boundary
-// pattern as Goal above - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
-// Only `CreateProject` and `UpdateProgress` are implemented (the frozen
-// action set also has `AddMilestone`/`AddTask`, out of scope - they need
-// Milestone/Task, which do not exist yet).
+// pattern as Goal above - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
+// and `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`.
+// `CreateProject`, `UpdateProject`, and `UpdateProgress` are all
+// implemented now - `AddMilestone`/`AddTask` live under their own
+// entities (`add_milestone`/`add_task` below), not here.
 
 /// `CreateProject`'s confirmation floor is `EXPLICIT_ADD` - same as
 /// `CreateGoal` - per the architecture-freeze report §F's confirmation
@@ -418,6 +420,112 @@ pub(crate) fn create_project(
 
     ActionOutcome::Success {
         value: project,
+        confirmation_class: class,
+    }
+}
+
+/// `UpdateProject`'s confirmation floor is `IMPORTANT_CHANGE` - the
+/// frozen floor from the M2 Project Child Action Freeze report, closing
+/// the M2 Project/storage integrity hardening report's action-set gap
+/// (§6 of that report). `Project.progress` is deliberately **not** part
+/// of this payload - `UpdateProgress` (below) remains its exclusive
+/// owner, floor `EXPLICIT_ADD`, unchanged; the two actions' payloads and
+/// audit semantics are never merged. If `payload.goal_id` is
+/// `FieldPatch::Set(x)`, `x` must reference a real, existing Goal -
+/// checked here (a database read) BEFORE persistence, the same pattern
+/// `create_project`'s own `goal_id` check already uses; `Clear`/
+/// `Unchanged` need no lookup. No status-transition restriction: all
+/// four `LifecycleStatus` values remain peer states for Project, exactly
+/// as already established for Goal - a completed or abandoned Project
+/// may be reopened.
+pub(crate) fn update_project(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: UpdateProjectPayload,
+) -> ActionOutcome<Project> {
+    let existing = match storage::project_repo::get_project(conn, payload.id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(errors) = crate::actions::validate_update_project(&existing, &payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    if let FieldPatch::Set(goal_id) = payload.goal_id {
+        match storage::goal_repo::goal_exists(conn, goal_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedGoalNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    let class = effective_class(ConfirmationClass::ImportantChange, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let previous_snapshot = serde_json::to_string(&existing).ok();
+
+    let mut updated = existing;
+    if let Some(title) = payload.title {
+        updated.title = title.trim().to_string();
+    }
+    match payload.description {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(description) => updated.description = Some(description),
+        FieldPatch::Clear => updated.description = None,
+    }
+    if let Some(status) = payload.status {
+        updated.status = status;
+    }
+    match payload.priority {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(priority) => updated.priority = Some(priority),
+        FieldPatch::Clear => updated.priority = None,
+    }
+    match payload.goal_id {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Set(goal_id) => updated.goal_id = Some(goal_id),
+        FieldPatch::Clear => updated.goal_id = None,
+    }
+    updated.updated_at = meta.requested_at;
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::project_repo::update_project(&tx, &updated) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::project_repo::insert_audit_entry(
+        &tx,
+        updated.id,
+        "UpdateProject",
+        meta.actor,
+        meta.provenance,
+        class,
+        previous_snapshot.as_deref(),
+        meta.requested_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: updated,
         confirmation_class: class,
     }
 }

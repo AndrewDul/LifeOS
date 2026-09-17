@@ -19,9 +19,9 @@
 use crate::core_error::CoreError;
 use crate::domain::{
     Goal, GoalId, GoalRelationType, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
-    OrderIndex, Priority, Progress, ProjectId, Task, TaskId, TaskStatus, DESCRIPTION_MAX_LEN,
-    DOMAIN_TAG_MAX_LEN, ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN,
-    TITLE_MAX_LEN,
+    OrderIndex, Priority, Progress, Project, ProjectId, Task, TaskId, TaskStatus,
+    DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN, ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN,
+    PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -434,13 +434,90 @@ pub(crate) fn validate_update_goal(
     }
 }
 
-// --- Project (M2 Project vertical slice, 2026-09-17) --------------------
+// --- Project (M2 Project vertical slice, 2026-09-17; UpdateProject
+// added 2026-09-17, M2 UpdateProject implementation) --------------------
 //
-// The frozen M2 action set for Project (architecture-freeze report §C)
-// is CreateProject, AddMilestone, AddTask, UpdateProgress - there is no
-// frozen UpdateProject. Only CreateProject and UpdateProgress are
-// implemented this slice; AddMilestone/AddTask need Milestone/Task,
-// which are explicitly out of scope.
+// The frozen M2 action set for Project (architecture-freeze report §C,
+// as extended by the M2 Project Child Action Freeze report) is
+// CreateProject, UpdateProject, AddMilestone, AddTask, UpdateProgress.
+// All are now implemented except AddMilestone/AddTask, which live under
+// their own entities (`domain::Milestone`/`domain::Task`), not here.
+
+/// `UpdateProject` payload (M2 UpdateProject implementation, 2026-09-17)
+/// - the frozen shape from the M2 Project Child Action Freeze report.
+/// `title`/`status` are non-nullable `Project` fields, so a plain
+/// `Option` is correct for them (`Some(x)` sets, `None` leaves
+/// unchanged). `description`/`priority`/`goal_id` are all genuinely
+/// nullable `Project` fields and use `FieldPatch` so "leave unchanged"
+/// and "explicitly clear to NULL" stay distinct. **`progress` is
+/// deliberately absent** - `UpdateProgress` remains its exclusive
+/// owner (§2 of the UpdateProject brief); do not add it here, do not
+/// merge the two actions, and do not derive progress from anything.
+/// `goal_id`'s existence, when `Set`, needs a database read, so it
+/// cannot happen in this pure module - `services::update_project`
+/// performs it, the same pattern `create_project` already uses.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UpdateProjectPayload {
+    pub id: ProjectId,
+    pub title: Option<String>,
+    pub description: FieldPatch<String>,
+    pub status: Option<LifecycleStatus>,
+    pub priority: FieldPatch<Priority>,
+    pub goal_id: FieldPatch<GoalId>,
+}
+
+/// Validates an update against the *existing* Project - `existing` is
+/// taken for the same shape-consistency reason
+/// `validate_update_goal`/`validate_update_milestone`/
+/// `validate_update_task` take it, though no field here actually needs
+/// prior state to validate. No status-transition restriction: all four
+/// `LifecycleStatus` values remain peer states for Project, exactly as
+/// already established for Goal - a completed or abandoned Project may
+/// be reopened; do not reintroduce a terminal-state rule here. Does
+/// **not** check whether a `Set` `goal_id` references a real Goal -
+/// needs a database read; `services::update_project` performs it.
+pub(crate) fn validate_update_project(
+    existing: &Project,
+    payload: &UpdateProjectPayload,
+) -> Result<(), Vec<ValidationError>> {
+    let _ = existing; // reserved for shape-consistency with validate_update_goal/validate_update_milestone/validate_update_task
+    let mut errors = Vec::new();
+
+    let touches_any_field = payload.title.is_some()
+        || !payload.description.is_unchanged()
+        || payload.status.is_some()
+        || !payload.priority.is_unchanged()
+        || !payload.goal_id.is_unchanged();
+    if !touches_any_field {
+        errors.push(ValidationError::NoFieldsToUpdate);
+    }
+
+    if let Some(title) = &payload.title {
+        if let Err(e) = validate_title(title) {
+            errors.push(e);
+        }
+    }
+    if let FieldPatch::Set(d) = &payload.description {
+        if let Err(e) = validate_description(d) {
+            errors.push(e);
+        }
+    }
+    if let FieldPatch::Set(p) = &payload.priority {
+        if let Err(e) = validate_priority(*p) {
+            errors.push(e);
+        }
+    }
+    // No goal_id existence check here - needs a database read;
+    // services::update_project performs it. No status-transition
+    // check: every LifecycleStatus -> LifecycleStatus change an
+    // explicit action requests is allowed, matching Goal's precedent.
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// `CreateProject` payload. `goal_id`, if present, must reference an
 /// existing `Goal` - that check needs a database read, so it cannot

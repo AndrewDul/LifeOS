@@ -78,10 +78,41 @@ pub(in crate::services) fn insert_project(
     Ok(())
 }
 
+/// The frozen general-purpose `UpdateProject` action (M2 UpdateProject
+/// implementation, 2026-09-17) - distinct from `update_project_progress`
+/// below: mutates `title`/`description`/`status`/`priority`/`goal_id`/
+/// `updated_at`. Deliberately never touches `progress` (that stays
+/// `UpdateProgress`'s exclusive field, §2 of the UpdateProject brief) or
+/// `created_at`/`id` (neither ever changes after creation).
+pub(in crate::services) fn update_project(
+    conn: &Connection,
+    project: &Project,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE projects SET title = ?2, description = ?3, status = ?4, priority = ?5, goal_id = ?6, updated_at = ?7
+         WHERE id = ?1",
+        params![
+            project.id.to_string(),
+            project.title,
+            project.description,
+            project.status.as_str(),
+            project.priority,
+            project.goal_id.map(|g| g.to_string()),
+            project.updated_at.to_rfc3339(),
+        ],
+    )?;
+    debug_assert_eq!(
+        changed, 1,
+        "update_project should affect exactly one row - caller must check existence first"
+    );
+    Ok(())
+}
+
 /// `UpdateProgress` is deliberately narrow - it only ever changes
-/// `progress`/`updated_at`, never any other Project field (there is no
-/// frozen generic `UpdateProject` action - see `actions::mod`'s Project
-/// section).
+/// `progress`/`updated_at`, never any other Project field - kept as its
+/// own function alongside the general-purpose `update_project` above
+/// rather than merged into it, preserving the frozen ownership split
+/// (§2/§21 of the UpdateProject brief).
 pub(in crate::services) fn update_project_progress(
     conn: &Connection,
     id: ProjectId,

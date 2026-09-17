@@ -965,3 +965,280 @@ fn update_task_inferred_provenance_becomes_inferred_change() {
     );
     assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
 }
+
+// =========================================================================
+// UpdateProject (M2 UpdateProject implementation, 2026-09-17) - direct
+// unit tests. `goal_id` existence needs a database read and is proven in
+// `services::tests` instead. `progress` is deliberately absent from
+// `UpdateProjectPayload` entirely - there is no field to test here,
+// which is itself the point (see `services::tests` for the dedicated
+// progress-preservation regression proof).
+// =========================================================================
+
+fn base_project(status: LifecycleStatus) -> Project {
+    Project {
+        id: ProjectId::new(),
+        title: "Base project".to_string(),
+        description: None,
+        status,
+        priority: None,
+        goal_id: None,
+        progress: 0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn update_project_rejects_when_no_fields_touched() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        ..Default::default()
+    };
+    let errors =
+        validate_update_project(&existing, &payload).expect_err("no-op update must be rejected");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_project_field_patch_unchanged_alone_is_not_a_touch() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        description: FieldPatch::Unchanged,
+        priority: FieldPatch::Unchanged,
+        goal_id: FieldPatch::Unchanged,
+        ..Default::default()
+    };
+    let errors = validate_update_project(&existing, &payload)
+        .expect_err("all-Unchanged update must be rejected as touching nothing");
+    assert!(errors.contains(&ValidationError::NoFieldsToUpdate));
+}
+
+#[test]
+fn update_project_title_some_is_trimmed_before_validation() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        title: Some("  Renamed Project  ".to_string()),
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_empty_title_is_rejected() {
+    let existing = base_project(LifecycleStatus::Active);
+    for bad in ["", "   ", "\t\n"] {
+        let payload = UpdateProjectPayload {
+            id: existing.id,
+            title: Some(bad.to_string()),
+            ..Default::default()
+        };
+        let errors = validate_update_project(&existing, &payload)
+            .expect_err("empty Some(title) must be rejected");
+        assert!(
+            errors.contains(&ValidationError::EmptyTitle),
+            "expected EmptyTitle for {bad:?}, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn update_project_overlong_title_is_rejected() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        title: Some("x".repeat(TITLE_MAX_LEN + 1)),
+        ..Default::default()
+    };
+    let errors =
+        validate_update_project(&existing, &payload).expect_err("overlong title must be rejected");
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::TitleTooLong { .. })));
+}
+
+#[test]
+fn update_project_description_set_valid_is_accepted() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        description: FieldPatch::Set("A real description".to_string()),
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_description_clear_is_accepted() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        description: FieldPatch::Clear,
+        ..Default::default()
+    };
+    assert!(
+        validate_update_project(&existing, &payload).is_ok(),
+        "Clear should never fail length validation"
+    );
+}
+
+#[test]
+fn update_project_overlong_description_set_is_rejected() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        description: FieldPatch::Set("x".repeat(DESCRIPTION_MAX_LEN + 1)),
+        ..Default::default()
+    };
+    let errors = validate_update_project(&existing, &payload)
+        .expect_err("overlong Set(description) must be rejected");
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::DescriptionTooLong { .. })));
+}
+
+#[test]
+fn update_project_priority_set_is_accepted() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        priority: FieldPatch::Set(3),
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_priority_clear_is_accepted() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        priority: FieldPatch::Clear,
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_priority_set_out_of_bounds_is_rejected() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        priority: FieldPatch::Set(PRIORITY_MAX + 1),
+        ..Default::default()
+    };
+    let errors = validate_update_project(&existing, &payload)
+        .expect_err("out-of-bounds Set(priority) must be rejected");
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::PriorityOutOfBounds { .. })));
+}
+
+#[test]
+fn update_project_goal_id_set_is_accepted_at_pure_layer() {
+    // Existence of the referenced Goal needs a database read and is
+    // proven in services::tests - this pure layer only proves the
+    // structural shape is accepted.
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        goal_id: FieldPatch::Set(GoalId::new()),
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_goal_id_clear_is_accepted() {
+    let existing = base_project(LifecycleStatus::Active);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        goal_id: FieldPatch::Clear,
+        ..Default::default()
+    };
+    assert!(validate_update_project(&existing, &payload).is_ok());
+}
+
+#[test]
+fn update_project_all_four_statuses_are_accepted_by_pure_validation() {
+    let existing = base_project(LifecycleStatus::Active);
+    for status in [
+        LifecycleStatus::Active,
+        LifecycleStatus::Paused,
+        LifecycleStatus::Completed,
+        LifecycleStatus::Abandoned,
+    ] {
+        let payload = UpdateProjectPayload {
+            id: existing.id,
+            status: Some(status),
+            ..Default::default()
+        };
+        assert!(
+            validate_update_project(&existing, &payload).is_ok(),
+            "status {status:?} should be accepted - no terminal-state rule exists"
+        );
+    }
+}
+
+#[test]
+fn update_project_completed_to_active_is_not_rejected() {
+    let existing = base_project(LifecycleStatus::Completed);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        status: Some(LifecycleStatus::Active),
+        ..Default::default()
+    };
+    assert!(
+        validate_update_project(&existing, &payload).is_ok(),
+        "reopening a COMPLETED project must be allowed - no terminal-state rule is frozen"
+    );
+}
+
+#[test]
+fn update_project_abandoned_to_active_is_not_rejected() {
+    let existing = base_project(LifecycleStatus::Abandoned);
+    let payload = UpdateProjectPayload {
+        id: existing.id,
+        status: Some(LifecycleStatus::Active),
+        ..Default::default()
+    };
+    assert!(
+        validate_update_project(&existing, &payload).is_ok(),
+        "reopening an ABANDONED project must be allowed - no terminal-state rule is frozen"
+    );
+}
+
+#[test]
+fn update_project_explicit_important_change_stays_important_change() {
+    // Frozen floor (M2 Project Child Action Freeze report) -
+    // IMPORTANT_CHANGE's type floor is already above ExplicitAdd's
+    // provenance-derived class, so Explicit provenance changes nothing.
+    assert_eq!(
+        effective_class(ConfirmationClass::ImportantChange, Provenance::Explicit),
+        ConfirmationClass::ImportantChange
+    );
+}
+
+#[test]
+fn update_project_inferred_important_change_stays_important_change() {
+    // IMPORTANT_CHANGE's type floor (severity 3) is already above
+    // InferredChange's provenance-derived class (severity 2), so
+    // Inferred provenance does not raise it further - effective_class
+    // takes the max of the two, and the type floor already wins.
+    assert_eq!(
+        effective_class(ConfirmationClass::ImportantChange, Provenance::Inferred),
+        ConfirmationClass::ImportantChange
+    );
+}
+
+#[test]
+fn update_project_important_change_blocks_until_confirmed_matches_generic_policy() {
+    // Do not change blocks_until_confirmed merely to make UpdateProject
+    // behave differently - this asserts against the EXISTING generic
+    // policy (ImportantChange executes immediately, always audited and
+    // Undo-able; only InferredChange/Delete block).
+    assert!(!blocks_until_confirmed(ConfirmationClass::ImportantChange));
+}
