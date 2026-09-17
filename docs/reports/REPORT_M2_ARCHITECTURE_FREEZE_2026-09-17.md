@@ -11,6 +11,18 @@ durable decisions are also written into `docs/LIFEOS_SPEC.md` §5 as the
 canonical reference; this document carries the full reasoning, the
 options considered, and the tradeoffs behind each decision.
 
+> **Errata (2026-09-17, same day, corrected during the M2 storage-spike
+> run before implementation began):** two issues identified during
+> review are fixed in place below rather than left as stale text -
+> §G's module-boundary claim did not actually hold under Rust's
+> visibility rules as originally written, and §E/§F's `ForgetMemory`
+> classification conflated it with ordinary soft-deletes. Both are
+> corrected in §E/§F/§G directly; see
+> `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the verified
+> proof of the corrected module boundary (a real compiler error was
+> captured, not just reasoned about) and for the storage-candidate
+> verification (§B below) that this same run's Phase B also required.
+
 ---
 
 ## 0. Context
@@ -261,9 +273,20 @@ not type-derived, per the overlay rule above.)
   acknowledgement step (not necessarily a blocking modal - severity-
   dependent, an M3 UX decision) and is always Undo-able and always
   written to the audit log.
-- **DELETE** — always a blocking confirmation dialog. Storage performs a
-  soft-delete/tombstone, never a hard SQL `DELETE`, so Undo remains
-  technically possible for a grace period even after confirmation.
+- **DELETE** — always a blocking confirmation dialog. **Corrected
+  2026-09-17: this is not one uniform storage behavior.** `CancelEvent`
+  performs a soft-delete/tombstone (never a hard SQL `DELETE`), so Undo
+  remains technically possible for a grace period even after
+  confirmation. `ForgetMemory` is different in kind, not just degree: it
+  is the user's explicit right-to-be-forgotten action, so it must
+  actually, permanently remove the targeted `Fact` payload and any
+  dependent sensitive `Evidence` - a real deletion, not a flag flip. Only
+  a minimal non-sensitive audit marker (record id/hash, timestamp, action
+  type) may remain; the original forgotten text/value must never persist
+  anywhere, including in backups taken afterward or in logs. `Undo` is
+  therefore not offered for `ForgetMemory` past the confirmation step
+  itself - offering it would mean secretly retaining exactly the data the
+  user asked to have removed, which defeats the purpose of the action.
 - **SENSITIVE** (overlay) — always logged to the user-visible outbound/
   action audit trail (`LIFEOS_SPEC.md` §4.3) regardless of base class,
   even though sensitive data never leaves the device by default; if
@@ -291,29 +314,59 @@ once a real plugin boundary needs it (post-M2, likely M5+ if/when
 third-party extensibility becomes real) - not a contradiction of the
 earlier research, a deliberate sequencing of it.
 
+**Corrected 2026-09-17 — the original enforcement claim did not actually
+hold.** This report originally described `storage/` as a *sibling* of
+`services/`, made callable "only from services" via `pub(crate)`/
+`pub(super)`. That does not work under Rust's real visibility rules:
+`pub(crate)` is visible to the *whole crate* (including `capability/`,
+`domain/`, anything else) - not just `services`; `pub(super)` on a
+sibling module only reaches their shared parent (`src-tauri/src/` itself
+via `lib.rs`), which is exactly where `capability/` also lives, so it
+would have been reachable too. Neither gives the intended guarantee.
+Identified during this run's review before any code was written.
+
+**Corrected structure: `storage` nests inside `services` as a private
+submodule**, not a sibling:
+
 ```
 src-tauri/src/
 ├── domain/       plain data types (Goal, Project, Fact, ...) - no I/O, no SQL
 ├── actions/      typed action payloads + deterministic validation (pure, no I/O)
 ├── services/     orchestration: validate → confirmation-class → persist → audit
-│                 (the ONLY module allowed to call storage/)
-├── storage/      SQLite access (rusqlite + sqlite3mc), repository-style
-│                 functions per domain area, migrations via refinery
+│   └── storage/  (private submodule - `mod storage;`, no pub at all, plus
+│                  pub(super) on its own functions as defense in depth)
+│                  SQLite access, repository-style functions per domain
+│                  area, migrations via refinery. Reachable ONLY from
+│                  services/mod.rs - not from capability/, domain/, or an
+│                  external test crate. This is a bare Rust module-privacy
+│                  fact, not a keyword choice someone can loosen by
+│                  accident without it being an explicit, visible edit.
 ├── knowledge/    Personal Knowledge Layer (Entity/Fact/Relation/Episode/
 │                 Evidence operations, temporal-history helpers)
 ├── security/     key management (keyring crate), encryption setup,
 │                 redaction/PII helpers (future GLiNER integration point),
 │                 outbound-audit-trail logging
 ├── backup/       encrypted export/import, rekey support
-├── migrations/   versioned schema migration files (consumed by storage/)
-└── capability/   the stable API surface - thin wrappers over services/ for
-                  Tauri commands today, the future NeXa-facing boundary
-                  later; never calls storage/ directly
+├── migrations/   versioned schema migration files (consumed by services/storage/)
+└── capability/   the stable API surface - thin wrappers over services/'s
+                  own public functions for Tauri commands today, the
+                  future NeXa-facing boundary later; cannot import
+                  services::storage even if it tried - the compiler
+                  rejects it (verified, see the storage-spike report)
 ```
 
 ---
 
 ## H. Encryption/key architecture
+
+> **Outcome (2026-09-17, storage spike, same day):** sqlite3mc turned out
+> to have no mature native-Rust integration (evidence in the spike
+> report's Phase B) - SQLCipher, always the documented fallback below,
+> was substituted and is now **PROVEN** against every item in this
+> section's checklist, including the Windows Tauri release-build check.
+> See `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the full
+> evidence and `docs/LIFEOS_SPEC.md` §5 for the updated canonical
+> decision. The target design below is otherwise unchanged.
 
 **Target design (not yet built):**
 - **DB master key:** randomly generated (256-bit), created on first run,

@@ -276,38 +276,64 @@ primary one.
 
 ## 5. Local database and LifeOS Core architecture
 
-Status: **architecture frozen at M2** (2026-09-17) — not yet
-implemented. Full reasoning, tradeoffs, and the storage-spike
-requirements behind every decision in this section:
-`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`. Original
-research: `RESEARCH_DECISIONS.md` §4.
+Status: **architecture frozen at M2** (2026-09-17); the storage layer
+specifically is **PROVEN** (2026-09-17, storage spike) — schema/action
+implementation not yet started. Full reasoning, tradeoffs, and evidence
+behind every decision in this section:
+`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md` and
+`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`. Original research:
+`RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
 OS-native key storage.
 
-- **Encryption**: `sqlite3mc` (SQLite3 Multiple Ciphers, ChaCha20-Poly1305)
-  rather than SQLCipher — actively maintained, format-compatible with
-  SQLCipher (low switching risk), a faster AEAD cipher, no external
-  OpenSSL/libcrypto build dependency. **This is a research recommendation,
-  not a proven implementation** — it is not declared final until an
-  executable storage spike proves it end-to-end (create, reopen after
-  restart, wrong-key rejection, migration, rekey, backup, restore,
-  corruption handling, and a real Windows Tauri *release*-build
-  compatibility check — see the M2 report §H). If it fails that spike,
-  the documented fallback is SQLCipher.
+- **Encryption: SQLCipher, via `rusqlite`'s native `bundled-sqlcipher`
+  feature — PROVEN, not `sqlite3mc`.** The architecture freeze proposed
+  `sqlite3mc` as the leading candidate; the storage-spike run verified
+  that assumption directly (not trusting prior documentation) and found
+  **no mature native-Rust integration exists for it** — `rusqlite`
+  (latest, 0.40.2) has no `sqlite3mc` feature at all (only SQLCipher-
+  family features), the upstream SQLite3MultipleCiphers project
+  documents no Rust bindings, and the only native-Rust crate found
+  (`walletkit-sqlite`) was 15 days old with 78 downloads at research
+  time — not viable to depend on. SQLCipher (always the documented
+  fallback) was substituted and passed the full required checklist:
+  encrypted creation, persistence across restart, wrong-key rejection,
+  encrypted-at-rest verification, migration, rekey, backup, restore,
+  corruption handling, OS key-store round trip, and — the specific gap
+  the freeze called out — a real Windows Tauri *release* build
+  (`cargo build --release` and `npm run tauri build`, producing actual
+  MSI and NSIS installers, not just `cargo check`). Full evidence:
+  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`.
+- **Known Windows build dependency:** `bundled-sqlcipher` links against
+  an *external* OpenSSL rather than building one from source (the
+  Perl bundled with Git for Windows on this machine cannot build
+  OpenSSL — a real, evidenced blocker, not a theoretical one). A
+  prebuilt Windows OpenSSL dev package (`winget install
+  ShiningLight.OpenSSL.Dev`) is required, with its path set in
+  `src-tauri/.cargo/config.toml` (currently a machine-specific absolute
+  path — any other machine continuing this work needs the same package
+  installed, or that config updated). Revisit
+  `bundled-sqlcipher-vendored-openssl` (avoids this external dependency
+  entirely) if a working Perl is ever set up on the build machine.
 - **DB master key**: randomly generated, created on first run, stored via
   the OS-native secure credential store via the `keyring` Rust crate
   (Windows Credential Manager/DPAPI today; macOS Keychain and Linux
-  Secret Service later, same code). **Not** Tauri's Stronghold plugin —
+  Secret Service later, same code) — the OS round-trip itself proven in
+  the storage spike (generate → store → retrieve → use to open the DB →
+  clean up), not just assumed. **Not** Tauri's Stronghold plugin —
   deprecated upstream (`RESEARCH_DECISIONS.md` §4). A *separate* future
   password/recovery-key-wrapped portable backup key is a target design
   for later (not built at M2) — the backup format must not preclude it.
   No plaintext secrets (keys, sensitive field values) may ever appear in
   logs.
-- **Driver/migrations**: `rusqlite` (with `sqlite3mc` bundled) +
-  `refinery` for versioned schema migrations. Not the official
-  `tauri-plugin-sql` (sqlx-based) — it lacks first-class
-  SQLCipher/sqlite3mc support as of this research.
+- **Driver/migrations**: `rusqlite` 0.37.0 (pinned — `refinery-core`
+  0.9.0's `rusqlite` feature caps at `<=0.37`, confirmed via a real
+  dependency-resolution failure against the latest 0.40.2) + `refinery`
+  0.9.2 for versioned schema migrations, proven end-to-end in the spike
+  (apply, re-run safely as a no-op, data survives). Not the official
+  `tauri-plugin-sql` (sqlx-based) — it lacks first-class SQLCipher
+  support.
 - **OS disk encryption** (BitLocker/FileVault/LUKS) is a complementary
   layer, not a substitute — Windows 11 Home's "Device Encryption" requires
   a Microsoft account and is off by default on local accounts (this dev
@@ -431,6 +457,17 @@ bare string. This is the literal implementation of the guarded-action-
 layer principle (§2): forms, chat, and (later) voice/NeXa all resolve to
 calls on this exact same set of functions.
 
+**`ForgetMemory` is not a soft-delete (corrected 2026-09-17, M2 storage-
+spike report §Errata).** Unlike `CancelEvent` and ordinary domain
+removal, which tombstone a row and keep it (§5.5), `ForgetMemory` is the
+user's explicit "delete this personal information" instruction and must
+actually remove it: the targeted `Fact` payload (and any dependent
+sensitive `Evidence`) is permanently deleted, not flagged deleted. Only a
+minimal, non-sensitive audit marker may remain — a record identifier/
+hash, the deletion timestamp, and the action type. The original
+forgotten text/value must never persist anywhere afterward, including in
+the audit trail, backups taken after the deletion, or logs.
+
 ### 5.5 Confirmation policy (frozen, M2)
 
 Six classes (M2 report §F): `SAFE_READ`, `EXPLICIT_ADD`,
@@ -446,24 +483,66 @@ Default behavior: `SAFE_READ` executes silently; `EXPLICIT_ADD` executes
 immediately with inline confirmation + Undo; `INFERRED_CHANGE` always
 blocks on explicit user confirmation before persisting; `IMPORTANT_CHANGE`
 executes with an acknowledgement step and is always Undo-able and
-audit-logged; `DELETE` always requires a blocking confirmation and is a
-soft-delete/tombstone in storage, never a hard SQL delete. Exact UI
+audit-logged; `DELETE` always requires a blocking confirmation. Exact UI
 treatment per class (modal vs. inline vs. toast) is an M3 decision, not
 frozen here.
+
+**`DELETE` is not one uniform storage behavior (corrected 2026-09-17).**
+`CancelEvent` and ordinary domain removal soft-delete/tombstone the row —
+the data stays, only its status changes, so Undo remains trivial.
+`ForgetMemory` is different and more severe: because it is the user
+exercising the right to have LifeOS actually forget something, it
+performs a real, permanent deletion of the personal payload (§5.4) —
+Undo is not offered for `ForgetMemory` past the blocking confirmation
+step itself, since "Undo" would mean retaining exactly the data the user
+asked to have removed.
 
 ### 5.6 Module boundaries (Core architecture, M2)
 
 One Rust crate (the existing `lifeos` in `src-tauri/`), organized into
 clear modules rather than split into multiple crates yet (M2 report §G —
 a deliberate sequencing of the crate-separation idea in §5.1, not a
-reversal of it): `domain/`, `actions/`, `services/`, `storage/`,
-`knowledge/`, `security/`, `backup/`, `migrations/`, `capability/`.
-`services/` is the only module allowed to call `storage/` — enforced by
-Rust module visibility (`storage/`'s functions are not `pub` outside
-`services/`), so "UI/LLM/NeXa never mutate SQL directly" is a compile-time
-guarantee, not just a convention. `capability/` is the thin, stable
-surface that Tauri commands, the cloud LLM's tool-handlers, and (later)
-NeXa all sit behind — see §10.1.
+reversal of it): `domain/`, `actions/`, `services/`, `knowledge/`,
+`security/`, `backup/`, `migrations/`, `capability/`.
+
+**Enforcement mechanism, corrected 2026-09-17 (M2 storage-spike report
+§Errata).** The original freeze described `storage` as a *sibling* of
+`services`, "restricted" to it via `pub(crate)`/`pub(super)` — that does
+not actually work: `pub(crate)` is visible to the *entire* crate
+(including `capability/`, `domain/`, anything else), and `pub(super)` on
+a sibling only reaches their shared parent, not `services` specifically.
+Neither gives the intended guarantee. The corrected, verified structure
+nests `storage` **inside** `services` as a private submodule:
+
+```
+services/
+    mod.rs        <- declares `mod storage;` (private - no pub at all)
+                     exposes services' own pub(crate) functions, which
+                     internally call into storage
+    storage/
+        mod.rs    <- functions are pub(super): reachable only from
+                     services/mod.rs, not even from other submodules
+                     of services beyond the immediate parent
+        ...
+```
+
+Because `storage` is declared as a plain private `mod storage;` inside
+`services/mod.rs`, **nothing outside the `services` module tree can even
+name `services::storage`** — not `capability/`, not `domain/`, not an
+external crate, not an integration test. This is enforced by the Rust
+compiler itself (a bare `mod` declaration defaults to private), not by a
+visibility keyword someone could loosen without noticing; `pub(super)` on
+the individual storage functions is a second, defense-in-depth layer in
+case a future edit ever changes the module declaration itself.
+**Verified for real** during the M2 storage spike by deliberately adding
+an illegal `services::storage::...` call from outside `services` and
+capturing the exact compiler rejection — see
+`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the literal
+error output, not just this description.
+
+`capability/` is the thin, stable surface that Tauri commands, the cloud
+LLM's tool-handlers, and (later) NeXa all sit behind — it calls only
+`services`' public functions, never `storage` — see §10.1.
 
 ---
 
@@ -753,7 +832,7 @@ Full evaluation, alternatives considered, and sources:
 | Frontend | React + TypeScript | No |
 | Backend | Rust | No |
 | Local DB | SQLite | No |
-| DB encryption | `sqlite3mc` (ChaCha20-Poly1305) | **Yes** — was SQLCipher |
+| DB encryption | SQLCipher (`rusqlite` `bundled-sqlcipher`) — PROVEN 2026-09-17 | No, net — `sqlite3mc` was tried first (no mature Rust integration found, storage-spike report), SQLCipher was always the documented fallback and is what's actually proven |
 | Encryption key storage | `keyring` crate (OS credential store) | **Yes** — Stronghold considered and rejected (deprecated upstream) |
 | DB driver/migrations | `rusqlite` + `refinery` | Clarification — not the sqlx-based official plugin |
 | Cloud LLM | Provider-agnostic; **v0.1 final: OpenAI GPT-5.6 Luna** | Product decision, §3 — supersedes the research-stage Sonnet-5 default |
@@ -787,13 +866,14 @@ reordered against `PROJECT_STATE.md`'s current reality).
   architecture. No fake backend functionality. **End of M1: the user must
   be able to launch and see the real app.**
 - **M2 — LifeOS Core + encrypted storage.** Architecture frozen
-  2026-09-17 (§5.1-§5.6, `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`);
-  implementation not started. First step is the storage spike proving
-  `sqlite3mc` (M2 report §H) before any schema/action code is written.
-  Local encrypted SQLite, secure key handling (`keyring`), migrations
-  (`refinery`), core action architecture (§2, §5.4-§5.6), initial
-  profile/settings. No AI dependency for CRUD (AI-optional resilience,
-  §2).
+  2026-09-17 (§5.1-§5.6, `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`).
+  Storage layer PROVEN 2026-09-17 (SQLCipher via `rusqlite`
+  `bundled-sqlcipher`, not `sqlite3mc` — see §5 and
+  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`); schema/action
+  implementation not yet started. Local encrypted SQLite, secure key
+  handling (`keyring`), migrations (`refinery`), core action
+  architecture (§2, §5.4-§5.6), initial profile/settings. No AI
+  dependency for CRUD (AI-optional resilience, §2).
 - **M3 — Core life UI.** Today, Goals, Projects, Calendar; Quick Add /
   schema-driven forms; PL/EN UI architecture (§1.3); backend recurrence
   authority (the Rust `rrule` crate, §6).
@@ -850,9 +930,13 @@ REPORT.
 
 These are genuinely unresolved and should not be treated as decided:
 
-- Whether `sqlite3mc` survives the M2 storage spike (§5, M2 report §H) —
-  the architecture is frozen around it as the leading candidate, but it
-  is explicitly not proven yet; SQLCipher is the documented fallback.
+- **Resolved 2026-09-17:** `sqlite3mc` had no mature native-Rust
+  integration to test; SQLCipher (via `rusqlite`'s `bundled-sqlcipher`)
+  was substituted and is now PROVEN for M2 on Windows — see §5 and
+  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`. Still open:
+  whether to invest in fixing this machine's Perl to unlock
+  `bundled-sqlcipher-vendored-openssl` and drop the machine-specific
+  external-OpenSSL build dependency `bundled-sqlcipher` currently needs.
 - `Relation.relation_type` (Personal Knowledge Layer, §5.3) is an
   intentionally free string rather than a constrained enum — revisit
   once M6 usage patterns exist.

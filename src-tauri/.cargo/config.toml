@@ -1,0 +1,16 @@
+# M2 storage spike (2026-09-17) build requirement, NOT a permanent
+# project convention. `rusqlite`'s `bundled-sqlcipher` feature needs an
+# external OpenSSL to link against. This machine's Perl (bundled with
+# Git for Windows) cannot build OpenSSL from source (missing core CPAN
+# modules), so a prebuilt Windows OpenSSL dev package was installed
+# instead (winget: ShiningLight.OpenSSL.Dev, default install path).
+#
+# This is a machine-specific path, not portable - any other machine
+# continuing M2 work needs the same package installed at this path, or
+# these variables updated to match wherever it lands there. See
+# docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md Phase B for the
+# full reasoning and the alternatives considered.
+[env]
+OPENSSL_DIR = "C:\\Program Files\\OpenSSL-Win64"
+OPENSSL_LIB_DIR = "C:\\Program Files\\OpenSSL-Win64\\lib\\VC\\x64\\MD"
+OPENSSL_INCLUDE_DIR = "C:\\Program Files\\OpenSSL-Win64\\include"

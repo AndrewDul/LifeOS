@@ -21,6 +21,35 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M2 encrypted storage (spike, 2026-09-17 - see docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md).
+# sqlite3mc has no mature native-Rust integration as of this research
+# (rusqlite has no sqlite3mc feature; the only found crate is 15 days
+# old with 78 downloads) - SQLCipher, natively supported by rusqlite,
+# is the tested candidate instead. vendored-openssl avoids depending on
+# a system-installed crypto library on Windows.
+# Pinned to <=0.37: refinery-core 0.9.0's `rusqlite` feature depends on
+# `rusqlite = ">=0.23, <=0.37"` (confirmed via a real `cargo check`
+# resolver failure against rusqlite 0.40, the latest at time of
+# research) - not yet updated for rusqlite's newer releases.
+#
+# `bundled-sqlcipher-vendored-openssl` was tried first and rejected:
+# building OpenSSL from source needs a full Perl (Configure is a Perl
+# script) and the Perl bundled with Git for Windows is a minimal
+# distribution missing required core modules (confirmed via a real
+# build failure: "Can't locate Locale/Maketext/Simple.pm"). Using
+# `bundled-sqlcipher` (links SQLCipher's bundled C source against an
+# external OpenSSL) with a prebuilt Windows OpenSSL dev package
+# (winget: ShiningLight.OpenSSL.Dev) instead - see
+# docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md Phase B for the
+# full evidence trail. Requires OPENSSL_LIB_DIR/OPENSSL_INCLUDE_DIR set
+# when building (see .cargo/config.toml).
+rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher", "backup"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
+keyring = "4"
+rand = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

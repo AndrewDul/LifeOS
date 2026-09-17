@@ -5,7 +5,8 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M1 closed/accepted; M2 architecture freeze).
+Last updated: 2026-09-17 (M2 storage spike — architecture errata,
+storage candidate proven).
 
 ---
 
@@ -13,31 +14,29 @@ Last updated: 2026-09-17 (M1 closed/accepted; M2 architecture freeze).
 
 | Milestone | Status |
 |---|---|
-| M0 — Environment ready | **DONE** (§2) |
+| M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | **ARCHITECTURE FROZEN, not yet implemented** (§4) |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; **storage layer PROVEN** 2026-09-17; schema/action layer **not yet implemented** (§4) |
 | M3-M10 | Not started |
 
-**M1 is closed.** The user manually reviewed the running app and accepts
-the current UI/navigation shell. Placeholder content, exact labels, menu
-composition, and other visual details may still change later, but none
-of that blocks architecture or backend work anymore. **Do not rewrite
-accepted M1 code** except for genuine bugs or when a later milestone's
-real functionality requires touching a screen it was standing in for.
+**M1 is closed** — see §3. Do not rewrite accepted M1 code except for
+genuine bugs or when later real functionality requires touching a
+screen it was standing in for.
 
-**M2 is now the active milestone.** Its architecture is frozen (this
-run) but no storage code has been written yet — see §4 and
-`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md` for the full
-design. The next implementation run's first job is the **storage spike**
-(§4, "Next implementation step"), not the domain schema.
+**M2's encrypted-storage question is now answered**, and the two
+architecture-errata items flagged during review are corrected (§4). The
+next implementation run's job is the real domain schema and action
+layer, starting with one small vertical slice — not the full domain
+model at once, and still not M3.
 
 ---
 
 ## 2. What exists right now
 
-A Tauri 2 + React + TypeScript desktop app that launches successfully in
-a real window, with an accepted visual/navigation shell. No domain code,
-no database, no AI, no chat logic yet.
+A Tauri 2 + React + TypeScript desktop app that launches in a real
+window, with an accepted visual/navigation shell, plus a proven (but
+still spike-only, not production) encrypted-storage layer. No real
+domain schema, no AI, no chat logic yet.
 
 Repository contents as of this run:
 
@@ -55,6 +54,7 @@ LiFeOS/
 │   └── reports/            REPORT_UI_REFINEMENT_..._2026-09-17.md
 │                            REPORT_NAVIGATION_CORRECTION_..._2026-09-17.md
 │                            REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md
+│                            REPORT_M2_STORAGE_SPIKE_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/                 (default Tauri/Vite icons)
 ├── src/                    (React frontend - M1, accepted)
@@ -64,134 +64,139 @@ LiFeOS/
 │   │                  ChatScreen, ChatSidebar, PlaceholderScreen
 │   └── state/         faceState.ts, navigation.ts
 └── src-tauri/               (Rust backend)
-    ├── src/main.rs, src/lib.rs   (no domain commands yet - run() only)
+    ├── .cargo/config.toml        (M2 spike: OpenSSL env vars, machine-specific - see §4)
+    ├── migrations/                V1__init.sql, V2__add_note_column.sql (spike schema, NOT real domain)
+    ├── src/
+    │   ├── main.rs, main() -> lifeos_lib::run() (unchanged)
+    │   ├── lib.rs         run() unchanged; declares `mod services;`
+    │   └── services/      M2 storage spike (see §4) - NOT real domain
+    │       ├── mod.rs      orchestration + SpikeError, private `mod storage;`
+    │       ├── storage/mod.rs   private submodule, pub(super) fns only
+    │       └── tests.rs    10-requirement spike test suite (#[cfg(test)])
     ├── Cargo.toml, Cargo.lock, tauri.conf.json, build.rs
     ├── capabilities/default.json
     └── icons/                    (default Tauri icons, not LifeOS-branded yet)
 ```
 
-`node_modules/`, `dist/`, and `src-tauri/target/` exist on disk but are
-gitignored and untracked, as intended.
+`node_modules/`, `dist/`, and `src-tauri/target/` (including the
+MSI/NSIS installers produced this run) exist on disk but are gitignored
+and untracked, as intended - no build artifacts, generated databases, or
+credentials were committed.
 
 ---
 
-## 3. M1 — ACCEPTED
+## 3. M1 — ACCEPTED (unchanged this run)
 
-Accepted by the user on 2026-09-17 after manually reviewing the running
-app. Summary of what M1 delivered (full detail across the two
-refinement reports and the navigation-correction report in
-`docs/reports/`):
-
-- Home: large centered NeXa face (click opens a radial menu of 8
-  sections), four edge handles that open full-screen sections directly,
-  a dark cosmic galaxy background with a constellation formation, and a
-  demo `CommunicationDisplay` (face slides left, unboxed message right).
-- Every full-screen section (Chat, Today, Calendar, Goals, Projects,
-  Money, Me, Insights, Settings, Notifications) opens as a real
-  full-viewport slide-in from the direction it was triggered from, with
-  **no permanent global navigation rail** - the NeXa Island (a small
-  floating glass tile with the animated face) is the sole persistent
-  global navigation element while a section is open, via its Home/Menu
-  quick menu.
-- Chat has its own dedicated sidebar (New Chat, search, demo chat list)
-  distinct from global navigation.
-- Everything is visual-only: demo/placeholder content, no backend, no
-  AI, no persistence, by design.
-
-**What "accepted" means going forward:** the UI/navigation is no longer
-a blocker for M2+ work. Placeholder labels, menu composition, and minor
-visual details are expected to keep evolving as real functionality lands
-in later milestones (M3 onward) - that evolution does not require
-reopening or re-litigating M1 itself, and M1's existing components
-should be extended/wired to real data then, not rewritten from scratch.
-
-| Test | Result |
-|---|---|
-| Frontend build (`npm run build`) | PASS (multiple runs, most recently 27 modules, ~170ms, zero TS errors) |
-| Rust check (`cargo check`) | PASS (most recently 9.49s, zero errors) |
-| Real window launches | Confirmed by user |
-| Visual/interaction review | **Confirmed by user, 2026-09-17 — ACCEPTED** |
+Accepted by the user on 2026-09-17. Full detail in the two refinement
+reports and the navigation-correction report in `docs/reports/`. Summary:
+Home (large NeXa face, radial menu, four edge handles opening full-screen
+sections), no permanent global nav rail (NeXa Island is the sole
+persistent global nav while a section is open), Chat's own dedicated
+sidebar, everything visual-only/demo content by design. Not touched this
+run.
 
 ---
 
-## 4. M2 — LifeOS Core + encrypted storage (ARCHITECTURE FROZEN)
+## 4. M2 — LifeOS Core + encrypted storage
 
-Full design, reasoning, and acceptance criteria:
-`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`. The frozen,
-durable parts of the architecture (domain model, action layer,
-confirmation policy, module boundaries, capability API) are also written
-into `docs/LIFEOS_SPEC.md` §5 as the canonical reference going forward -
-the report carries the full reasoning and tradeoffs, the spec carries the
-decisions.
+### 4a. Architecture errata (corrected this run)
 
-### What's frozen (summary — see the report/spec for full detail)
+Two issues identified during review of the architecture freeze, fixed
+**before** any implementation began:
 
-- **Ownership boundary:** LifeOS Core (Rust) is the only thing that
-  touches SQL. UI, the cloud LLM, and future NeXa all go through a typed
-  action/service layer - enforced at compile time via Rust module
-  privacy (storage functions are not `pub` outside `services`), not just
-  convention.
-- **Personal Knowledge Layer:** minimum relational model of `Entity`,
-  `Fact`, `Relation`, `Episode`, `Evidence`, `Source`, with temporal
-  validity (facts are superseded, never overwritten) and the required
-  epistemic states (`USER_CONFIRMED`/`OBSERVED`/`INFERRED`/`DISPUTED`/
-  `STALE`) and categories (`FACT`/`PREFERENCE`/`EXPERIENCE`/`DECISION`/
-  `OBSERVATION`/`HYPOTHESIS`/`EFFECTIVE_SOLUTION`/`INEFFECTIVE_SOLUTION`/
-  `SKILL`/`HABIT`/`CURRENT_STATE`).
-- **Domain model:** minimum v0.1 structures frozen for `Goal`,
-  `GoalRelation`, `Project`, `Milestone`, `Task`, `Challenge`, `Plan`,
-  `SolutionAttempt`, `Outcome`, `CalendarEvent`, `Reminder`, `Question`,
-  `ProgressUpdate`, plus a minimal `WellbeingCheckin` (added because the
-  frozen capability API requires `log_wellbeing()` - flagged as a
-  deliberate small addition, see the report §C).
-- **Goal relations:** `SUPPORTS`/`CONFLICTS_WITH`/`DEPENDS_ON`/`BLOCKS`/
-  `CONTRIBUTES_TO`/`REQUIRES`/`PARENT_OF`/`CHILD_OF`/`DUPLICATES`/
-  `SUPERSEDES`/`COMPETES_FOR_RESOURCE`.
-- **Action layer:** the full typed action list from the build brief
-  (Goal/Project/Calendar/Challenge/Memory/Question/Plan actions),
-  validated deterministically in Core before persistence - never by an
-  LLM.
-- **Confirmation policy:** six classes (`SAFE_READ`/`EXPLICIT_ADD`/
-  `INFERRED_CHANGE`/`IMPORTANT_CHANGE`/`DELETE`/`SENSITIVE`), with a
-  `type_floor × provenance` rule rather than a fixed per-action table -
-  see the report §F for the full mapping.
-- **Module boundaries (one crate, not several):** `domain/`, `actions/`,
-  `services/`, `storage/`, `knowledge/`, `security/`, `backup/`,
-  `migrations/`, `capability/` as Rust modules inside the existing
-  `lifeos` crate - a deliberate refinement of the earlier
-  crate-per-domain research note (`RESEARCH_DECISIONS.md` §5): start as
-  modules, split into crates later only if a real plugin boundary
-  demands it.
-- **Encryption/key architecture target:** random DB master key in the OS
-  credential store (`keyring` crate) by default; a separate,
-  password/recovery-key-wrapped portable backup is a future capability
-  the backup format must not preclude; no plaintext secrets in logs.
-  **`sqlite3mc` is NOT declared final** - it remains the leading
-  candidate from `RESEARCH_DECISIONS.md` §4b, unproven until the storage
-  spike (below) passes.
-- **NeXa capability API:** the frozen function list
-  (`get_current_situation`, `get_active_goals`, `get_today_plan`,
-  `get_relevant_memory`, `create_goal`, `update_goal`, `create_challenge`,
-  `record_solution_attempt`, `record_outcome`, `create_calendar_event`,
-  `change_priority`, `log_wellbeing`, `get_progress`) as Rust functions in
-  `services`/`capability` - transport to NeXa itself is explicitly not
-  decided yet.
-- **M2 acceptance criteria:** ten concrete tests (persistence across
-  restart, encrypted-at-rest, wrong-key rejection, migration, backup/
-  restore, deterministic validation rejecting bad input, temporal fact
-  history, relation integrity, no direct UI/LLM SQL path, unit/
-  integration coverage) - see the report §J for exact detail.
+- **Module-boundary enforcement was wrong as originally written.**
+  `storage` was described as a *sibling* of `services`, "restricted" via
+  `pub(crate)`/`pub(super)` — that doesn't actually work under Rust's
+  visibility rules (`pub(crate)` reaches the whole crate; `pub(super)` on
+  a sibling reaches their shared parent, where a future `capability`
+  module would also live). **Corrected structure:** `storage` nests
+  *inside* `services` as a private submodule (`mod storage;`, no `pub`
+  at all), so nothing outside `services` can name it — verified for real
+  by deliberately attempting the illegal access and capturing the
+  compiler's rejection (`error[E0603]: module 'storage' is private`).
+  `docs/LIFEOS_SPEC.md` §5.6 and the architecture-freeze report's §G are
+  corrected in place.
+- **`ForgetMemory` was wrongly grouped with ordinary soft-deletes.**
+  `CancelEvent`-style tombstoning is fine for most deletions, but
+  `ForgetMemory` is the user's explicit right-to-be-forgotten action — it
+  must permanently remove the targeted `Fact` payload and dependent
+  sensitive `Evidence`, keeping only a minimal non-sensitive audit marker
+  (id/hash, timestamp, action type), never the original text. No `Undo`
+  past confirmation. `docs/LIFEOS_SPEC.md` §5.4/§5.5 and the freeze
+  report's §E/§F are corrected in place. Documentation-only — no code
+  exists yet for either action layer or memory.
+
+### 4b. Storage candidate: PROVEN — SQLCipher, not sqlite3mc
+
+Full evidence: `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`.
+
+**sqlite3mc could not be tested** — verified directly (not trusting
+prior docs) that no mature native-Rust integration exists: `rusqlite`
+0.40.2 has no `sqlite3mc` feature, upstream SQLite3MultipleCiphers
+documents no Rust bindings, and the only native-Rust crate found
+(`walletkit-sqlite`) was 15 days old with 78 downloads. Not rejected on
+technical grounds — never run against the checklist, because there was
+no mature dependency to run it through.
+
+**SQLCipher (via `rusqlite` 0.37.0's `bundled-sqlcipher` feature, pinned
+because `refinery-core` 0.9.0 caps at `rusqlite <=0.37`) passed all 10
+required tests plus the Windows Tauri release-build check**, run in an
+isolated spike (`src-tauri/src/services/`, a `spike_records` table only
+— no real domain schema):
+
+| # | Requirement | Result |
+|---|---|---|
+| 1 | Encrypted database creation | PASS |
+| 2 | Persistence across restart | PASS |
+| 3 | Wrong key fails cleanly | PASS (typed `rusqlite::Error`, real SQLCipher HMAC failure) |
+| 4 | Encrypted at rest (34-byte plaintext marker, 20,480-byte file) | PASS |
+| 5 | Migration V1→V2 (refinery), safe re-run | PASS |
+| 6 | Rekey | PASS |
+| 7 | Backup (same-installation) | PASS |
+| 8 | Restore (row count + content hash) | PASS |
+| 9 | Corruption detected safely (copy corrupted, original untouched) | PASS |
+| 10 | OS keyring round trip (Windows Credential Manager, real) | PASS |
+| 11 | `cargo build --release` | PASS (4m50s, real 4MB binary) |
+| 11 | `npm run tauri build` (MSI + NSIS) | PASS (both installers produced, verified on disk) |
+| 11 | Code signing | Not configured — correctly out of scope, not a failure |
+
+**Known Windows build dependency, not yet resolved:** `bundled-sqlcipher`
+needs an *external* OpenSSL (this machine's Git-for-Windows Perl cannot
+build OpenSSL from source — confirmed via a real build failure). Fixed
+by installing a prebuilt Windows OpenSSL dev package (`winget install
+ShiningLight.OpenSSL.Dev`) and pointing `src-tauri/.cargo/config.toml`
+at it — **a machine-specific absolute path**. Any other machine
+continuing M2 work needs the same package at the same path, or that
+config updated. Revisit `bundled-sqlcipher-vendored-openssl` (removes
+this dependency entirely) if a working Perl is ever set up here.
+
+`docs/LIFEOS_SPEC.md` §5 is updated to reflect SQLCipher (not sqlite3mc)
+as the proven M2 choice; `RESEARCH_DECISIONS.md` §4 is left as historical
+record, not deleted.
+
+### 4c. What's frozen architecturally (unchanged from the freeze, corrected per §4a)
+
+Personal Knowledge Layer (`Entity`/`Fact`/`Relation`/`Episode`/
+`Evidence`/`Source`, temporal validity, required epistemic states/
+categories); domain model minimum v0.1 (`Goal`, `GoalRelation`,
+`Project`, `Milestone`, `Task`, `Challenge`, `Plan`, `SolutionAttempt`,
+`Outcome`, `CalendarEvent`, `Reminder`, `Question`, `ProgressUpdate`,
+`WellbeingCheckin`); goal relations (11 types); the full typed action
+list; confirmation policy (6 classes, `type_floor × provenance`, with
+`ForgetMemory` now correctly distinguished per §4a); module boundaries
+(one crate, `domain/actions/services/knowledge/security/backup/
+migrations/capability`, `storage` nested inside `services` per §4a); the
+NeXa capability API function list. Full detail:
+`docs/LIFEOS_SPEC.md` §5.1-§5.6.
 
 ### Next implementation step (M2, not yet started)
 
-**The storage spike.** Before any domain schema or action code is
-written, prove `sqlite3mc` (or its fallback, `SQLCipher`) against the
-full checklist in the report §H: create an encrypted DB, reopen after
-restart, wrong key fails, migration works, rekey works, backup works,
-restore works, corrupt DB fails safely, and - critically, not yet
-proven - it actually builds/packages correctly in a Windows Tauri
-*release* build, not just `cargo check` in dev mode. This is a small
-standalone proof, not the real schema.
+Begin the real domain schema and action layer against the now-proven
+storage foundation — **one small vertical slice first** (e.g. a real
+`Goal` table through `services`/`storage`/`domain`, reusing the exact
+module-privacy pattern proven this run), not the whole domain model at
+once. Not started this run, per the stop condition: Goal/Project/Fact
+production schemas, the real action layer, M3.
 
 ---
 
@@ -203,11 +208,14 @@ standalone proof, not the real schema.
 | Node.js / npm | `v24.18.0` / `11.1.0` |
 | Git | `2.47.1.windows.2` |
 | WebView2 Runtime | `153.0.4234.32` |
-| Visual Studio "Desktop development with C++" workload | Installed (by you, manually) |
+| Visual Studio "Desktop development with C++" workload | Installed |
+| OpenSSL (Windows dev package, for SQLCipher) | **Installed this run** — `winget install ShiningLight.OpenSSL.Dev`, no admin elevation needed (unlike the VS installer in an earlier run) |
 
 **Standing note, still true:** this automated session cannot perform
-admin-elevated installs on this machine. Will recur for any future
-milestone needing one.
+*admin-elevated* installs (confirmed again N/A this run — `winget` for
+this package did not require elevation, unlike the VS Installer
+previously). Will still recur for anything that genuinely needs
+elevation.
 
 ---
 
@@ -216,17 +224,16 @@ milestone needing one.
 - OS: Microsoft Windows 11 Home, 10.0.26200, 64-bit
 - CPU: 12th Gen Intel Core i5-12500H, 12 physical / 16 logical cores, 3.1GHz base
 - RAM: 63.71 GB (2× 32GB Kingston, 3200 MT/s)
-- GPU: NVIDIA GeForce RTX 3050 Ti Laptop — 4096 MiB (4GB) VRAM (`nvidia-smi`), driver 610.62; Intel Iris Xe integrated (not CUDA-relevant)
+- GPU: NVIDIA GeForce RTX 3050 Ti Laptop — 4096 MiB (4GB) VRAM, driver 610.62
 - Disks: `C:` 475.6GB (166.8GB free), `D:` 3815.4GB (2769.1GB free), both NVMe SSD
-- Git 2.47.1.windows.2, Node v24.18.0, npm 11.1.0, Python 3.12.7
-- Rust: rustc 1.98.1, cargo 1.98.1
+- Git 2.47.1.windows.2, Node v24.18.0, npm 11.1.0, Python 3.12.7, Rust 1.98.1
 - Ollama: still not installed (needed starting M4)
 - Visual Studio: Community 2022, 17.13.35931.197, C++ workload installed
 - WebView2 Runtime: 153.0.4234.32 present
+- **New this run:** Windows OpenSSL dev package (ShiningLight.OpenSSL.Dev, 4.0.2) at `C:\Program Files\OpenSSL-Win64`
+- **Still missing:** a full Perl (Git for Windows' bundled Perl cannot build OpenSSL from source - `Locale::Maketext::Simple` and other CPAN modules absent)
 
-No live NeXa git repository is accessible from this environment (only
-Desktop planning documents) - `RESEARCH_DECISIONS.md` §3 treats NeXa as
-prior research, not a code dependency. Unchanged.
+No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §3.
 
 ---
 
@@ -245,60 +252,64 @@ prior research, not a code dependency. Unchanged.
   8. `feat: refine M1 visual shell and NeXa navigation`
   9. `feat: restore home edge drawers, refine face/background, add chat sidebar`
   10. `fix: full-screen edge transitions, remove global sidebar, NeXa Island as sole global nav`
-  11. (this run) `docs: close M1, freeze M2 architecture, fix reporting policy`
+  11. `docs: close M1, freeze M2 architecture, fix reporting policy`
+  12. (this run) `feat: prove M2 encrypted storage (SQLCipher) and correct architecture errata`
       — see this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-11 were not
+- Pushed to `origin/main` through commit 7. **Commits 8-12 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
 
 `npm create tauri-app@latest -- . --force` briefly deleted `CLAUDE.md`
 and all `docs/*.md` files and overwrote `.gitignore` during the original
-M1 scaffold. Restored immediately via `git checkout`, no data lost. Kept
-as a standing lesson for any future scaffold-into-existing-directory
-operation.
+M1 scaffold. Restored via `git checkout`, no data lost. Standing lesson
+for any future scaffold-into-existing-directory operation.
 
 ---
 
 ## 8. What can the user actually do right now?
 
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
-navigate Home, the radial menu, all four edge-triggered sections, and
-Chat's own sidebar. There is still no real functionality behind any of
-it - no data, no AI, no persistence - M2 (which will change that,
-starting with storage) has not been implemented yet, only designed.
+unchanged from before. Separately, `cd src-tauri && cargo test
+services::tests -- --nocapture` runs the M2 storage spike's 9 test
+functions proving encrypted storage works end-to-end. Neither is wired
+to the other yet — the spike is not integrated into the running app, and
+the app still has no real domain functionality, no AI, no persistence
+for actual user data.
 
 ---
 
 ## 9. Next recommended step
 
-Execute the **M2 storage spike** (§4): a small standalone proof (not the
-real schema, not wired into the app yet) that `sqlite3mc` satisfies every
-item in the report's §H checklist, including a real Windows Tauri release
-build - not just `cargo check`. Only after that passes (or a fallback
-candidate is chosen instead) should the actual domain schema and action
-layer be implemented.
+Implement the first real M2 vertical slice: one actual domain table
+(suggest `Goal`, the simplest frozen entity) through `domain` →
+`actions` → `services` → `storage` (reusing the private-submodule
+pattern proven this run), with at least the `CreateGoal` and `UpdateGoal`
+actions, their deterministic validation, and unit/integration tests -
+before attempting the rest of the domain model. Do not implement the
+full schema/action set at once.
 
 ---
 
 ## 10. Known problems / risks / unresolved questions
 
-- **M2's storage spike has not been run.** `sqlite3mc` is a research
-  recommendation, not a proven implementation choice, until it is.
-- **The Personal Knowledge Layer's `Relation` type is intentionally
-  generic** (loosely-typed `relation_type` string rather than a rigid
-  enum) to avoid over-specifying now - the report flags this as worth
-  revisiting once real usage patterns exist.
-- **`log_wellbeing()` required adding a minimal `WellbeingCheckin`
-  domain type** not originally in the frozen domain-model list - a
-  deliberate small addition, not scope creep (see §4 above).
-- **Exact NeXa transport is undecided** - the capability API's function
-  boundary is frozen, but whether NeXa reaches it via a local socket,
-  embedded HTTP, or something else is deferred.
-- **Exact confirmation-class UX (modal vs. inline vs. toast) is
-  deferred to M3+** - only the architectural classification is frozen
-  now.
-- Everything already listed as pending from M1 (local/cloud model
-  integration for M4/M5, Goal Intelligence and Personal Knowledge UI for
-  M6, LifeOS's own software license, bilingual detection mechanism) is
-  unchanged by this architecture-only run.
+- **The M2 storage spike is not wired into the running app** — it's
+  isolated code (`src-tauri/src/services/`) proving the architecture,
+  not yet used by `run()` or any Tauri command.
+- **`bundled-sqlcipher`'s external-OpenSSL dependency is machine-specific**
+  (§4b) — needs the same setup on any other machine, or a switch to
+  `bundled-sqlcipher-vendored-openssl` once a working Perl exists here.
+- **The Personal Knowledge Layer's `Relation.relation_type`** remains an
+  intentionally free string, not a rigid enum — revisit once M6 usage
+  patterns exist.
+- **Exact NeXa transport is undecided** — the capability API's function
+  boundary is frozen, transport is not.
+- **Exact confirmation-class UX (modal vs. inline vs. toast)** is
+  deferred to M3+.
+- **The one-off dated report file policy question** raised in the prior
+  run is resolved — `CLAUDE.md` now explicitly requires them for
+  substantial runs (this run produced one).
+- Everything already listed as pending from M1/M2-freeze (local/cloud
+  model integration for M4/M5, Goal Intelligence and Personal Knowledge
+  UI for M6, LifeOS's own software license, bilingual detection
+  mechanism) is unchanged by this run.
