@@ -5,12 +5,15 @@ interface RadialMenuProps {
   onSelect: (id: ScreenId) => void;
 }
 
-const RADIUS_VMIN = 26;
+// vmin-based radius so the ring clears the larger shrunk hero face at
+// any reasonable desktop window size, and stays inside the viewport.
+const RADIUS_VMIN = 30;
 
 /**
- * Glass-effect tiles revealed around the shrunk face, like numbers around
- * a clock face (LIFEOS_SPEC.md §9.1). Primary ring only - do not add the
- * secondary ring (Memory, Quick Forms, Model/AI, Settings) here.
+ * Elegant dark-glass tiles revealed around the shrunk face, like numbers
+ * around a clock face (LIFEOS_SPEC.md §9.1). Primary ring only - the
+ * secondary ring (Memory, Quick Forms, Model/AI, Settings) does not
+ * belong here.
  */
 export function RadialMenu({ open, onSelect }: RadialMenuProps) {
   const count = PRIMARY_SCREENS.length;
@@ -28,7 +31,7 @@ export function RadialMenu({ open, onSelect }: RadialMenuProps) {
             className="radial-tile"
             style={{
               transform: `translate(-50%, -50%) translate(${x}vmin, ${y}vmin)`,
-              transitionDelay: open ? `${i * 25}ms` : "0ms",
+              transitionDelay: open ? `${i * 28}ms` : "0ms",
             }}
             onClick={() => onSelect(screen.id)}
             tabIndex={open ? 0 : -1}
