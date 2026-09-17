@@ -62,7 +62,7 @@ button {
   border-radius: 50%;
   filter: blur(80px);
   opacity: 0.14;
-  animation: haze-drift 220s ease-in-out infinite alternate;
+  animation: haze-drift 130s ease-in-out infinite alternate;
 }
 
 .galaxy-haze--a {
@@ -79,24 +79,24 @@ button {
   right: -10vmax;
   bottom: -12vmax;
   background: radial-gradient(circle, #16234a 0%, transparent 70%);
-  animation-duration: 260s;
+  animation-duration: 160s;
   animation-delay: -60s;
 }
 
 @keyframes haze-drift {
   from { translate: 0 0; }
-  to { translate: 2vmin -1.5vmin; }
+  to { translate: 4vmin -3vmin; }
 }
 
 .galaxy-stars {
   position: absolute;
   inset: -2% -2% -2% -2%;
-  animation: stars-drift 180s ease-in-out infinite alternate;
+  animation: stars-drift 100s ease-in-out infinite alternate;
 }
 
 @keyframes stars-drift {
   from { translate: 0 0; }
-  to { translate: -0.8vmin 0.6vmin; }
+  to { translate: -2.2vmin 1.6vmin; }
 }
 
 .galaxy-star {
@@ -111,6 +111,18 @@ button {
 @keyframes twinkle {
   0%, 100% { opacity: calc(var(--peak-opacity, 0.5) * 0.35); }
   50% { opacity: var(--peak-opacity, 0.5); }
+}
+
+.galaxy-star--constellation {
+  filter: drop-shadow(0 0 3px rgba(220, 228, 255, 0.55));
+}
+
+.galaxy-constellation {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
 
 /* =====================================================================
@@ -384,6 +396,232 @@ button {
 }
 
 /* =====================================================================
+   Edge drawers (Home only) - hidden by default, subtle handles at each
+   screen edge open a glass panel sliding in from that edge.
+   ===================================================================== */
+
+.edge-handles {
+  position: fixed;
+  z-index: 4;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.edge-handles--top {
+  top: 0;
+  left: 50%;
+  translate: -50% 0;
+  flex-direction: row;
+}
+
+.edge-handles--bottom {
+  bottom: 0;
+  left: 50%;
+  translate: -50% 0;
+  flex-direction: row;
+}
+
+.edge-handles--left {
+  left: 0;
+  top: 50%;
+  translate: 0 -50%;
+  flex-direction: column;
+}
+
+.edge-handles--right {
+  right: 0;
+  top: 50%;
+  translate: 0 -50%;
+  flex-direction: column;
+}
+
+.edge-handle {
+  border: 1px solid var(--glass-border);
+  background: rgba(10, 11, 22, 0.4);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--text-faint);
+  font-size: 0.66rem;
+  letter-spacing: 0.02em;
+  padding: 0.4em 0.9em;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 220ms ease, background 220ms ease, color 220ms ease;
+}
+
+.edge-handle:hover,
+.edge-handle--active {
+  opacity: 1;
+  color: var(--nexa-white);
+  background: var(--glass-bg-strong);
+}
+
+.edge-handles--top .edge-handle {
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+}
+
+.edge-handles--bottom .edge-handle {
+  border-bottom: none;
+  border-radius: 10px 10px 0 0;
+}
+
+.edge-handles--left .edge-handle {
+  border-left: none;
+  border-radius: 0 10px 10px 0;
+  writing-mode: vertical-rl;
+  padding: 0.9em 0.4em;
+}
+
+.edge-handles--right .edge-handle {
+  border-right: none;
+  border-radius: 10px 0 0 10px;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  padding: 0.9em 0.4em;
+}
+
+.edge-panel {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  background: rgba(7, 8, 17, 0.72);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(26px);
+  -webkit-backdrop-filter: blur(26px);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  padding: 1.6rem 1.8rem;
+  transition: translate 420ms var(--ease-premium), opacity 300ms ease;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.edge-panel--open {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+.edge-panel--top {
+  top: 0;
+  left: 50%;
+  translate: -50% -100%;
+  width: min(420px, 88vw);
+  border-top: none;
+  border-radius: 0 0 20px 20px;
+}
+
+.edge-panel--top.edge-panel--open {
+  translate: -50% 0;
+}
+
+.edge-panel--bottom {
+  bottom: 0;
+  left: 50%;
+  translate: -50% 100%;
+  width: min(420px, 88vw);
+  border-bottom: none;
+  border-radius: 20px 20px 0 0;
+}
+
+.edge-panel--bottom.edge-panel--open {
+  translate: -50% 0;
+}
+
+.edge-panel--left {
+  left: 0;
+  top: 50%;
+  translate: -100% -50%;
+  width: min(340px, 82vw);
+  border-left: none;
+  border-radius: 0 20px 20px 0;
+}
+
+.edge-panel--left.edge-panel--open {
+  translate: 0 -50%;
+}
+
+.edge-panel--right {
+  right: 0;
+  top: 50%;
+  translate: 100% -50%;
+  width: min(340px, 82vw);
+  border-right: none;
+  border-radius: 20px 0 0 20px;
+}
+
+.edge-panel--right.edge-panel--open {
+  translate: 0 -50%;
+}
+
+.edge-panel-tabs {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.edge-panel-tab {
+  border: 1px solid var(--glass-border);
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 0.3em 0.8em;
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease, border-color 160ms ease;
+}
+
+.edge-panel-tab--active,
+.edge-panel-tab:hover {
+  background: var(--glass-bg-strong);
+  color: var(--nexa-white);
+  border-color: var(--glass-border-strong);
+}
+
+.edge-panel-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.edge-panel-blurb {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.edge-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.2rem;
+}
+
+.edge-panel-action {
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  color: var(--nexa-white);
+  border-radius: 999px;
+  padding: 0.5em 1.1em;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 180ms ease, border-color 180ms ease;
+}
+
+.edge-panel-action:hover {
+  background: var(--glass-bg-strong);
+  border-color: var(--glass-border-strong);
+}
+
+.edge-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 4;
+  background: transparent;
+}
+
+/* =====================================================================
    Screen shell (full-screen sections)
    ===================================================================== */
 
@@ -624,6 +862,14 @@ button {
 .chat-screen {
   flex: 1;
   display: flex;
+  min-height: 0;
+  gap: clamp(1.2rem, 2.5vw, 2.2rem);
+}
+
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
   min-height: 0;
   gap: 1.5rem;
@@ -638,6 +884,121 @@ button {
   gap: 0.9rem;
   padding-top: 1rem;
   max-width: 42em;
+}
+
+.chat-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.35rem;
+}
+
+.chat-empty p {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.chat-empty-note {
+  color: var(--text-faint) !important;
+  font-size: 0.85rem !important;
+}
+
+/* ---------- Chat's own sidebar (distinct from the global SideNavigation) ---------- */
+
+.chat-sidebar {
+  flex-shrink: 0;
+  width: clamp(220px, 18vw, 280px);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 1rem 0.9rem;
+  border-radius: 20px;
+  background: rgba(9, 10, 20, 0.42);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  overflow-y: auto;
+}
+
+.chat-sidebar-new {
+  border: 1px solid var(--glass-border-strong);
+  background: var(--glass-bg-strong);
+  color: var(--nexa-white);
+  border-radius: 12px;
+  padding: 0.6em 0.8em;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background 180ms ease;
+}
+
+.chat-sidebar-new:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.chat-sidebar-search {
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  border-radius: 10px;
+  padding: 0.5em 0.7em;
+  font-size: 0.8rem;
+  outline: none;
+}
+
+.chat-sidebar-search::placeholder {
+  color: var(--text-faint);
+}
+
+.chat-sidebar-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  overflow-y: auto;
+}
+
+.chat-sidebar-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  padding: 0.55em 0.7em;
+  cursor: pointer;
+  text-align: left;
+  transition: background 160ms ease;
+}
+
+.chat-sidebar-item:hover {
+  background: var(--glass-bg);
+}
+
+.chat-sidebar-item--active {
+  background: var(--glass-bg-strong);
+  box-shadow: inset 0 0 0 1px var(--glass-border-strong);
+}
+
+.chat-sidebar-item-title {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--nexa-white);
+}
+
+.chat-sidebar-item-preview {
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .chat-bubble {

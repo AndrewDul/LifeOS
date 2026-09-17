@@ -4,7 +4,8 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 `RESEARCH_DECISIONS.md`, at the start of every session. Update it at the
 end of every substantial run (`CLAUDE.md`, step 6).
 
-Last updated: 2026-09-17 (M1 visual refinement run).
+Last updated: 2026-09-17 (M1 visual refinement run #2 — Home drawers,
+face geometry, constellation background, Chat sidebar).
 
 ---
 
@@ -32,9 +33,10 @@ LiFeOS/
 ├── public/                 (default Tauri/Vite icons)
 ├── src/                    (React frontend)
 │   ├── main.tsx, App.tsx, App.css
-│   ├── components/   Galaxy, NexaFace, RadialMenu, CommunicationDisplay,
-│   │                  NexaIsland, SideNavigation, ScreenShell,
-│   │                  ChatScreen, PlaceholderScreen
+│   ├── components/   Galaxy, NexaFace, RadialMenu, EdgeDrawers,
+│   │                  CommunicationDisplay, NexaIsland, SideNavigation,
+│   │                  ScreenShell, ChatScreen, ChatSidebar,
+│   │                  PlaceholderScreen
 │   └── state/         faceState.ts, navigation.ts
 └── src-tauri/               (Rust backend)
     ├── src/main.rs, src/lib.rs   (no domain commands yet - run() only)
@@ -46,28 +48,34 @@ LiFeOS/
 `node_modules/`, `dist/`, and `src-tauri/target/` exist on disk but are
 gitignored and untracked, as intended.
 
-### M1 status: first launch confirmed, visual refinement pass complete
+### M1 status: first launch confirmed, second visual refinement pass complete
 
-The MSVC "Desktop development with C++" workload blocker recorded in the
-prior version of this document **has been resolved** (by you, manually,
-outside this session — this session still cannot perform admin-elevated
-installs). `cargo check` now succeeds and `npm run tauri dev` opens a
-real window; you manually reviewed the first version of the visual shell.
-This run is a **visual refinement pass only**, driven by that review —
-no architecture, backend, or milestone progression.
+The MSVC "Desktop development with C++" workload blocker is resolved
+(unchanged from the prior run). This run is a **second visual refinement
+pass**, driven by user feedback on the first refinement pass: Home's
+edge drawers (removed in refinement #1 for looking like prototype tabs)
+are back in a more deliberate, hidden-by-default form; the NeXa face
+geometry, background motion, and Chat's sidebar were all adjusted per
+specific feedback. Full detail and reasoning:
+`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`.
+No architecture, backend, or milestone progression - M2 has not started.
 
 ### What the visual shell does now, after this refinement
 
 **Home (default state):**
-- Very dark, almost-black galaxy background with clustered (not evenly
-  random) star field, ~97% neutral cool-white stars / ~3% sparse warm
-  orange, yellow, or cool-blue stars, two very low-opacity nebula haze
-  blobs, and near-imperceptible slow drift (stars + haze both animate
-  over 180-260s, not noticeable while sitting still).
-- A large, centered, dominant NeXa face (two rounded eyes, simple smile,
-  soft glow, gentle idle float/breathing/blink/eye-drift) - sized via
-  `clamp(320px, 40vmin, 520px)`, several times larger than the original
-  M1 pass's fixed 200px.
+- Very dark, almost-black galaxy background with a clustered (not evenly
+  random) star field - now ~8 clusters + 100 sparse background stars
+  (roughly double the prior pass) - ~97% neutral cool-white stars / ~3%
+  sparse warm orange, yellow, or cool-blue stars, two low-opacity nebula
+  haze blobs, and a clearly perceptible (but still slow and calm) drift:
+  star field over ~100s, haze over ~130-160s, both with larger amplitude
+  than before. One deliberately larger, brighter **constellation
+  formation** (6-7 connected points with a faint connecting line) sits in
+  the upper-right as a single visible anchor shape.
+- A large, centered, dominant NeXa face (two elongated rounded eyes,
+  simple smile sitting further below the eyes, soft glow, gentle idle
+  float/breathing/blink/eye-drift) - sized via `clamp(320px, 40vmin,
+  520px)`.
 - Clicking the face toggles a radial ring of 8 dark-glass pills (Today,
   Chat, Calendar, Goals, Projects, Money, Me, Insights) around a shrunk
   face; clicking again (or selecting a screen) closes it.
@@ -77,9 +85,13 @@ no architecture, backend, or milestone progression.
   it's visually reachable without a prototype trigger button; dismissing
   it returns Home. This is explicitly demo content, not real intelligence
   (`src/App.tsx`, `DEMO_GREETING`).
-- **No more persistent edge tabs** - the old bottom "Chat" / top
-  "Notifications" / left "Today" prototype buttons and their drawers are
-  removed entirely (`EdgeDrawers.tsx` deleted).
+- **Edge drawers restored, redesigned to be hidden by default:** small,
+  low-opacity tab handles at each screen edge (Top: Notifications,
+  Settings · Left: Dashboard, Goals · Right: Projects, Me/Insights ·
+  Bottom: Chat) open a glass panel sliding in from that edge with a short
+  blurb and, where a real screen exists, an "Open X" button. Only one
+  panel open at a time; a scrim or re-clicking the handle closes it
+  cleanly back to Home. Not the old permanently-visible prototype tabs.
 
 **Full-screen sections (Chat, Today, Calendar, Goals, Projects, Money,
 Me, Insights, Settings):**
@@ -93,10 +105,16 @@ Me, Insights, Settings):**
   detour through Home.
 - The old standalone "← Home" corner button and the generic "This screen
   is a navigation placeholder" text are gone.
-- **Chat** has real (visual-only) shell: demo conversation bubbles
-  (NeXa-left / user-right, restrained dark glass, no AI), and a bottom
-  input bar ("Message NeXa...", disabled send/attach - visual only, no
-  backend).
+- **Chat** has real (visual-only) shell, now with its **own dedicated
+  chat sidebar** (`ChatSidebar` - New Chat, a search field, and a demo
+  chat list with 3 conversations) rendered alongside the global
+  `SideNavigation`, not replacing it - the two are visually distinct
+  (icon rail vs. rounded glass list panel) and serve different purposes
+  (app section vs. which conversation). Selecting a chat swaps in that
+  chat's own small demo transcript (NeXa-left / user-right bubbles,
+  restrained dark glass, no AI); "New Chat" shows an empty state instead
+  of a fake saved entry. A bottom input bar ("Message NeXa...", disabled
+  send/attach) remains visual-only, no backend.
 - Every other section uses a shared `PlaceholderScreen`: a clean heading
   and one honest line naming which milestone brings real content (no
   fake dashboards).
@@ -108,12 +126,13 @@ AI/voice/memory. `LISTENING`, `LOCAL_PROCESSING`, `WAITING_FOR_CLOUD`,
 
 ### Visual verification status (IMPORTANT)
 
-**This refinement pass has NOT been visually re-verified by you yet.**
-`npm run build` and `cargo check` both pass (§3), which proves the code
-compiles and type-checks - it does **not** prove the redesigned galaxy,
-face sizing, radial menu, communication display, island, or chat/sidebar
-actually look right. Per `CLAUDE.md`, automated build success must not be
-reported as a visual PASS. Run `npm run tauri dev` and look at it.
+**This second refinement pass has NOT been visually re-verified by you
+yet.** `npm run build` and `cargo check` both pass (§3), which proves the
+code compiles and type-checks - it does **not** prove the edge drawers,
+face geometry, strengthened background motion/constellation, or Chat
+sidebar actually look right. Per `CLAUDE.md`, automated build success
+must not be reported as a visual PASS. Run `npm run tauri dev` and look
+at it.
 
 ---
 
@@ -140,18 +159,21 @@ etc.) and will need the same human-in-the-loop step again.
 
 ---
 
-## 3. M1 status — Visual shell refinement (BUILDS CLEAN, VISUAL RE-VERIFICATION PENDING)
+## 3. M1 status — Visual shell refinement #2 (BUILDS CLEAN, VISUAL RE-VERIFICATION PENDING)
 
 | Test | Command | Result |
 |---|---|---|
-| Frontend build | `npm run build` (`tsc && vite build`) | **PASS** — 26 modules transformed, built in 486ms, no TypeScript errors |
-| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | **PASS** — full dependency graph compiled and linked in 32.58s, no errors |
-| Real window appears | (visual) | Previously confirmed by you, before this refinement pass |
-| Refined Home/Galaxy/face/radial menu/communication display | (visual) | **NOT YET RE-VERIFIED** — needs your look after this pass |
-| Chat screen (sidebar + island + demo conversation) | (visual) | **NOT YET VERIFIED** — new this pass |
-| Other sections (placeholder + sidebar + island) | (visual) | **NOT YET VERIFIED** — new this pass |
+| Frontend build | `npm run build` (`tsc && vite build`) | **PASS** — 28 modules transformed, built in 142ms, no TypeScript errors |
+| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | **PASS** — full dependency graph compiled and linked in 9.30s, no errors |
+| Real window appears | (visual) | Previously confirmed by you, before either refinement pass |
+| Home edge drawers (open/close, all 4 edges) | (visual) | **NOT YET VERIFIED** — new this pass |
+| Face geometry (elongated eyes, lower mouth) | (visual) | **NOT YET VERIFIED** — new this pass |
+| Background motion + constellation | (visual) | **NOT YET VERIFIED** — new this pass |
+| Chat sidebar (New Chat, chat list, per-chat transcript) | (visual) | **NOT YET VERIFIED** — new this pass |
 
 No LifeOS-authored code changes caused any build/check failure this run.
+Full change detail:
+`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`.
 
 ---
 
@@ -194,12 +216,12 @@ prior research, not a code dependency.
   5. `docs: lock v0.1 product direction (bilingual, GPT-5.6 Luna, Qwen3 4B, visual language, M0-M10 plan)`
   6. `feat: scaffold Tauri 2 + React + TS app and build the M1 visual shell`
   7. `docs: record M0/M1 build-start results`
-  8. (this run) `feat: refine M1 visual shell and NeXa navigation` — see
-     the RUN REPORT for this session for the exact hash.
-- Pushed to `origin/main` through commit 7 (prior run). **This run's
-  commit was not pushed** unless explicitly authorized in this run's
-  instructions — check the RUN REPORT for this session for the exact
-  push status.
+  8. `feat: refine M1 visual shell and NeXa navigation`
+  9. (this run) `feat: restore home edge drawers, refine face/background,
+     add chat sidebar` — see this run's report and chat reply for the
+     exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8 and 9 were not
+  pushed** — not authorized in either run's instructions.
 
 ### Note on an incident in a prior run (kept for reference)
 
@@ -215,29 +237,50 @@ any future scaffold-into-existing-directory operation.
 ## 6. What can the user actually do right now?
 
 Launch the real app (`npm run tauri dev`) and see the refined visual
-shell described in §1 - a large centered NeXa face on a calm dark galaxy,
-a radial menu, a demo focused-message display, and full-screen sections
-(especially Chat) with a side navigation and floating NeXa island. There
-is still no real functionality behind any of it - no data, no AI, no
-persistence - by design, this is a visual milestone.
+shell described in §1 - a large centered NeXa face with elongated eyes on
+a calm, clearly-moving dark galaxy with a visible constellation, edge
+drawers at all four screen edges, a radial menu, a demo focused-message
+display, and full-screen sections - especially Chat, which now has its
+own chat-list sidebar alongside the global navigation. There is still no
+real functionality behind any of it - no data, no AI, no persistence - by
+design, this is a visual milestone.
 
 ---
 
 ## 7. Next recommended step
 
-**You:** run `npm run tauri dev` and visually review this refinement pass
-against the brief (galaxy density/color/motion, face size/animation,
-radial menu styling, the communication display, the NeXa island and its
-quick menu, the Chat sidebar/demo conversation, and the other
-placeholders). Report back anything that doesn't match so it can be
-corrected before M2 (LifeOS Core + encrypted storage) begins.
+**You:** run `npm run tauri dev` and visually review this second
+refinement pass specifically: do the four edge drawers open/close
+smoothly and feel like intentional handles rather than clutter; does the
+face read correctly with the new eye/mouth geometry; does the background
+motion feel alive-but-calm now (not too much, not too little) and is the
+constellation visible; does the Chat sidebar clearly read as "which
+conversation" rather than a second copy of the app's section menu. Report
+back anything that doesn't match so it can be corrected before M2
+(LifeOS Core + encrypted storage) begins.
 
 ---
 
 ## 8. Known problems / risks / unresolved questions
 
-- **This visual refinement has not been visually re-verified yet** (§1,
-  §3) - only compile/type-check evidence exists so far.
+- **This second visual refinement has not been visually re-verified yet**
+  (§1, §3) - only compile/type-check evidence exists so far.
+- **A one-off dated report file was created for this pass**
+  (`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`),
+  explicitly requested by the user, but this directly conflicts with
+  `CLAUDE.md`'s standing "Documentation policy" (no one-off/dated report
+  files). Flagged in this run's chat reply; `CLAUDE.md` was not amended
+  since it wasn't clear whether this should become a standing pattern or
+  stay a one-time exception - worth resolving explicitly before it
+  recurs.
+- The Home-drawer label "Dashboard" refers to the same screen the rest of
+  the app calls "Today" (`today` `ScreenId`) - a deliberate, narrow
+  naming inconsistency scoped to that one drawer handle, per the
+  instruction to keep the global navigation structure unchanged. Flag if
+  this should be reconciled either direction.
+- Star cluster and constellation placement in `Galaxy.tsx` is randomized
+  per page load (no fixed seed) - the exact look will vary slightly
+  between launches.
 - **This automated session still cannot perform admin-elevated installs**
   on this machine - will recur for any future milestone needing one.
 - No local helper LLM (Qwen3 4B) has been downloaded, installed, or

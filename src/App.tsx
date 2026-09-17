@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Galaxy } from "./components/Galaxy";
 import { NexaFace } from "./components/NexaFace";
 import { RadialMenu } from "./components/RadialMenu";
+import { EdgeDrawers } from "./components/EdgeDrawers";
 import { CommunicationDisplay } from "./components/CommunicationDisplay";
 import { ChatScreen } from "./components/ChatScreen";
 import { PlaceholderScreen } from "./components/PlaceholderScreen";
@@ -82,6 +83,8 @@ function App() {
           <RadialMenu open={menuOpen && !message} onSelect={handleSelect} />
 
           {message && <CommunicationDisplay message={message} onClose={handleCloseMessage} />}
+
+          <EdgeDrawers onNavigate={handleSelect} />
         </div>
       )}
     </div>

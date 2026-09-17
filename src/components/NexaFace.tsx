@@ -37,26 +37,26 @@ export function NexaFace({ state, size, shrunk = false, onClick, ariaLabel }: Ne
       <svg className="nexa-face" viewBox="0 0 200 200" aria-hidden="true">
         <rect
           className="nexa-eye nexa-eye--left"
-          x="56"
-          y="66"
-          width="30"
-          height="42"
-          rx="15"
+          x="58"
+          y="61"
+          width="26"
+          height="52"
+          rx="13"
         />
         <rect
           className="nexa-eye nexa-eye--right"
-          x="114"
-          y="66"
-          width="30"
-          height="42"
-          rx="15"
+          x="116"
+          y="61"
+          width="26"
+          height="52"
+          rx="13"
         />
         {speaking ? (
-          <ellipse className="nexa-mouth nexa-mouth--open" cx="100" cy="168" rx="22" ry="16" />
+          <ellipse className="nexa-mouth nexa-mouth--open" cx="100" cy="176" rx="22" ry="16" />
         ) : (
           <path
             className="nexa-mouth nexa-mouth--smile"
-            d="M 66 158 Q 100 186 134 158"
+            d="M 66 166 Q 100 192 134 166"
             fill="none"
             strokeLinecap="round"
           />
