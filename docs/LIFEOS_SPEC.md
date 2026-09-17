@@ -423,22 +423,69 @@ open question:
   what `Project.progress` means, not when/whether `ProgressUpdate` gets
   built.
 
-**OPEN M2 ACTION-SET GAP (2026-09-17, M2 Project/storage integrity
-hardening report §10) — explicitly NOT resolved this run.** `Project`
-stores `title`/`description`/`status`/`priority`/`goal_id` in addition
-to `progress`, but the frozen Project action set (§5.4, below) is only
-`CreateProject`/`AddMilestone`/`AddTask`/`UpdateProgress` — there is
-**no frozen action for editing** `title`/`description`/`status`/
-`priority`/`goal_id` after creation. Before M3/UI wiring needs to let a
-user actually edit a project, this requires a deliberate architecture
-decision — most plausibly either one `UpdateProject` action (mirroring
-`UpdateGoal`'s shape) or several narrower ones (e.g. `RenameProject`,
-`ChangeProjectPriority`, `RelinkProjectGoal`) — and that decision must
-be made consciously in this section, the same way the Project action
-set itself was, not invented inside a future implementation slice the
-way the Goal vertical slice's terminal-status rule was (and had to be
-removed). No code changes accompany this entry; it exists so the gap is
-visible before it becomes a silent implementation choice.
+**M2 ACTION-SET GAP — RESOLVED (2026-09-17, M2 Project Child Action
+Freeze report).** `Project` stores `title`/`description`/`status`/
+`priority`/`goal_id` in addition to `progress`; the frozen Project
+action set (§5.4, below) now includes **`UpdateProject`** (floor
+`IMPORTANT_CHANGE`, `FieldPatch<T>` patch semantics for the nullable
+fields — same shape as `UpdateGoal`) to edit all five, as a single typed
+update action rather than several narrow ones (`RenameProject`,
+`ChangeProjectPriority`, etc. were considered and rejected — see the
+freeze report §3 for the reasoning). **`UpdateProgress` stays
+completely separate** — it still owns `progress` alone, floor
+`EXPLICIT_ADD`, unchanged; `UpdateProject` never touches `progress`.
+This is a documentation-only freeze — no code implementing
+`UpdateProject` was written this run; it exists so implementation has
+an unambiguous target when Project editing is actually built.
+
+**Project child action set (Milestone, Task) — frozen, not yet
+implemented (2026-09-17, M2 Project Child Action Freeze report).**
+Before `Milestone`/`Task` implementation begins, the same mutation gap
+`UpdateProject` just closed was identified and closed for both
+children, documentation-only, same reasoning:
+
+- **`UpdateMilestone`** (floor `EXPLICIT_ADD`) — `FieldPatch<T>` for
+  `title`/`target_date`/`order_index`, plain `Option<T>` for `status`
+  (non-nullable — `PENDING`/`DONE` are peer states, freely reversible;
+  no terminal-state rule, matching the correction already applied to
+  `Goal.status`/`LifecycleStatus`, never reintroduce one here either).
+  This is the only way a `Milestone` created `PENDING` via
+  `AddMilestone` can ever become `DONE` (or move back) — without it,
+  `AddMilestone` alone leaves no path to completion.
+- **`UpdateTask`** (floor `EXPLICIT_ADD`) — `FieldPatch<T>` for `title`/
+  `due_at`/`project_id`/`goal_id` (the latter two nullable — clearing
+  either is a legitimate "unlink" operation, distinct from leaving it
+  unchanged), plain `Option<T>` for `status`. `TODO`/`IN_PROGRESS`/
+  `DONE`/`CANCELLED` are peer persisted states with **no** frozen
+  transition policy — a task may move directly `TODO -> DONE`, reopen
+  from `DONE`/`CANCELLED`, etc.; do not invent restrictions.
+  `recurring_rule_id` mutation is deliberately out of scope (recurrence
+  behavior itself is not designed yet).
+- Both are `EXPLICIT_ADD`, not `IMPORTANT_CHANGE` — `UpdateProgress`
+  already established that an *update* action can sit at `EXPLICIT_ADD`
+  when the mutation is routine/low-risk; Milestone/Task status changes
+  are the routine, frequent case a user makes constantly, unlike
+  Project's own structural identity fields.
+- **Task ownership stays exactly as frozen — nullable, unconstrained.**
+  Neither `project_id` nor `goal_id` is required; a `Task` may be
+  standalone, linked to a `Project` only, a `Goal` only, or both. No new
+  requirement is introduced.
+- **FK/delete policy, matching `GoalRelation`'s precedent exactly:**
+  `Milestone.project_id` (required) and `Task.project_id`/`Task.goal_id`
+  (both nullable, when present) all use `ON DELETE RESTRICT` against
+  their parent, never cascade — neither `Project` nor `Goal` has a hard
+  delete action today, so child work must never silently vanish.
+- **Creation defaults**: `AddMilestone` creates `PENDING`; `AddTask`
+  creates `TODO`. Neither `Add*` action doubles as an update action.
+- **`Milestone.order_index` uniqueness within a Project is an OPEN
+  QUESTION**, deliberately left open rather than silently decided — no
+  existing frozen document states whether duplicate `order_index` values
+  within one `Project` are allowed or forbidden. `order_index` is
+  persisted explicitly and used for deterministic sort order; no
+  automatic renumbering/rebalancing is frozen. See §13.
+
+Full reasoning for every point above:
+`docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`.
 
 Deliberately **not** modeled yet (future milestones, not a frozen
 schema): `UserProfile`/settings, `Transaction`/`IncomeSource`/`Budget`
@@ -570,8 +617,13 @@ requires judgment). Frozen minimum v0.1 action set (M2 report §E):
 
 - **Goal**: `CreateGoal`, `UpdateGoal`, `PauseGoal`, `CompleteGoal`,
   `LinkGoals`, `ChangePriority`
-- **Project**: `CreateProject`, `AddMilestone`, `AddTask`,
-  `UpdateProgress`
+- **Project** (and its children `Milestone`/`Task`): `CreateProject`,
+  `UpdateProject`, `UpdateProgress`, `AddMilestone`, `UpdateMilestone`,
+  `AddTask`, `UpdateTask` — `UpdateProject`/`UpdateMilestone`/
+  `UpdateTask` frozen 2026-09-17 (M2 Project Child Action Freeze
+  report), documentation-only; `UpdateProject` is implemented-ready but
+  not yet coded, `UpdateMilestone`/`UpdateTask` await their entities'
+  own vertical slices (§5.1)
 - **Calendar**: `CreateEvent`, `MoveEvent`, `CancelEvent`, `AddReminder`
 - **Challenge**: `CreateChallenge`, `AddHypothesis`, `TrySolution`,
   `RecordOutcome`
@@ -1153,9 +1205,15 @@ These are genuinely unresolved and should not be treated as decided:
 - Exact bilingual detection/normalisation mechanism (which layer decides
   the response language, how mixed-language utterances are handled) —
   design target stated in §1.3, mechanism not yet designed.
-- **OPEN M2 ACTION-SET GAP (2026-09-17):** no frozen action exists to
-  edit a `Project`'s `title`/`description`/`status`/`priority`/`goal_id`
-  after creation (the frozen set is only `CreateProject`/
-  `AddMilestone`/`AddTask`/`UpdateProgress`) — full detail and the
-  decision this needs (one `UpdateProject` vs. several narrower
-  actions) in §5.1.
+- **Resolved 2026-09-17 (M2 Project Child Action Freeze report):** the
+  previously-open Project action-set gap (no frozen action to edit a
+  `Project`'s `title`/`description`/`status`/`priority`/`goal_id`) is
+  closed — `UpdateProject` is now frozen, floor `IMPORTANT_CHANGE`. The
+  same gap for `Milestone`/`Task` was closed pre-emptively, before either
+  is implemented — `UpdateMilestone`/`UpdateTask`, both floor
+  `EXPLICIT_ADD`. Full detail in §5.1.
+- **`Milestone.order_index` uniqueness within a Project** (§5.1) —
+  genuinely undecided: no frozen document states whether duplicate
+  `order_index` values are allowed or forbidden within one Project.
+  Must be resolved before (or during) the `Milestone` vertical slice,
+  not silently defaulted to a `UNIQUE` constraint or silently allowed.

@@ -5,14 +5,15 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 GoalRelation vertical slice — the third
-real domain entity and the first true relationship-graph structure,
-implemented via the frozen `LinkGoals` action, directly with the
-already-hardened pattern; also corrects a factual GoalRelation-vs-
-Personal-Knowledge-Relation taxonomy confusion in the previous run's
-report - on top of the same day's Goal vertical slice/storage
-hardening, Goal hardening pass, Project vertical slice, and Project/
-storage integrity hardening).
+Last updated: 2026-09-17 (M2 Project Child Action Freeze — a
+documentation-only architecture/action-set clarification pass:
+`UpdateProject` frozen (closing the previously-open Project action-set
+gap), and `UpdateMilestone`/`UpdateTask` frozen pre-emptively before
+either entity is implemented, so their vertical slices have an
+unambiguous target. Zero source-code changes. On top of the same day's
+Goal vertical slice/storage hardening, Goal hardening pass, Project
+vertical slice, Project/storage integrity hardening, and GoalRelation
+vertical slice).
 
 ---
 
@@ -30,19 +31,24 @@ storage integrity hardening).
 **M2 now has three real, working, tested domain entities: Goal,
 Project, and GoalRelation**, end to end through
 `domain → actions → services → private services/storage → encrypted
-SQLCipher`. Five runs on 2026-09-17 built this: the Goal vertical slice
+SQLCipher`. Six runs on 2026-09-17 built this: the Goal vertical slice
 (storage foundation hardening + Goal implemented), a dedicated Goal
 hardening pass (fixed 7 issues before the pattern was reused), the
 **Project vertical slice** (second entity, built directly with the
 already-hardened pattern), a **Project/storage integrity hardening
 pass** (SQLite FK enforcement genuinely enabled, `Project.progress`
 canonically resolved, `GoalStatus` renamed to `LifecycleStatus`, an
-action-set gap documented), and the **GoalRelation vertical slice**
-(third entity, the first true relationship-graph structure - two
-foreign keys into `goals`, a frozen 11-value relation-type enum, the
-`LinkGoals` action - built directly with the twice-hardened pattern, no
-separate hardening pass needed). See §4b-§4h. Next step is a fourth
-entity - not the rest of the domain model at once, and still not M3.
+action-set gap documented), the **GoalRelation vertical slice** (third
+entity, the first true relationship-graph structure - two foreign keys
+into `goals`, a frozen 11-value relation-type enum, the `LinkGoals`
+action - built directly with the twice-hardened pattern, no separate
+hardening pass needed), and a sixth, **documentation-only Project
+Child Action Freeze pass** (`UpdateProject` frozen, closing the
+Project action-set gap; `UpdateMilestone`/`UpdateTask` frozen
+pre-emptively before either entity exists in code). See §4b-§4h. Next
+step is the `Milestone` vertical slice (frozen order, §4g/§4h) - not
+`Task` first, not the rest of the domain model at once, and still not
+M3.
 
 ---
 
@@ -589,33 +595,86 @@ genuinely-free-string Personal Knowledge Layer `Relation.relation_type`
 11-value enum. Corrected in that report and in `LIFEOS_SPEC.md` - see
 the GoalRelation vertical-slice report §2 for the full correction.
 
-### 4g. What's still architecturally frozen but not yet implemented
+### 4g. Project child action freeze (2026-09-17, documentation-only)
+
+**No code changed this run** - a focused architecture/action-set
+clarification pass, resolving the mutation gaps around
+Project→Milestone→Task *before* either child entity is implemented, so
+their vertical slices don't have to invent product rules mid-
+implementation the way the Goal vertical slice's terminal-status rule
+did.
+
+- **`UpdateProject` is now frozen** (floor `IMPORTANT_CHANGE`,
+  `FieldPatch<T>` for the nullable fields - same shape as `UpdateGoal`)
+  - resolves the previously-open Project action-set gap (§4e point 6).
+  `UpdateProgress` stays completely separate, unchanged, floor
+  `EXPLICIT_ADD`, owns only `progress`.
+- **`UpdateMilestone` and `UpdateTask` are now frozen** (both floor
+  `EXPLICIT_ADD`, `FieldPatch<T>` for their nullable fields, plain
+  `Option<T>` for `status`) - pre-emptively, before either entity is
+  implemented. Without `UpdateMilestone`, a `Milestone` created
+  `PENDING` via `AddMilestone` would have no path to `DONE` at all.
+- **No narrow action explosion** (`RenameProject`, `CompleteMilestone`,
+  `StartTask`, `CompleteTask`, `CancelTask`, etc. were considered and
+  rejected) - one typed update action per entity with patch semantics,
+  matching the pattern `UpdateGoal` already proved works.
+- **No terminal-state rules invented** for `Milestone.status`
+  (`PENDING`/`DONE`, freely reversible) or `Task.status`
+  (`TODO`/`IN_PROGRESS`/`DONE`/`CANCELLED`, all peer states, direct
+  `TODO -> DONE` and reopening both allowed) - the Goal hardening
+  pass's lesson (§4c) applied proactively this time, not retroactively.
+- **FK/delete policy frozen to match `GoalRelation`'s precedent
+  exactly**: `Milestone.project_id` (required) and
+  `Task.project_id`/`Task.goal_id` (both nullable) all `ON DELETE
+  RESTRICT`, never cascade - neither `Project` nor `Goal` has a hard
+  delete action, so child work must never silently vanish.
+- **Task ownership confirmed unconstrained**: a `Task` may be
+  standalone, `Project`-only, `Goal`-only, or both - no new requirement
+  invented, matching the already-frozen nullable fields exactly.
+- **Creation defaults frozen**: `AddMilestone` → `PENDING`, `AddTask` →
+  `TODO`.
+- **`Milestone.order_index` uniqueness within a Project flagged as a
+  genuine OPEN QUESTION** (`docs/LIFEOS_SPEC.md` §13), not silently
+  decided either way - no existing document resolves it, and none was
+  invented here.
+- **Next M2 implementation order frozen**: `Milestone` vertical slice,
+  then `Task`, then reassess - `Milestone` is the smaller, single-parent
+  entity and proves the parent-child FK/action pattern before `Task`'s
+  two optional parents and four statuses add complexity. Personal
+  Knowledge Layer explicitly not started this run.
+
+Full reasoning: `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`.
+
+### 4h. What's still architecturally frozen but not yet implemented
 
 Personal Knowledge Layer, `Milestone`/`Task`/`Challenge`/`Plan`/
 `SolutionAttempt`/`Outcome`/`CalendarEvent`/`Reminder`/`Question`/
 `ProgressUpdate`/`WellbeingCheckin`, the rest of the frozen action list
-(`AddMilestone`/`AddTask` for Project, plus the still-undecided
-`UpdateProject`-or-narrower-actions gap, §4e point 6), `ForgetMemory`'s
-corrected (hard-delete) semantics, the `knowledge`/`backup` modules, a
-real `capability` module, NeXa transport. Full detail:
-`docs/LIFEOS_SPEC.md` §5.1-§5.6.
+(`AddMilestone`/`AddTask` for Project - both still schema/code-
+unimplemented, though their sibling `UpdateMilestone`/`UpdateTask` are
+now action-set-frozen, §4g), `ForgetMemory`'s corrected (hard-delete)
+semantics, the `knowledge`/`backup` modules, a real `capability`
+module, NeXa transport. Full detail: `docs/LIFEOS_SPEC.md` §5.1-§5.6.
 
 ### Next implementation step (M2)
 
-A fourth domain entity - `Milestone`/`Task` (both need Project's
-`AddMilestone`/`AddTask` actions, not yet implemented) or the Personal
-Knowledge Layer (`Entity`/`Fact`/`Relation`/`Episode`/`Evidence`/
-`Source` - note: that `Relation` is the genuinely-free-string one, not
-`GoalRelation`, §4f's correction) are the most natural next candidates.
-Whichever is chosen, reuse `domain → actions → services →
+**`Milestone` vertical slice** (frozen order, §4g) - the fourth domain
+entity, a `Project` child. Reuse `domain → actions → services →
 services::storage::<entity>_repo` with the same atomicity/typed-error
 discipline applied from the start (as Project and GoalRelation both
-did, not retrofitted afterward like Goal needed). Do not invent product
-rules inside the implementation - flag them as open questions instead
-(§4c's lesson from the removed terminal-status rule; §4e's action-set-
-gap documentation; §4f's three relation-integrity rules being frozen
-*before* coding rather than invented mid-implementation, and its
-taxonomy correction being caught and fixed rather than left standing).
+did, not retrofitted afterward like Goal needed), and the action set/
+patch semantics/confirmation floor/FK policy/creation default already
+frozen in §4g/`LIFEOS_SPEC.md` §5.1 - implement `AddMilestone` and
+`UpdateMilestone` together (both are already frozen; do not implement
+one without the other, or a `PENDING` milestone has no path to `DONE`).
+Resolve `Milestone.order_index`'s uniqueness open question as part of
+that slice, not before or after. `Task` follows after `Milestone`, not
+in the same pass. Do not invent product rules inside the
+implementation - flag them as open questions instead (§4c's lesson from
+the removed terminal-status rule; §4e's/§4g's action-set-gap
+documentation-before-code discipline; §4f's three relation-integrity
+rules being frozen *before* coding rather than invented
+mid-implementation).
 
 ---
 
@@ -676,9 +735,11 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   14. `fix: harden M2 Goal action atomicity and patch semantics`
   15. `feat: implement M2 Project vertical slice`
   16. `fix: harden M2 project integrity and shared lifecycle types`
-  17. (this run) `feat: implement M2 GoalRelation graph slice` — see
+  17. `feat: implement M2 GoalRelation graph slice`
+  18. (this run) `docs: freeze Project child mutation actions` — a
+      documentation-only commit, zero source-code files changed; see
       this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-17 were not
+- Pushed to `origin/main` through commit 7. **Commits 8-18 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -710,14 +771,23 @@ proofs via raw SQL, the PARENT_OF convention, and a V2-to-V3 migration-
 compatibility check (23 integration test functions covering 26 numbered
 requirements + 5 direct action-layer unit + 3 direct `GoalRelationType`
 unit) - all passing against temp databases, never the user's real data.
+**Test count unchanged at 104 this run** - the Project Child Action
+Freeze pass is documentation-only, zero source-code files touched, so
+there was nothing new to test and nothing existing to regress.
 
 ---
 
 ## 9. Next recommended step
 
-A fourth domain entity - see §4g for the exact reasoning (this
-duplicates §4g's "Next implementation step" so it is visible without
-scrolling past the M2 detail section).
+The `Milestone` vertical slice - see §4h for the exact reasoning (this
+duplicates §4h's "Next implementation step" so it is visible without
+scrolling past the M2 detail section). Its action set
+(`AddMilestone`/`UpdateMilestone`), patch semantics, confirmation floor
+(`EXPLICIT_ADD`), and FK policy (`ON DELETE RESTRICT` on
+`Milestone.project_id`) are already frozen (§4g) - implementation should
+not need to invent any of those, only resolve the one genuinely open
+question (`order_index` uniqueness, `LIFEOS_SPEC.md` §13) as part of
+that slice.
 
 ---
 
@@ -726,15 +796,18 @@ scrolling past the M2 detail section).
 - **Neither Goal, Project, nor GoalRelation (nor the storage bootstrap)
   is wired into the running app** — no Tauri command layer exists yet;
   `services`' functions are only reachable from tests.
-- **OPEN M2 ACTION-SET GAP: no frozen action edits an existing
-  Project's `title`/`description`/`status`/`priority`/`goal_id`** — the
-  frozen set is only `CreateProject`/`AddMilestone`/`AddTask`/
-  `UpdateProgress`. Documented explicitly (`LIFEOS_SPEC.md` §5.1/§13,
-  §4e point 6 above) rather than resolved in code this run - needs a
-  conscious architecture decision (`UpdateProject` vs. narrower actions)
-  before M3/UI wiring needs to let a user edit a project. Same gap does
-  not exist for `GoalRelation` - `LinkGoals` is its entire frozen action
-  set, there is no expectation of an "UpdateGoalRelation."
+- **RESOLVED (2026-09-17, M2 Project Child Action Freeze): the Project
+  action-set gap is closed.** `UpdateProject` (floor `IMPORTANT_CHANGE`)
+  is now frozen - `LIFEOS_SPEC.md` §5.1/§5.4. Not yet implemented in
+  code (documentation-only freeze); implementation is expected whenever
+  Project editing is actually built, not necessarily the very next run.
+  `UpdateMilestone`/`UpdateTask` (both floor `EXPLICIT_ADD`) are also
+  now frozen, pre-emptively, before either entity exists in code.
+- **`Milestone.order_index` uniqueness within a Project is a genuine
+  OPEN QUESTION** (`LIFEOS_SPEC.md` §13, §4g above) - no existing
+  document decides whether duplicate `order_index` values are allowed
+  or forbidden within one Project. Must be resolved as part of the
+  `Milestone` vertical slice, not silently defaulted either way.
 - **`bundled-sqlcipher`'s build-time OpenSSL dependency is real but no
   longer hardcoded** — any machine building this needs
   `scripts/setup-windows-storage-env.ps1` run once (§4a).
