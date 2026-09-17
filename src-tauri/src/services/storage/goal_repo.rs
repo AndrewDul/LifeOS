@@ -7,19 +7,12 @@
 //! that is `actions`' job; this module trusts its caller (`services`)
 //! to have already validated.
 
+use super::parse_rfc3339;
 use crate::actions::{Actor, ConfirmationClass, Provenance};
 use crate::domain::{Goal, GoalId, GoalStatus};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
-
-fn parse_rfc3339(s: &str) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })
-}
 
 fn row_to_goal(row: &Row) -> rusqlite::Result<Goal> {
     let id_str: String = row.get("id")?;
@@ -120,32 +113,6 @@ pub(in crate::services) fn get_active_goals(conn: &Connection) -> rusqlite::Resu
     rows.collect()
 }
 
-fn actor_str(actor: Actor) -> &'static str {
-    match actor {
-        Actor::Ui => "UI",
-        Actor::CloudLlm => "CloudLLM",
-        Actor::NeXa => "NeXa",
-    }
-}
-
-fn provenance_str(provenance: Provenance) -> &'static str {
-    match provenance {
-        Provenance::Explicit => "Explicit",
-        Provenance::Inferred => "Inferred",
-    }
-}
-
-fn confirmation_class_str(class: ConfirmationClass) -> &'static str {
-    match class {
-        ConfirmationClass::SafeRead => "SAFE_READ",
-        ConfirmationClass::ExplicitAdd => "EXPLICIT_ADD",
-        ConfirmationClass::InferredChange => "INFERRED_CHANGE",
-        ConfirmationClass::ImportantChange => "IMPORTANT_CHANGE",
-        ConfirmationClass::Delete => "DELETE",
-        ConfirmationClass::Sensitive => "SENSITIVE",
-    }
-}
-
 /// Minimum state to support a future Undo (build brief Part C5) -
 /// deliberately not a full event-sourcing system: one row per audited
 /// mutation, with `previous_snapshot` (JSON, NULL for a fresh create)
@@ -168,9 +135,9 @@ pub(in crate::services) fn insert_audit_entry(
             Uuid::now_v7().to_string(),
             goal_id.to_string(),
             action_type,
-            actor_str(actor),
-            provenance_str(provenance),
-            confirmation_class_str(confirmation_class),
+            super::actor_str(actor),
+            super::provenance_str(provenance),
+            super::confirmation_class_str(confirmation_class),
             previous_snapshot_json,
             occurred_at.to_rfc3339(),
         ],

@@ -117,9 +117,7 @@ fn effective_class_explicit_add_with_inferred_provenance_becomes_inferred_change
         effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
         ConfirmationClass::InferredChange
     );
-    assert!(goal_blocks_until_confirmed(
-        ConfirmationClass::InferredChange
-    ));
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
 }
 
 #[test]
@@ -128,9 +126,7 @@ fn effective_class_important_change_with_explicit_provenance_stays_important_cha
         effective_class(ConfirmationClass::ImportantChange, Provenance::Explicit),
         ConfirmationClass::ImportantChange
     );
-    assert!(!goal_blocks_until_confirmed(
-        ConfirmationClass::ImportantChange
-    ));
+    assert!(!blocks_until_confirmed(ConfirmationClass::ImportantChange));
 }
 
 // --- UpdateGoal patch validation ---------------------------------------
@@ -262,4 +258,159 @@ fn update_goal_status_no_op_transition_is_valid() {
 #[test]
 fn field_patch_default_is_unchanged() {
     assert_eq!(FieldPatch::<String>::default(), FieldPatch::Unchanged);
+}
+
+// =========================================================================
+// Project (M2 Project vertical slice, 2026-09-17) - direct unit tests.
+// Pure `validate_create_project`/`validate_update_progress`/
+// `effective_class` calls, no DB, no I/O - mirrors the Goal tests above.
+// The `goal_id` reference check is NOT exercised here (it needs a
+// database read and lives in `services::create_project`) - see
+// `services::tests` for that.
+// =========================================================================
+
+fn base_create_project_payload() -> CreateProjectPayload {
+    CreateProjectPayload {
+        title: "Valid project title".to_string(),
+        description: None,
+        priority: None,
+        goal_id: None,
+    }
+}
+
+#[test]
+fn create_project_title_is_trimmed() {
+    let payload = CreateProjectPayload {
+        title: "  Van purchase  ".to_string(),
+        ..base_create_project_payload()
+    };
+    let title = validate_create_project(&payload).expect("should validate");
+    assert_eq!(title, "Van purchase");
+}
+
+#[test]
+fn create_project_rejects_empty_title() {
+    for bad in ["", "   ", "\t\n"] {
+        let payload = CreateProjectPayload {
+            title: bad.to_string(),
+            ..base_create_project_payload()
+        };
+        let errors = validate_create_project(&payload).expect_err("empty title must be rejected");
+        assert!(
+            errors.contains(&ValidationError::EmptyTitle),
+            "expected EmptyTitle for {bad:?}, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn create_project_rejects_title_too_long() {
+    let payload = CreateProjectPayload {
+        title: "x".repeat(TITLE_MAX_LEN + 1),
+        ..base_create_project_payload()
+    };
+    let errors = validate_create_project(&payload).expect_err("overlong title must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TitleTooLong { .. })),
+        "expected TitleTooLong, got {errors:?}"
+    );
+}
+
+#[test]
+fn create_project_rejects_priority_out_of_bounds() {
+    let payload = CreateProjectPayload {
+        priority: Some(PRIORITY_MAX + 1),
+        ..base_create_project_payload()
+    };
+    let errors =
+        validate_create_project(&payload).expect_err("out-of-bounds priority must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::PriorityOutOfBounds { .. })),
+        "expected PriorityOutOfBounds, got {errors:?}"
+    );
+}
+
+#[test]
+fn create_project_rejects_description_too_long() {
+    let payload = CreateProjectPayload {
+        description: Some("x".repeat(DESCRIPTION_MAX_LEN + 1)),
+        ..base_create_project_payload()
+    };
+    let errors =
+        validate_create_project(&payload).expect_err("overlong description must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::DescriptionTooLong { .. })),
+        "expected DescriptionTooLong, got {errors:?}"
+    );
+}
+
+#[test]
+fn create_project_confirmation_floor_is_explicit_add_for_explicit_provenance() {
+    // Architecture-freeze report §F confirmation table lists
+    // CreateProject under EXPLICIT_ADD - same floor as CreateGoal.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+}
+
+#[test]
+fn create_project_inferred_provenance_becomes_inferred_change() {
+    // Same mechanism as CreateGoal + Inferred - the type floor
+    // (ExplicitAdd) is lower severity than Inferred's provenance floor
+    // (InferredChange), so the action must block until confirmed. See
+    // `services::tests::req_p_inferred_create_project_requires_confirmation_and_does_not_write`
+    // for the end-to-end DB proof.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred),
+        ConfirmationClass::InferredChange
+    );
+    assert!(blocks_until_confirmed(ConfirmationClass::InferredChange));
+}
+
+#[test]
+fn update_progress_accepts_in_bounds_value() {
+    let payload = UpdateProgressPayload {
+        id: ProjectId::new(),
+        progress: 50,
+    };
+    assert!(validate_update_progress(&payload).is_ok());
+}
+
+#[test]
+fn update_progress_rejects_out_of_bounds_value() {
+    // Progress is `u8`, so ">100" is representable but out of the
+    // canonical 0..=100 bound - PROGRESS_MAX + 1 stays in range for the
+    // type (100 < 255) so this exercises the bounds check, not a type
+    // overflow.
+    let payload = UpdateProgressPayload {
+        id: ProjectId::new(),
+        progress: PROGRESS_MAX + 1,
+    };
+    let errors =
+        validate_update_progress(&payload).expect_err("out-of-bounds progress must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ProgressOutOfBounds { .. })),
+        "expected ProgressOutOfBounds, got {errors:?}"
+    );
+}
+
+#[test]
+fn update_progress_confirmation_floor_is_explicit_add() {
+    // Deliberately different from UpdateGoal (IMPORTANT_CHANGE) - the
+    // architecture-freeze report §F confirmation table lists
+    // UpdateProgress under EXPLICIT_ADD explicitly. Not a bug.
+    assert_eq!(
+        effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit),
+        ConfirmationClass::ExplicitAdd
+    );
+    assert!(!blocks_until_confirmed(ConfirmationClass::ExplicitAdd));
 }

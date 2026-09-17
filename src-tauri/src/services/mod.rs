@@ -18,11 +18,12 @@
 mod storage;
 
 use crate::actions::{
-    effective_class, goal_blocks_until_confirmed, ActionMeta, ActionOutcome, ConfirmationClass,
-    CreateGoalPayload, FieldPatch, UpdateGoalPayload,
+    blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, ConfirmationClass,
+    CreateGoalPayload, CreateProjectPayload, FieldPatch, UpdateGoalPayload, UpdateProgressPayload,
+    ValidationError,
 };
 use crate::core_error::CoreError;
-use crate::domain::{Goal, GoalId, GoalStatus};
+use crate::domain::{Goal, GoalId, GoalStatus, Project, ProjectId};
 use crate::security;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -94,6 +95,27 @@ fn bootstrap_db_at(path: &std::path::Path, key_hex: &str) -> Result<Connection, 
     Ok(conn)
 }
 
+/// Test-only: same as `bootstrap_db_at` but stops migrating at
+/// `version` - lets a test build a database frozen at an old schema
+/// version (e.g. V1/Goal only, before `Project` existed) and then
+/// upgrade it later with a normal `bootstrap_db_at` call, proving the
+/// real upgrade path rather than only ever testing a fresh all-at-once
+/// migration (M2 Project vertical slice, 2026-09-17).
+#[cfg(test)]
+fn bootstrap_db_at_version(
+    path: &std::path::Path,
+    key_hex: &str,
+    version: i32,
+) -> Result<Connection, BootstrapError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(BootstrapError::Io)?;
+    }
+    let mut conn = storage::open_encrypted(path, key_hex)?;
+    storage::verify_key(&conn)?;
+    storage::run_production_migrations_to_version(&mut conn, version)?;
+    Ok(conn)
+}
+
 /// Full production bootstrap: resolves the real DB path, obtains/
 /// generates the real master key via the OS credential store
 /// (`LifeOS` / `database-master-key-v1`), opens the encrypted database,
@@ -134,7 +156,7 @@ pub(crate) fn create_goal(
     };
 
     let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
-    if goal_blocks_until_confirmed(class) && !meta.confirmed {
+    if blocks_until_confirmed(class) && !meta.confirmed {
         return ActionOutcome::ConfirmationRequired {
             confirmation_class: class,
         };
@@ -206,7 +228,7 @@ pub(crate) fn update_goal(
     }
 
     let class = effective_class(ConfirmationClass::ImportantChange, meta.provenance);
-    if goal_blocks_until_confirmed(class) && !meta.confirmed {
+    if blocks_until_confirmed(class) && !meta.confirmed {
         return ActionOutcome::ConfirmationRequired {
             confirmation_class: class,
         };
@@ -299,6 +321,182 @@ pub(crate) fn get_active_goals(conn: &Connection) -> Result<Vec<Goal>, rusqlite:
 /// API actually lists.
 pub(crate) fn get_goal(conn: &Connection, id: GoalId) -> Result<Option<Goal>, rusqlite::Error> {
     storage::goal_repo::get_goal(conn, id)
+}
+
+// --- Project (M2 Project vertical slice, 2026-09-17) --------------------
+//
+// Same atomic-mutation-plus-audit, typed-`CoreError`, module-boundary
+// pattern as Goal above - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
+// Only `CreateProject` and `UpdateProgress` are implemented (the frozen
+// action set also has `AddMilestone`/`AddTask`, out of scope - they need
+// Milestone/Task, which do not exist yet).
+
+/// `CreateProject`'s confirmation floor is `EXPLICIT_ADD` - same as
+/// `CreateGoal` - per the architecture-freeze report §F's confirmation
+/// table, which explicitly lists `CreateProject` under `EXPLICIT_ADD`.
+/// If `payload.goal_id` is supplied, it must reference an existing
+/// `Goal` - checked here (a database read) BEFORE persistence, reported
+/// through the same `ValidationFailed` channel as structural checks, not
+/// left to the SQL foreign-key constraint to catch (that constraint is
+/// declared in the V2 migration for documentation/defense-in-depth, but
+/// is not relied on as the primary mechanism - see the migration's own
+/// comment).
+pub(crate) fn create_project(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: CreateProjectPayload,
+) -> ActionOutcome<Project> {
+    let normalized_title = match crate::actions::validate_create_project(&payload) {
+        Ok(t) => t,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    if let Some(goal_id) = payload.goal_id {
+        match storage::project_repo::goal_exists(conn, goal_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return ActionOutcome::ValidationFailed(vec![
+                    ValidationError::ReferencedGoalNotFound,
+                ]);
+            }
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+    let project = Project {
+        id: ProjectId::new(),
+        title: normalized_title,
+        description: payload.description,
+        status: GoalStatus::Active,
+        priority: payload.priority,
+        goal_id: payload.goal_id,
+        progress: 0,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::project_repo::insert_project(&tx, &project) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::project_repo::insert_audit_entry(
+        &tx,
+        project.id,
+        "CreateProject",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: project,
+        confirmation_class: class,
+    }
+}
+
+/// `UpdateProgress`'s confirmation floor is also `EXPLICIT_ADD` (not
+/// `IMPORTANT_CHANGE`, unlike `UpdateGoal`) - per the same frozen
+/// confirmation table, which lists `UpdateProgress` under
+/// `EXPLICIT_ADD` explicitly. This is a deliberate frozen difference
+/// from Goal, not an oversight - do not "fix" it to match `UpdateGoal`
+/// without `LIFEOS_SPEC.md` changing first.
+pub(crate) fn update_progress(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: UpdateProgressPayload,
+) -> ActionOutcome<Project> {
+    let existing = match storage::project_repo::get_project(conn, payload.id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(errors) = crate::actions::validate_update_progress(&payload) {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let previous_snapshot = serde_json::to_string(&existing).ok();
+
+    let mut updated = existing;
+    updated.progress = payload.progress;
+    updated.updated_at = meta.requested_at;
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::project_repo::update_project_progress(
+        &tx,
+        updated.id,
+        updated.progress,
+        updated.updated_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::project_repo::insert_audit_entry(
+        &tx,
+        updated.id,
+        "UpdateProgress",
+        meta.actor,
+        meta.provenance,
+        class,
+        previous_snapshot.as_deref(),
+        meta.requested_at,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: updated,
+        confirmation_class: class,
+    }
+}
+
+/// Narrow internal read, same reasoning as `get_goal` above. The frozen
+/// capability API's minimum function set (architecture-freeze report
+/// §I) does not list any Project-specific read (no `get_projects()`/
+/// `get_active_projects()` - only a generic, unspecified
+/// `get_progress()`), so none is added here beyond what tests and
+/// `update_progress` actually need.
+pub(crate) fn get_project(
+    conn: &Connection,
+    id: ProjectId,
+) -> Result<Option<Project>, rusqlite::Error> {
+    storage::project_repo::get_project(conn, id)
 }
 
 #[cfg(test)]

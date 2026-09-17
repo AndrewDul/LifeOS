@@ -18,8 +18,8 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, GoalStatus, Priority, Progress, DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN,
-    PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
+    Goal, GoalId, GoalStatus, Priority, Progress, ProjectId, DESCRIPTION_MAX_LEN,
+    DOMAIN_TAG_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN, PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -151,7 +151,12 @@ pub(crate) fn effective_class(
     }
 }
 
-pub(crate) fn goal_blocks_until_confirmed(class: ConfirmationClass) -> bool {
+/// Generic across entities - not Goal-specific despite the historical
+/// name of its call sites (renamed from `goal_blocks_until_confirmed`,
+/// M2 Project vertical slice, 2026-09-17, so `services::create_project`/
+/// `update_progress` can reuse it instead of duplicating an identical
+/// function under a `project_` prefix).
+pub(crate) fn blocks_until_confirmed(class: ConfirmationClass) -> bool {
     class.blocks_until_confirmed()
 }
 
@@ -182,6 +187,15 @@ pub(crate) enum ValidationError {
         actual: i64,
     },
     NoFieldsToUpdate,
+    /// A referenced entity does not exist - e.g. `CreateProject`'s
+    /// `goal_id` pointing at a nonexistent `Goal`. This check needs a
+    /// database read, which this module never performs itself (pure
+    /// logic, no I/O) - `services::create_project` performs the read
+    /// and reports the result through this same deterministic
+    /// `ValidationFailed` channel as every other structural check,
+    /// rather than relying solely on the SQL foreign-key constraint
+    /// failing (M2 Project vertical slice, 2026-09-17).
+    ReferencedGoalNotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +376,80 @@ pub(crate) fn validate_update_goal(
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+// --- Project (M2 Project vertical slice, 2026-09-17) --------------------
+//
+// The frozen M2 action set for Project (architecture-freeze report §C)
+// is CreateProject, AddMilestone, AddTask, UpdateProgress - there is no
+// frozen UpdateProject. Only CreateProject and UpdateProgress are
+// implemented this slice; AddMilestone/AddTask need Milestone/Task,
+// which are explicitly out of scope.
+
+/// `CreateProject` payload. `goal_id`, if present, must reference an
+/// existing `Goal` - that check needs a database read, so it cannot
+/// happen in this pure module; `services::create_project` performs it
+/// and reports failure via `ValidationError::ReferencedGoalNotFound`.
+#[derive(Debug, Clone)]
+pub(crate) struct CreateProjectPayload {
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: Option<Priority>,
+    pub goal_id: Option<GoalId>,
+}
+
+/// `UpdateProgress` payload - deliberately narrow (one field, one
+/// purpose), matching the frozen action's scope exactly. There is no
+/// tri-state `FieldPatch` need here: `progress` is Project's one
+/// non-nullable mutable field this action touches.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpdateProgressPayload {
+    pub id: ProjectId,
+    pub progress: Progress,
+}
+
+/// Returns the normalized (trimmed) title on success, mirroring
+/// `validate_create_goal`. Deliberately does **not** check `goal_id`
+/// existence - pure logic, no I/O; see `CreateProjectPayload`'s doc.
+pub(crate) fn validate_create_project(
+    payload: &CreateProjectPayload,
+) -> Result<String, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    let mut normalized_title = None;
+
+    match validate_title(&payload.title) {
+        Ok(t) => normalized_title = Some(t),
+        Err(e) => errors.push(e),
+    }
+    if let Some(d) = &payload.description {
+        if let Err(e) = validate_description(d) {
+            errors.push(e);
+        }
+    }
+    if let Some(p) = payload.priority {
+        if let Err(e) = validate_priority(p) {
+            errors.push(e);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(normalized_title.expect("title validated Ok implies normalized_title is Some"))
+    } else {
+        Err(errors)
+    }
+}
+
+/// Progress-bounds check only - the frozen `UpdateProgress` action has
+/// nothing else to validate structurally. Project existence is checked
+/// at the `services` layer, the same way `update_goal` checks `Goal`
+/// existence (needs a database read).
+pub(crate) fn validate_update_progress(
+    payload: &UpdateProgressPayload,
+) -> Result<(), Vec<ValidationError>> {
+    match validate_progress(payload.progress) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(vec![e]),
     }
 }
 

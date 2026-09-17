@@ -1,9 +1,11 @@
-//! LifeOS domain types (M2 Goal vertical slice, 2026-09-17).
+//! LifeOS domain types (M2 Goal vertical slice, 2026-09-17; Project
+//! vertical slice added 2026-09-17).
 //!
 //! Pure data, no I/O, no SQL - matches `LIFEOS_SPEC.md` §5.6's module
-//! boundaries. Only `Goal` is implemented this slice
-//! (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model has more; Project/
-//! Task/Fact/etc. are explicitly out of scope for this run).
+//! boundaries. Only `Goal` and `Project` are implemented so far
+//! (`LIFEOS_SPEC.md` §5.1's frozen v0.1 domain model has more;
+//! `GoalRelation`/`Milestone`/`Task`/`Fact`/etc. are explicitly out of
+//! scope for this run).
 
 // Not wired into `run()` yet this run (no capability/Tauri-command
 // layer exists) - only exercised by services::tests, hence dead_code
@@ -108,6 +110,67 @@ pub(crate) struct Goal {
     pub priority_system: Option<Priority>,
     pub progress: Progress,
     pub domain_tag: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A stable, globally unique Project identifier - same UUID v7 design as
+/// `GoalId` (M2 Project vertical slice, 2026-09-17). Kept as its own
+/// newtype rather than reusing `GoalId` for a different entity: the two
+/// ID spaces must stay distinct at the type level (a `ProjectId` must
+/// never be usable where a `GoalId` is expected, and vice versa) - this
+/// is type-safety, not the kind of duplication `Progress`/`Priority`
+/// reuse below is meant to avoid.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct ProjectId(pub Uuid);
+
+impl ProjectId {
+    pub(crate) fn new() -> Self {
+        ProjectId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(ProjectId)
+    }
+}
+
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `Project` (M2 Project vertical slice, 2026-09-17). Field set is
+/// exactly the frozen architecture-freeze definition (M2 report §C):
+/// `id`, `title`, `description`, `status` (same 4 values as `Goal` -
+/// reuses `GoalStatus` directly rather than defining a duplicate
+/// `ProjectStatus` enum, since the freeze explicitly says "same 4
+/// values as Goal"), `priority` (reuses the shared `Priority`
+/// type/scale, singular - unlike Goal there is no user/system split),
+/// `goal_id` (nullable - the first real cross-entity relationship in
+/// production M2; NOT the future `GoalRelation` graph, which remains
+/// unimplemented), `created_at`, `updated_at`.
+///
+/// `progress: Progress` is this struct's one field beyond that frozen
+/// one-line table - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
+/// §3 for the reasoning: the frozen `UpdateProgress` action needs
+/// something concrete to mutate, Goal's own precedent stores progress
+/// directly on the entity, and the separate frozen `ProgressUpdate`
+/// entity (polymorphic GOAL/PROJECT/TASK log) is a different, not-yet-
+/// implemented, time-series concept out of scope for this slice - this
+/// is flagged as an explicit interpretation, not a silently invented
+/// field.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Project {
+    pub id: ProjectId,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: GoalStatus,
+    pub priority: Option<Priority>,
+    pub goal_id: Option<GoalId>,
+    pub progress: Progress,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

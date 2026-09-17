@@ -808,3 +808,589 @@ fn req_h5_inferred_create_goal_requires_confirmation_and_does_not_write() {
         ),
     }
 }
+
+// =========================================================================
+// M2 Project vertical slice (2026-09-17) - new evidence below.
+// Evidence for `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
+// =========================================================================
+
+fn mk_create_project_payload(
+    title: &str,
+    goal_id: Option<crate::domain::GoalId>,
+) -> CreateProjectPayload {
+    CreateProjectPayload {
+        title: title.to_string(),
+        description: None,
+        priority: None,
+        goal_id,
+    }
+}
+
+fn project_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn project_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM project_audit_log", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Same forced-failure mechanism as `install_audit_failure_trigger`
+/// (hardening report §3), targeting `project_audit_log` instead.
+fn install_project_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_project_audit_failure
+         BEFORE INSERT ON project_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced project audit failure');
+         END;",
+    )
+    .expect("failed to install the forced project-audit-failure trigger");
+}
+
+fn remove_project_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_project_audit_failure;")
+        .expect("failed to remove the forced project-audit-failure trigger");
+}
+
+/// Requirement 1: V2 migration creates the Project schema.
+#[test]
+fn req_p1_v2_migration_creates_project_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for table in ["projects", "project_audit_log"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(exists, "[req_p1] FAIL - missing table {table}");
+    }
+    println!("[req_p1] PASS - V2 migration created projects + project_audit_log");
+}
+
+/// Requirements 2 & 14 (migration compatibility): an existing database
+/// created at V1 only (real Goal data, no Project schema yet - the real
+/// shape of an existing user's database before this app update) upgrades
+/// cleanly to V2: original Goal data is unchanged, and a Project can
+/// then reference that pre-existing Goal. Not a destructive migration;
+/// `V1__create_goals.sql` itself was not touched by this run.
+#[test]
+fn req_p2_v1_goal_database_upgrades_cleanly_to_v2_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project2.db");
+
+    let goal_id;
+    {
+        // Simulate an existing production DB that only ever ran V1.
+        let mut conn = bootstrap_db_at_version(&path, &key, 1).unwrap();
+        let has_projects_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_projects_table,
+            "[req_p2] FAIL - a V1-only database already has the projects table"
+        );
+
+        let created = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V2 goal"))
+        {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = created.id;
+    }
+
+    {
+        // Reopen normally - this applies every pending migration,
+        // i.e. just V2 on top of the already-applied V1.
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+        let goal_after_upgrade = get_goal(&conn, goal_id).unwrap();
+        assert_eq!(
+            goal_after_upgrade.as_ref().map(|g| g.title.as_str()),
+            Some("Pre-V2 goal"),
+            "[req_p2] FAIL - Goal data did not survive the V1 -> V2 upgrade"
+        );
+
+        let has_projects_table: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            has_projects_table,
+            "[req_p2] FAIL - projects table missing after upgrade"
+        );
+
+        match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Project on the pre-existing goal", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.goal_id, Some(goal_id));
+                println!("[req_p2] PASS - V1 Goal data survived the upgrade to V2, and a new Project can reference the pre-existing Goal");
+            }
+            other => panic!(
+                "[req_p2] FAIL - expected CreateProject to succeed against the pre-existing goal, got {other:?}"
+            ),
+        }
+    }
+}
+
+/// Requirement 3 (and Project->Goal case A): a Project without a
+/// `goal_id` can be created.
+#[test]
+fn req_p3_project_without_goal_id_can_be_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project3.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Standalone project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.goal_id, None);
+            assert_eq!(value.status, GoalStatus::Active);
+            assert_eq!(value.progress, 0);
+            println!("[req_p3] PASS - Project created with no goal_id: {value:?}");
+        }
+        other => panic!("[req_p3] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// Requirements 4, 5, 7 (and Project->Goal cases B and D): a Project
+/// linked to an existing Goal can be created, the link + the project
+/// itself survive a full connection close/reopen, and reading it back
+/// returns the same linked GoalId.
+#[test]
+fn req_p4_5_7_project_with_valid_goal_id_persists_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project4.db");
+
+    let (goal_id, project_id);
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Linked goal")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = goal.id;
+
+        match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Linked project", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.goal_id, Some(goal_id));
+                project_id = value.id;
+                println!("[req_p4] PASS - CreateProject succeeded linked to goal {goal_id}");
+            }
+            other => panic!("[req_p4] FAIL - expected Success, got {other:?}"),
+        }
+    }
+
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let fetched = get_project(&conn, project_id).unwrap();
+        assert!(
+            fetched.is_some(),
+            "[req_p5/7] FAIL - project not found after reopen"
+        );
+        let fetched = fetched.unwrap();
+        assert_eq!(
+            fetched.goal_id,
+            Some(goal_id),
+            "[req_p5] FAIL - goal_id link did not survive close/reopen"
+        );
+        println!("[req_p5/7] PASS - project and its goal_id link both survived a full connection close/reopen: {fetched:?}");
+    }
+}
+
+/// Requirement 6 (and Project->Goal case C): a nonexistent GoalId is
+/// rejected before any write - zero project rows written.
+#[test]
+fn req_p6_nonexistent_goal_id_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project6.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_goal_id = crate::domain::GoalId::new();
+    match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Dangling reference", Some(fake_goal_id)),
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::ReferencedGoalNotFound),
+                "[req_p6] FAIL - expected ReferencedGoalNotFound, got {errors:?}"
+            );
+        }
+        other => panic!("[req_p6] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    assert_eq!(
+        project_row_count(&conn),
+        0,
+        "[req_p6] FAIL - a project row was written despite the dangling goal_id"
+    );
+    println!("[req_p6] PASS - nonexistent goal_id rejected before persistence, zero project rows written");
+}
+
+/// Requirement 8: invalid Project input makes zero writes.
+#[test]
+fn req_p8_invalid_project_input_makes_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project8.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload = CreateProjectPayload {
+        priority: Some(99),
+        ..mk_create_project_payload(&"x".repeat(201), None)
+    };
+    match create_project(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::TitleTooLong { .. })));
+            assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PriorityOutOfBounds { .. })));
+            println!("[req_p8] PASS - overlong title AND out-of-bounds priority both reported: {errors:?}");
+        }
+        other => panic!("[req_p8] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    assert_eq!(
+        project_row_count(&conn),
+        0,
+        "[req_p8] FAIL - a row was written despite validation failure"
+    );
+}
+
+/// Requirement 9: UpdateProgress succeeds.
+#[test]
+fn req_p9_update_progress_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project9.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Ship the van", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let update = UpdateProgressPayload {
+        id: created.id,
+        progress: 65,
+    };
+    match update_progress(&mut conn, ui_explicit(), update) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(value.progress, 65);
+            assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+            println!(
+                "[req_p9] PASS - UpdateProgress succeeded: progress=65, class={confirmation_class:?}"
+            );
+        }
+        other => panic!("[req_p9] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// Requirement 10: out-of-bounds progress is rejected. `Progress` is
+/// `u8` (0..=255 representable), so a negative value cannot even be
+/// constructed through this API - the "<0 is rejected" half of this
+/// requirement is a *stronger*, type-level guarantee than a runtime
+/// check, not merely untested; only the ">100" half is a runtime
+/// validation check.
+#[test]
+fn req_p10_progress_out_of_bounds_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project10.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Bounded progress", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let update = UpdateProgressPayload {
+        id: created.id,
+        progress: 101,
+    };
+    match update_progress(&mut conn, ui_explicit(), update) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ProgressOutOfBounds { .. })));
+            println!("[req_p10] PASS - progress=101 rejected: {errors:?}");
+        }
+        other => panic!("[req_p10] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+}
+
+/// Requirement 11: UpdateProgress on a missing Project returns
+/// structured NotFound.
+#[test]
+fn req_p11_update_progress_missing_project_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project11.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_id = crate::domain::ProjectId::new();
+    let update = UpdateProgressPayload {
+        id: fake_id,
+        progress: 10,
+    };
+    match update_progress(&mut conn, ui_explicit(), update) {
+        ActionOutcome::NotFound => {
+            println!(
+                "[req_p11] PASS - UpdateProgress on a nonexistent id returned structured NotFound"
+            )
+        }
+        other => panic!("[req_p11] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+/// Requirement 12: an invalid UpdateProgress causes zero mutation.
+#[test]
+fn req_p12_invalid_update_progress_causes_zero_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project12.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Stable project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_project(&conn, created.id).unwrap().unwrap();
+
+    let invalid = UpdateProgressPayload {
+        id: created.id,
+        progress: 255,
+    };
+    match update_progress(&mut conn, ui_explicit(), invalid) {
+        ActionOutcome::ValidationFailed(_) => {}
+        other => panic!("[req_p12] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+
+    let after = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_p12] FAIL - project changed despite validation failure"
+    );
+    println!("[req_p12] PASS - zero changes persisted after the invalid UpdateProgress");
+}
+
+/// Requirement 13: CreateProject's project-insert + audit-insert are
+/// one atomic transaction - same forced-failure proof as Goal hardening
+/// report §3.
+#[test]
+fn req_p13_create_project_audit_failure_rolls_back_project_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project13.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    install_project_audit_failure_trigger(&conn);
+
+    match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Should never persist", None),
+    ) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_p13] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_p13] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    assert_eq!(
+        project_row_count(&conn),
+        0,
+        "[req_p13] FAIL - a project row survived a rolled-back transaction"
+    );
+    assert_eq!(
+        project_audit_row_count(&conn),
+        0,
+        "[req_p13] FAIL - an audit row survived a rolled-back transaction"
+    );
+
+    remove_project_audit_failure_trigger(&conn);
+
+    match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Now it works", None),
+    ) {
+        ActionOutcome::Success { .. } => {
+            println!("[req_p13] PASS - connection remains usable after the rollback")
+        }
+        other => panic!("[req_p13] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+/// Requirement 14: UpdateProgress's project-update + audit-insert are
+/// one atomic transaction.
+#[test]
+fn req_p14_update_progress_audit_failure_rolls_back_project_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project14.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Stable", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let before = get_project(&conn, created.id).unwrap().unwrap();
+
+    install_project_audit_failure_trigger(&conn);
+
+    let update = UpdateProgressPayload {
+        id: created.id,
+        progress: 77,
+    };
+    match update_progress(&mut conn, ui_explicit(), update) {
+        ActionOutcome::StorageError(e) => {
+            assert_eq!(e.kind(), CoreErrorKind::Storage);
+            println!(
+                "[req_p14] PASS - forced audit failure surfaced as a typed StorageError: {e:?}"
+            );
+        }
+        other => panic!("[req_p14] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_project_audit_failure_trigger(&conn);
+
+    let after = get_project(&conn, created.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_p14] FAIL - project mutated despite a rolled-back transaction"
+    );
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM project_audit_log WHERE project_id = ?1",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 1,
+        "[req_p14] FAIL - expected exactly 1 audit row (the original CreateProject), got {audit_count}"
+    );
+    println!(
+        "[req_p14] PASS - project left identical to its pre-update state, no orphan audit row"
+    );
+}
+
+/// Requirement 15: Project audit rows contain the required actor/
+/// provenance/confirmation metadata.
+#[test]
+fn req_p15_project_audit_rows_contain_required_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project15.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Audited project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let (action_type, actor, provenance, confirmation_class): (String, String, String, String) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class FROM project_audit_log WHERE project_id = ?1",
+            [created.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(action_type, "CreateProject");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    println!(
+        "[req_p15] PASS - audit row carries action_type={action_type}, actor={actor}, provenance={provenance}, confirmation_class={confirmation_class}"
+    );
+}
+
+/// Requirement 16: Inferred CreateProject blocks before write.
+#[test]
+fn req_p16_inferred_create_project_requires_confirmation_and_does_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "project16.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload = mk_create_project_payload("AI-proposed project", None);
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    assert!(!meta.confirmed);
+
+    match create_project(&mut conn, meta, payload.clone()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_p16] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        project_row_count(&conn),
+        0,
+        "[req_p16] FAIL - a project was written before confirmation"
+    );
+    println!("[req_p16] PASS - Inferred CreateProject blocked with ConfirmationRequired, zero rows written");
+
+    let mut confirmed_meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    confirmed_meta.confirmed = true;
+    match create_project(&mut conn, confirmed_meta, payload) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(project_row_count(&conn), 1);
+            println!("[req_p16] PASS - resubmission with confirmed=true persisted the project");
+        }
+        other => {
+            panic!("[req_p16] FAIL - expected Success on confirmed resubmission, got {other:?}")
+        }
+    }
+}

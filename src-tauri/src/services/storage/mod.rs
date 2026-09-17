@@ -15,21 +15,69 @@
 //! `open_encrypted`/`verify_key`/`rekey`/`integrity_check` are generic
 //! encrypted-SQLite primitives, proven in the storage spike and reused
 //! here unchanged for production. Production migrations
-//! (`../../../migrations/`) create ONLY the real `goals` table - the
-//! spike's `spike_records` schema lives under `spike/`, compiled for
-//! `#[cfg(test)]` only, and is never reachable from a non-test build.
+//! (`../../../migrations/`) create ONLY real domain tables - `goals`
+//! (V1) and `projects`/`project_audit_log` (V2, M2 Project vertical
+//! slice, 2026-09-17) - the spike's `spike_records` schema lives under
+//! `spike/`, compiled for `#[cfg(test)]` only, and is never reachable
+//! from a non-test build.
 
 // Not wired into `run()` yet this run - only exercised by tests, hence
 // dead_code would otherwise warn on every non-test build.
 #![allow(dead_code)]
 
+use crate::actions::{Actor, ConfirmationClass, Provenance};
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use std::path::Path;
 
 pub(super) mod goal_repo;
+pub(super) mod project_repo;
 
 #[cfg(test)]
 pub(super) mod spike;
+
+/// Shared by `goal_repo`/`project_repo` (M2 Project vertical slice,
+/// 2026-09-17 - promoted here to avoid each repo module duplicating an
+/// identical RFC3339 parse helper). `pub(super)` here means visible
+/// throughout `crate::services` (this module's parent), which includes
+/// `storage`'s own child repo modules.
+pub(super) fn parse_rfc3339(s: &str) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+}
+
+/// Shared audit-column string mappings - same reasoning as
+/// `parse_rfc3339` above. Moved out of `goal_repo` (where they
+/// originated, Goal vertical slice) rather than duplicated into
+/// `project_repo`.
+pub(super) fn actor_str(actor: Actor) -> &'static str {
+    match actor {
+        Actor::Ui => "UI",
+        Actor::CloudLlm => "CloudLLM",
+        Actor::NeXa => "NeXa",
+    }
+}
+
+pub(super) fn provenance_str(provenance: Provenance) -> &'static str {
+    match provenance {
+        Provenance::Explicit => "Explicit",
+        Provenance::Inferred => "Inferred",
+    }
+}
+
+pub(super) fn confirmation_class_str(class: ConfirmationClass) -> &'static str {
+    match class {
+        ConfirmationClass::SafeRead => "SAFE_READ",
+        ConfirmationClass::ExplicitAdd => "EXPLICIT_ADD",
+        ConfirmationClass::InferredChange => "INFERRED_CHANGE",
+        ConfirmationClass::ImportantChange => "IMPORTANT_CHANGE",
+        ConfirmationClass::Delete => "DELETE",
+        ConfirmationClass::Sensitive => "SENSITIVE",
+    }
+}
 
 /// Opens (creating if absent) an encrypted database at `path` using a
 /// raw 256-bit hex key (`PRAGMA key = "x'<64 hex chars>'"` - the raw-key
@@ -75,6 +123,28 @@ pub(super) fn run_production_migrations(
     conn: &mut Connection,
 ) -> Result<Vec<String>, refinery::Error> {
     let report = migrations::migrations::runner().run(conn)?;
+    Ok(report
+        .applied_migrations()
+        .iter()
+        .map(|m| m.to_string())
+        .collect())
+}
+
+/// Test-only: applies production migrations only up to `version`, so a
+/// test can construct a database frozen at an old schema version (e.g.
+/// V1/Goal only) and then separately apply the rest later - simulating
+/// a real user's existing database being upgraded across an app update,
+/// rather than only ever testing a fresh DB that gets every migration
+/// at once (M2 Project vertical slice, 2026-09-17 - see
+/// `services::tests::req_p_v1_goal_database_upgrades_cleanly_to_v2_project`).
+#[cfg(test)]
+pub(super) fn run_production_migrations_to_version(
+    conn: &mut Connection,
+    version: i32,
+) -> Result<Vec<String>, refinery::Error> {
+    let report = migrations::migrations::runner()
+        .set_target(refinery::Target::Version(version))
+        .run(conn)?;
     Ok(report
         .applied_migrations()
         .iter()

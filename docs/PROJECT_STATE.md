@@ -5,11 +5,11 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 Goal hardening — atomic mutation+audit,
-typed Core error model, tri-state field-patch semantics, removed an
-unapproved terminal-status rule, direct action-layer unit tests, and
-documentation corrections, on top of the same day's Goal vertical
-slice/storage hardening).
+Last updated: 2026-09-17 (M2 Project vertical slice — the second real
+domain entity, implemented directly with the hardened Goal pattern:
+atomic mutation+audit, typed `CoreError`, structured cross-entity
+reference validation, on top of the same day's Goal vertical
+slice/storage hardening and Goal hardening pass).
 
 ---
 
@@ -19,20 +19,22 @@ slice/storage hardening).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal vertical slice implemented AND hardened** 2026-09-17 (§4); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal (implemented + hardened) and Project (implemented) vertical slices done** 2026-09-17 (§4); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
 
-**M2 now has one real, working, hardened, tested domain entity: Goal**,
-end to end through `domain → actions → services → private
-services/storage → encrypted SQLCipher`. Two runs on 2026-09-17 built
-this: first the vertical slice itself (storage foundation hardening +
-Goal implemented), then a **dedicated hardening pass** after
-architectural review found issues that had to be corrected before the
-Goal pattern could safely be copied to `Project` — see §4b-§4c. Next
-step is repeating the now-hardened pattern for `Project` — not the rest
-of the domain model at once, and still not M3.
+**M2 now has two real, working, tested domain entities: Goal and
+Project**, end to end through `domain → actions → services → private
+services/storage → encrypted SQLCipher`. Three runs on 2026-09-17 built
+this: the Goal vertical slice (storage foundation hardening + Goal
+implemented), a dedicated Goal hardening pass (fixed 7 issues before the
+pattern was reused), and then the **Project vertical slice** - the
+second entity, built directly with the already-hardened pattern (atomic
+transactions, typed `CoreError` from the start) rather than needing a
+separate hardening pass of its own. See §4b-§4e. Next step is a third
+entity or `GoalRelation` - not the rest of the domain model at once, and
+still not M3.
 
 ---
 
@@ -40,14 +42,25 @@ of the domain model at once, and still not M3.
 
 A Tauri 2 + React + TypeScript desktop app that launches in a real
 window (accepted M1 shell, untouched), plus a working, hardened
-encrypted Goal store: create and update goals with deterministic
-validation, atomic mutation+audit transactions, tri-state patch
-semantics (Set/Unchanged/Clear), typed storage errors, confirmation
-classification, and a read API - all proven by 42 automated tests (9
-storage-spike regression, 17 Goal-slice/hardening integration against a
-real encrypted DB, 16 direct action-layer unit tests). **Not wired into
-the running app yet** - no Tauri command layer exists, so the UI cannot
-create/see real goals yet.
+encrypted store for two domain entities:
+
+- **Goal**: create and update goals with deterministic validation,
+  atomic mutation+audit transactions, tri-state patch semantics
+  (Set/Unchanged/Clear), typed storage errors, confirmation
+  classification, and a read API.
+- **Project**: create projects (optionally linked to an existing Goal by
+  `goal_id`, validated to actually exist before persistence) and update
+  their progress, same atomic-transaction/typed-error discipline from
+  the start, its own `project_audit_log`, and a read API. The first real
+  cross-entity relationship in production M2 (`Project.goal_id ->
+  Goal.id`) - not the future `GoalRelation` graph, which remains
+  unimplemented.
+
+66 automated tests prove all of this (9 storage-spike regression, 17
+Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
+Project integration, 10 direct Project action-layer unit). **Not wired
+into the running app yet** - no Tauri command layer exists, so the UI
+cannot create/see real goals or projects yet.
 
 Repository contents as of this run:
 
@@ -63,33 +76,47 @@ LiFeOS/
 │                    REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md
 │                    REPORT_M2_STORAGE_SPIKE_2026-09-17.md
 │                    REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md
+│                    REPORT_M2_GOAL_HARDENING_2026-09-17.md
+│                    REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
     ├── migrations/V1__create_goals.sql          (PRODUCTION schema - Goal only)
+    │              V2__create_projects.sql        (PRODUCTION schema - Project only, new)
     ├── src/
-    │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 new modules, all private)
+    │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 modules, all private)
     │   ├── core_error.rs          CoreError/CoreErrorKind - typed Core-boundary error model
-    │   │                          (Storage/Migration/Security/Internal), added in hardening
-    │   ├── domain/mod.rs          Goal, GoalId (UUID v7), GoalStatus, Progress, Priority
-    │   │                          (no terminal-status rule - removed in hardening)
+    │   │                          (Storage/Migration/Security/Internal)
+    │   ├── domain/mod.rs          Goal, GoalId, Project, ProjectId (both UUID v7),
+    │   │                          GoalStatus (reused for Project.status - "same 4 values
+    │   │                          as Goal" per the freeze, not a duplicate ProjectStatus),
+    │   │                          Progress, Priority (both shared by Goal and Project)
     │   ├── actions/
     │   │   ├── mod.rs              Actor, Provenance, ActionMeta, ConfirmationClass,
-    │   │   │                       ActionOutcome<T> (StorageError now typed CoreError),
-    │   │   │                       ValidationError, FieldPatch<T> (hardening), validation
-    │   │   └── tests.rs             16 direct action-layer unit tests (hardening, new)
+    │   │   │                       ActionOutcome<T>, ValidationError (+
+    │   │   │                       ReferencedGoalNotFound, new), FieldPatch<T>,
+    │   │   │                       CreateProjectPayload/UpdateProgressPayload (new),
+    │   │   │                       blocks_until_confirmed (renamed from
+    │   │   │                       goal_blocks_until_confirmed - now entity-generic)
+    │   │   └── tests.rs             26 direct action-layer unit tests (16 Goal, 10 Project)
     │   ├── security/mod.rs        OS-keyring master-key lifecycle
     │   └── services/
-    │       ├── mod.rs              bootstrap_production_db, create_goal/update_goal
-    │       │                       (now atomic: &mut Connection + rusqlite transaction),
-    │       │                       get_active_goals, get_goal (capability API contract's
-    │       │                       names - no dedicated capability/ module yet, see
-    │       │                       LIFEOS_SPEC.md §5.6/§10.1's hardening-run correction)
-    │       ├── tests.rs            17 Goal-slice/hardening integration tests (incl. 2
-    │       │                       forced-audit-failure transaction-rollback tests)
+    │       ├── mod.rs              bootstrap_production_db, create_goal/update_goal,
+    │       │                       create_project/update_progress/get_project (new) -
+    │       │                       all atomic (&mut Connection + rusqlite transaction) -
+    │       │                       capability API contract's names, no dedicated
+    │       │                       capability/ module yet (LIFEOS_SPEC.md §5.6/§10.1)
+    │       ├── tests.rs            31 integration tests against a real encrypted DB
+    │       │                       (17 Goal, 14 Project - incl. 4 forced-audit-failure
+    │       │                       transaction-rollback tests and a V1-only-database
+    │       │                       upgrades-to-V2 migration-compatibility test)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
-    │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations
+    │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
+    │           │                    now also hosts actor_str/provenance_str/
+    │           │                    confirmation_class_str/parse_rfc3339 shared by both
+    │           │                    repo modules (moved out of goal_repo, not duplicated)
     │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services)
+    │           ├── project_repo.rs  Project SQL access, pub(in crate::services) (new)
     │           └── spike/           #[cfg(test)] only - old storage-spike suite, moved
     │               ├── mod.rs, tests.rs, migrations/V1__init.sql, V2__add_note_column.sql
     ├── Cargo.toml, Cargo.lock, tauri.conf.json, build.rs
@@ -269,27 +296,99 @@ Full evidence: `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`.
 **Goal is now considered safe to use as the template for `Project`** -
 see that report's §13 for the exact reasoning.
 
-### 4d. What's still architecturally frozen but not yet implemented
+### 4d. Project vertical slice implemented (2026-09-17)
 
-Personal Knowledge Layer, `GoalRelation`/goal relations, `Project`/
-`Milestone`/`Task`/`Challenge`/`Plan`/`SolutionAttempt`/`Outcome`/
-`CalendarEvent`/`Reminder`/`Question`/`ProgressUpdate`/
-`WellbeingCheckin`, the rest of the frozen action list, `ForgetMemory`'s
-corrected (hard-delete) semantics, the `knowledge`/`backup` modules, a
-real `capability` module, NeXa transport. Full detail:
-`docs/LIFEOS_SPEC.md` §5.1-§5.6.
+The second real domain entity, built directly with the hardened Goal
+pattern - no separate hardening pass was needed:
+
+- **Domain** (`domain::Project`): `id` (UUID v7, own `ProjectId`
+  newtype - distinct from `GoalId` at the type level even though both
+  wrap a `Uuid`), `title`, `description`, `status` (reuses
+  `domain::GoalStatus` directly - the architecture freeze says "same 4
+  values as Goal", so a separate `ProjectStatus` enum would have
+  duplicated an already-frozen type), `priority` (reuses the shared
+  `Priority` type, singular unlike Goal's user/system split), `goal_id`
+  (nullable `Option<GoalId>` - the first real cross-entity relationship
+  in production M2), `progress` (reuses `Progress`, 0-100 - **not**
+  explicitly listed in the architecture-freeze report's one-line Project
+  field table, added as a documented interpretation since the frozen
+  `UpdateProgress` action needs a field to mutate and Goal's own
+  precedent stores progress directly on the entity; see the Project
+  report §3 for the full reasoning, flagged as an open question, not a
+  silent invention), `created_at`/`updated_at` (UTC).
+- **Actions**: `CreateProject` and `UpdateProgress` only - the frozen
+  Project action set also has `AddMilestone`/`AddTask`
+  (architecture-freeze report §C), out of scope (they need
+  `Milestone`/`Task`, which do not exist). **Both actions' confirmation
+  floor is `EXPLICIT_ADD`** (architecture-freeze report §F's
+  confirmation table lists both explicitly) - `UpdateProgress` is
+  deliberately *not* `IMPORTANT_CHANGE` like `UpdateGoal`; this is a
+  frozen difference, not an oversight.
+- **Cross-entity reference validation**: `CreateProject`'s optional
+  `goal_id` is checked against a real database read
+  (`storage::project_repo::goal_exists`) *before* persistence, returning
+  a new structured `ValidationError::ReferencedGoalNotFound` rather than
+  relying on the SQL foreign-key constraint (which is declared in the
+  V2 migration for documentation/defense-in-depth but not enforced at
+  runtime - `PRAGMA foreign_keys` is not set, unchanged from Goal-only
+  behavior). Proven for all four required cases: no `goal_id` succeeds,
+  a valid `goal_id` succeeds and the link survives close/reopen, a
+  nonexistent `goal_id` is rejected with zero rows written, and reading
+  the project back returns the same linked `GoalId`.
+- **Atomicity from day one**: `create_project`/`update_progress` use the
+  exact same `&mut Connection` + `rusqlite::Transaction` +
+  `CoreError`-on-any-failure shape as the hardened Goal actions - proven
+  again with two forced-audit-failure tests
+  (`req_p13`/`req_p14`), not assumed to transfer automatically just
+  because the code looks similar.
+- **Migration compatibility proven, not assumed**: a dedicated test
+  builds a database frozen at V1 only (real Goal data, no `projects`
+  table - the actual shape of an existing user's database before this
+  update), then reopens it normally (applying only the newly-pending V2
+  migration) and confirms the original Goal data is unchanged and a new
+  Project can reference it. `V1__create_goals.sql` itself was not
+  edited.
+- **DRY cleanup carried out alongside, not deferred**: `goal_repo.rs`'s
+  `actor_str`/`provenance_str`/`confirmation_class_str`/`parse_rfc3339`
+  helpers were promoted to `storage/mod.rs` (`pub(super)`, reachable by
+  both repo modules) rather than duplicated into `project_repo.rs`;
+  `actions::goal_blocks_until_confirmed` was renamed to
+  `blocks_until_confirmed` (it was already entity-generic logic under a
+  Goal-specific name) rather than adding a second, identical
+  `project_blocks_until_confirmed`.
+- **Read side stays narrow**: only an internal `get_project(id)` was
+  added. The frozen capability API's minimum function set
+  (architecture-freeze report §I) does not list any Project-specific
+  read (no `get_projects()`/`get_active_projects()`) - only a generic,
+  unspecified `get_progress()` - so no list/read capability was
+  invented.
+
+Full evidence, exact SQL, and every test result:
+`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
+
+### 4e. What's still architecturally frozen but not yet implemented
+
+Personal Knowledge Layer, `GoalRelation`/goal relations, `Milestone`/
+`Task`/`Challenge`/`Plan`/`SolutionAttempt`/`Outcome`/`CalendarEvent`/
+`Reminder`/`Question`/`ProgressUpdate`/`WellbeingCheckin`, the rest of
+the frozen action list (`AddMilestone`/`AddTask` for Project included),
+`ForgetMemory`'s corrected (hard-delete) semantics, the `knowledge`/
+`backup` modules, a real `capability` module, NeXa transport. Full
+detail: `docs/LIFEOS_SPEC.md` §5.1-§5.6.
 
 ### Next implementation step (M2)
 
-Repeat the now-hardened pattern for **`Project`** (it already references
-`Goal` via a nullable `goal_id` in the frozen domain model - a good
-second entity to prove the pattern handles a cross-entity relationship).
-Reuse `domain → actions → services → services::storage::project_repo`,
-applying the same atomicity/typed-error/`FieldPatch` discipline from the
-start rather than retrofitting it afterward. Do not implement Milestone
-in the same pass, and do not invent product rules (like the removed
-terminal-status one) inside the implementation - flag them as open
-questions instead.
+A third domain entity or `GoalRelation` (the first cross-entity
+relationship *graph*, distinct from the `Goal`/`Project` direct foreign
+keys already proven). Whichever is chosen, reuse
+`domain → actions → services → services::storage::<entity>_repo` with
+the same atomicity/typed-error discipline applied from the start (as
+Project did, not retrofitted afterward like Goal needed). Do not
+implement Milestone/Task in the same pass as whatever is chosen, and do
+not invent product rules inside the implementation - flag them as open
+questions instead (§4c's lesson from the removed terminal-status rule,
+reinforced by §4d's `Project.progress` field being flagged rather than
+silently added).
 
 ---
 
@@ -347,9 +446,10 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   11. `docs: close M1, freeze M2 architecture, fix reporting policy`
   12. `feat: prove M2 encrypted storage (SQLCipher) and correct architecture errata`
   13. `feat: implement first M2 Goal vertical slice`
-  14. (this run) `fix: harden M2 Goal action atomicity and patch semantics`
-      — see this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-14 were not
+  14. `fix: harden M2 Goal action atomicity and patch semantics`
+  15. (this run) `feat: implement M2 Project vertical slice` — see this
+      run's report and chat reply for the exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8-15 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -363,51 +463,60 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 ## 8. What can the user actually do right now?
 
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
-unchanged, no real goals visible there yet (no Tauri command wiring).
-Separately, `cd src-tauri && cargo test -- --test-threads=1` runs 42
-tests proving: the storage foundation (9, regression from the spike), a
-full CreateGoal/UpdateGoal/get_active_goals lifecycle - now including
-atomic-rollback-under-forced-failure and tri-state patch semantics -
-against a real encrypted, migrated, production-schema database (17), and
-direct action-layer validation/classification logic with no DB involved
-(16) - all passing against temp databases, never the user's real data.
+unchanged, no real goals or projects visible there yet (no Tauri command
+wiring). Separately, `cd src-tauri && cargo test -- --test-threads=1`
+runs 66 tests proving: the storage foundation (9, regression from the
+spike), a full CreateGoal/UpdateGoal/get_active_goals lifecycle
+including atomic-rollback-under-forced-failure and tri-state patch
+semantics (17 integration + 16 direct action-layer unit), and a full
+CreateProject/UpdateProgress/get_project lifecycle including its own
+atomic-rollback proof, cross-entity `goal_id` reference validation, and
+a V1-to-V2 migration-compatibility check (14 integration + 10 direct
+action-layer unit) - all passing against temp databases, never the
+user's real data.
 
 ---
 
 ## 9. Next recommended step
 
-Implement the `Project` vertical slice using the now-hardened pattern
-proven for `Goal` (§4b-§4c) - `domain::Project` (with a nullable
-`goal_id` foreign key), `actions::{CreateProject, AddMilestone, AddTask,
-UpdateProgress}` (or at minimum `CreateProject`/`UpdateProject` first,
-matching Goal's scope) using atomic transactions + typed `CoreError` +
-`FieldPatch` from the start, `services::storage::project_repo`, and a
-production migration `V2__create_projects.sql`. Do not implement
-Milestone/Task in the same pass - repeat the "one entity, fully proven"
-discipline, and do not invent unfrozen product rules inside the
-implementation (§4c's lesson from the removed terminal-status rule).
+A third domain entity or `GoalRelation` - see §4e for the exact
+reasoning (this duplicates §4e's "Next implementation step" so it is
+visible without scrolling past the M2 detail section).
 
 ---
 
 ## 10. Known problems / risks / unresolved questions
 
-- **Neither Goal nor the storage bootstrap is wired into the running
-  app** — no Tauri command layer exists yet; `services`' functions are
-  only reachable from tests.
+- **Neither Goal nor Project (nor the storage bootstrap) is wired into
+  the running app** — no Tauri command layer exists yet; `services`'
+  functions are only reachable from tests.
+- **`Project.progress` is a documented interpretation, not a literal
+  frozen field** — the architecture-freeze report's one-line Project
+  field table does not list `progress` explicitly (unlike Goal's row,
+  which does); it was added because the frozen `UpdateProgress` action
+  needs something to mutate and a separate, unimplemented, polymorphic
+  `ProgressUpdate` log entity (GOAL/PROJECT/TASK) exists in the freeze
+  for what might be the "real" intended mechanism. Flagged explicitly in
+  the Project report §3, not silently decided - revisit if
+  `LIFEOS_SPEC.md` is ever updated to resolve this explicitly.
 - **`bundled-sqlcipher`'s build-time OpenSSL dependency is real but no
   longer hardcoded** — any machine building this needs
   `scripts/setup-windows-storage-env.ps1` run once (§4a).
 - **Clean-machine runtime is inferred from `dumpbin`, not an actual
   execution test** on a machine that never had any dev tooling installed
   — not available in this environment.
+- **`projects.goal_id`'s foreign key is declared but not enforced at
+  runtime** — `PRAGMA foreign_keys` is never set (unchanged, matches
+  Goal-only behavior); `CreateProject`'s application-level existence
+  check (`storage::project_repo::goal_exists`) is the actual enforcement
+  mechanism, not the SQL constraint - deliberate, not an oversight (see
+  the Project report §5), but worth remembering if a future direct-SQL
+  debugging session assumes the constraint is live.
 - **The Personal Knowledge Layer's `Relation.relation_type`** remains an
   intentionally free string — revisit once M6 usage patterns exist.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
-  past) — pre-existing gap, not introduced or expanded this run, and
-  intentionally left out of the hardening scope (not one of the 7 issues
-  architectural review flagged); revisit if it turns out to matter in
-  practice.
+  past) — pre-existing gap, unchanged again this run.
 - **`CoreError` derives `Debug`, which does include the internal
   `diagnostic` string** (only `Display` is deliberately generic/safe) -
   fine for test assertions and future internal logging, but a future
@@ -415,10 +524,10 @@ implementation (§4c's lesson from the removed terminal-status rule).
   `Display`/`kind()`, never `{:?}`, or the "no arbitrary database string
   as the authoritative error" guarantee leaks back in through the side
   door.
-- **`GoalRelation` is still schema-frozen only, not implemented** - the
-  hardening run corrected `LIFEOS_SPEC.md` §5.2's overclaim that the V1
-  Goal migration already contains it; it needs its own vertical slice
-  before M2 is complete (§4d).
+- **`GoalRelation` is still schema-frozen only, not implemented** - it
+  needs its own vertical slice before M2 is complete (§4e); `Project`'s
+  `goal_id` is a plain FK on Project itself, not the `GoalRelation`
+  graph, and does not substitute for it.
 - **Exact NeXa transport, exact confirmation-class UX (modal/inline/
   toast)** — both deferred, unchanged.
 - Everything already listed as pending from M1/M2-freeze (local/cloud

@@ -8,16 +8,20 @@ sources, alternatives, and REUSE/ADAPT/REJECT verdicts) lives in
 `../CLAUDE.md`.
 
 Status (2026-09-17): M0/M1 done and accepted. M2's storage foundation is
-proven and hardened for production use, and one real domain entity -
-Goal - is implemented and hardened end to end (validated atomicity,
+proven and hardened for production use. Two real domain entities are
+implemented: **Goal** (implemented, then hardened - validated atomicity,
 typed errors, tri-state patch semantics; see the M2 Goal hardening
-report). The rest of the M2 domain model (Project, Task, Calendar,
-Personal Knowledge, `GoalRelation`, Goal Intelligence, and the rest of
-the frozen action set) is still in progress - not implemented yet. M3 is
-not started. See `PROJECT_STATE.md` for exactly what exists; most of
-this document still describes design targets for later milestones, not
-built functionality — §5.1-§5.6 in particular are a frozen
-*architecture*, only partially code so far (Goal only).
+report) and **Project** (implemented directly with the hardened pattern
+- `CreateProject`/`UpdateProgress` only, its first cross-entity
+relationship to `Goal` proven; see the M2 Project vertical-slice
+report). The rest of the M2 domain model (Task, Calendar, Personal
+Knowledge, `GoalRelation`, Goal Intelligence, and the rest of the frozen
+action set, including Project's own `AddMilestone`/`AddTask`) is still
+in progress - not implemented yet. M3 is not started. See
+`PROJECT_STATE.md` for exactly what exists; most of this document still
+describes design targets for later milestones, not built functionality
+— §5.1-§5.6 in particular are a frozen *architecture*, only partially
+code so far (Goal and Project).
 
 ---
 
@@ -284,13 +288,17 @@ primary one.
 
 Status: **architecture frozen at M2** (2026-09-17); the storage layer is
 **PROVEN** (2026-09-17, storage spike) and now **hardened for production
-use**, and the first real domain entity, **Goal, is implemented**
-end-to-end (2026-09-17, Goal vertical slice) — the rest of the domain
-model (Project, Task, Calendar, Personal Knowledge, Goal Intelligence)
-is not yet started. Full reasoning, tradeoffs, and evidence behind every
-decision in this section: `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
-`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`, and
-`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`. Original
+use**. Two real domain entities are implemented end-to-end: **Goal**
+(2026-09-17, vertical slice + hardening) and **Project** (2026-09-17,
+vertical slice, built directly with the hardened pattern) — the rest of
+the domain model (Task, Calendar, Personal Knowledge, `GoalRelation`,
+Goal Intelligence) is not yet started. Full reasoning, tradeoffs, and
+evidence behind every decision in this section:
+`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
+`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`,
+`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`, and
+`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`. Original
 research: `RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
@@ -371,8 +379,10 @@ Field-level detail: M2 report §C. Frozen entities: `Goal`, `GoalRelation`
 specifically because the capability API's `log_wellbeing()`, §10.1,
 needed something real to persist — not originally in this list, flagged
 in the M2 report as a deliberate small addition, not scope creep).
-**Implementation status (2026-09-17): only `Goal` is implemented** (with
-its own hardened vertical slice); every other entity in this list,
+**Implementation status (2026-09-17): `Goal` and `Project` are
+implemented** (Goal with its own hardened vertical slice; Project built
+directly with that hardened pattern - `CreateProject`/`UpdateProgress`
+only, not `AddMilestone`/`AddTask`); every other entity in this list,
 `GoalRelation` included, is schema-frozen only — see §5.2's correction
 and `PROJECT_STATE.md` §9 for which one is next.
 
@@ -944,8 +954,17 @@ reordered against `PROJECT_STATE.md`'s current reality).
   2026-09-17 (§5.1-§5.6, `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`).
   Storage layer PROVEN 2026-09-17 (SQLCipher via `rusqlite`
   `bundled-sqlcipher`, not `sqlite3mc` — see §5 and
-  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`); schema/action
-  implementation not yet started. Local encrypted SQLite, secure key
+  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`) and hardened for
+  production use the same day (spike/production separation, no
+  committed machine-specific config). `Goal` is implemented **and**
+  hardened (atomic mutation+audit, typed `CoreError`, `FieldPatch`
+  semantics — `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+  `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`). `Project` is
+  also implemented (`CreateProject`/`UpdateProgress`, its `goal_id` link
+  to `Goal` proven — `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`),
+  built directly with the hardened pattern. The remainder of the M2
+  domain model is still in progress — a third entity or `GoalRelation`
+  is next (`docs/PROJECT_STATE.md` §9). Local encrypted SQLite, secure key
   handling (`keyring`), migrations (`refinery`), core action
   architecture (§2, §5.4-§5.6), initial profile/settings. No AI
   dependency for CRUD (AI-optional resilience, §2).
