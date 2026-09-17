@@ -4,17 +4,17 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 `RESEARCH_DECISIONS.md`, at the start of every session. Update it at the
 end of every substantial run (`CLAUDE.md`, step 6).
 
-Last updated: 2026-09-17 (M1 visual refinement run #2 — Home drawers,
-face geometry, constellation background, Chat sidebar).
+Last updated: 2026-09-17 (M1 navigation correction — full-screen edge
+transitions, global sidebar removed, NeXa Island is sole global nav).
 
 ---
 
 ## 1. What exists right now
 
 **A Tauri 2 + React + TypeScript desktop app that launches successfully
-in a real window on this machine, with a refined visual shell (M1).** No
-domain code, no database, no AI, no chat logic — those are later
-milestones (`LIFEOS_SPEC.md` §12). M2 has **not** started.
+in a real window on this machine, with a corrected navigation model
+(M1).** No domain code, no database, no AI, no chat logic — those are
+later milestones (`LIFEOS_SPEC.md` §12). M2 has **not** started.
 
 Repository contents as of this run:
 
@@ -28,15 +28,17 @@ LiFeOS/
 ├── docs/
 │   ├── LIFEOS_SPEC.md
 │   ├── RESEARCH_DECISIONS.md
-│   └── PROJECT_STATE.md   (this file)
+│   ├── PROJECT_STATE.md   (this file)
+│   └── reports/            REPORT_UI_REFINEMENT_..._2026-09-17.md,
+│                            REPORT_NAVIGATION_CORRECTION_..._2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/                 (default Tauri/Vite icons)
 ├── src/                    (React frontend)
 │   ├── main.tsx, App.tsx, App.css
 │   ├── components/   Galaxy, NexaFace, RadialMenu, EdgeDrawers,
-│   │                  CommunicationDisplay, NexaIsland, SideNavigation,
-│   │                  ScreenShell, ChatScreen, ChatSidebar,
-│   │                  PlaceholderScreen
+│   │                  CommunicationDisplay, NexaIsland, ScreenShell,
+│   │                  ChatScreen, ChatSidebar, PlaceholderScreen
+│   │                  (SideNavigation.tsx was deleted this run - see §1a)
 │   └── state/         faceState.ts, navigation.ts
 └── src-tauri/               (Rust backend)
     ├── src/main.rs, src/lib.rs   (no domain commands yet - run() only)
@@ -48,91 +50,71 @@ LiFeOS/
 `node_modules/`, `dist/`, and `src-tauri/target/` exist on disk but are
 gitignored and untracked, as intended.
 
-### M1 status: first launch confirmed, second visual refinement pass complete
+### M1 status: navigation model corrected (third pass this milestone)
 
-The MSVC "Desktop development with C++" workload blocker is resolved
-(unchanged from the prior run). This run is a **second visual refinement
-pass**, driven by user feedback on the first refinement pass: Home's
-edge drawers (removed in refinement #1 for looking like prototype tabs)
-are back in a more deliberate, hidden-by-default form; the NeXa face
-geometry, background motion, and Chat's sidebar were all adjusted per
-specific feedback. Full detail and reasoning:
-`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`.
+Two prior visual-refinement passes got the *look* closer but the
+*navigation model* wrong: edge drawers were small preview panels with an
+"Open X" button, and a permanent global sidebar (Home/Today/Chat/.../
+Settings) was showing inside every open section. This run corrects both,
+per explicit feedback. Full detail and reasoning:
+`docs/reports/REPORT_NAVIGATION_CORRECTION_FULLSCREEN_EDGE_TRANSITIONS_2026-09-17.md`
+(this run) and
+`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`
+(prior run, background/face/drawer-restoration detail still accurate).
 No architecture, backend, or milestone progression - M2 has not started.
 
-### What the visual shell does now, after this refinement
+### 1a. Current navigation model (canonical as of this run)
 
-**Home (default state):**
-- Very dark, almost-black galaxy background with a clustered (not evenly
-  random) star field - now ~8 clusters + 100 sparse background stars
-  (roughly double the prior pass) - ~97% neutral cool-white stars / ~3%
-  sparse warm orange, yellow, or cool-blue stars, two low-opacity nebula
-  haze blobs, and a clearly perceptible (but still slow and calm) drift:
-  star field over ~100s, haze over ~130-160s, both with larger amplitude
-  than before. One deliberately larger, brighter **constellation
-  formation** (6-7 connected points with a faint connecting line) sits in
-  the upper-right as a single visible anchor shape.
-- A large, centered, dominant NeXa face (two elongated rounded eyes,
-  simple smile sitting further below the eyes, soft glow, gentle idle
-  float/breathing/blink/eye-drift) - sized via `clamp(320px, 40vmin,
-  520px)`.
-- Clicking the face toggles a radial ring of 8 dark-glass pills (Today,
-  Chat, Calendar, Goals, Projects, Money, Me, Insights) around a shrunk
-  face; clicking again (or selecting a screen) closes it.
-- A reusable **CommunicationDisplay**: the same face slides to the left
-  and an unboxed, editorial-style message appears on the right with a
-  single glass "Close" button. Demo-triggered once, ~1.1s after load, so
-  it's visually reachable without a prototype trigger button; dismissing
-  it returns Home. This is explicitly demo content, not real intelligence
-  (`src/App.tsx`, `DEMO_GREETING`).
-- **Edge drawers restored, redesigned to be hidden by default:** small,
-  low-opacity tab handles at each screen edge (Top: Notifications,
-  Settings · Left: Dashboard, Goals · Right: Projects, Me/Insights ·
-  Bottom: Chat) open a glass panel sliding in from that edge with a short
-  blurb and, where a real screen exists, an "Open X" button. Only one
-  panel open at a time; a scrim or re-clicking the handle closes it
-  cleanly back to Home. Not the old permanently-visible prototype tabs.
+**Home** (unchanged in kind): large centered NeXa face, click-to-open
+radial menu (8 sections), edge handles at all four screen edges, dark
+cosmic galaxy background. Home does not use the NeXa Island - the large
+face is Home's own navigation center.
 
-**Full-screen sections (Chat, Today, Calendar, Goals, Projects, Money,
-Me, Insights, Settings):**
-- Shared `ScreenShell` layout: a slim dark-glass `SideNavigation` rail on
-  the left (Home + all 9 sections, active-state highlight), a compact
-  floating `NexaIsland` (small glass circular tile with the animated face
-  inside, Dynamic-Island-style) near the top, and a content area - the
-  galaxy stays visible behind all of it.
-- Clicking the island opens a small quick menu (Home / Menu); Menu
-  expands a compact list of all sections to jump directly, without a
-  detour through Home.
-- The old standalone "← Home" corner button and the generic "This screen
-  is a navigation placeholder" text are gone.
-- **Chat** has real (visual-only) shell, now with its **own dedicated
-  chat sidebar** (`ChatSidebar` - New Chat, a search field, and a demo
-  chat list with 3 conversations) rendered alongside the global
-  `SideNavigation`, not replacing it - the two are visually distinct
-  (icon rail vs. rounded glass list panel) and serve different purposes
-  (app section vs. which conversation). Selecting a chat swaps in that
-  chat's own small demo transcript (NeXa-left / user-right bubbles,
-  restrained dark glass, no AI); "New Chat" shows an empty state instead
-  of a fake saved entry. A bottom input bar ("Message NeXa...", disabled
-  send/attach) remains visual-only, no backend.
-- Every other section uses a shared `PlaceholderScreen`: a clean heading
-  and one honest line naming which milestone brings real content (no
-  fake dashboards).
+**Edge handles now open the real screen directly** - no more
+intermediate preview panel. Clicking a handle immediately opens the full
+section, sliding in from that edge and filling the viewport:
+- **Top:** Notifications, Settings (slide down)
+- **Left:** Dashboard (→ `today`), Goals (slide in from left)
+- **Right:** Projects, Me, Insights (slide in from right)
+- **Bottom:** Chat (slides up)
 
-**Still not implemented (unchanged from before):** any backend/database/
-AI/voice/memory. `LISTENING`, `LOCAL_PROCESSING`, `WAITING_FOR_CLOUD`,
-`SPEAKING` face states have matching CSS but no real trigger yet - only
-`IDLE` and a click-triggered `ATTENTION` bounce run for real.
+**No permanent global sidebar exists anywhere anymore.**
+`SideNavigation.tsx` was deleted. Every full-screen section (Chat,
+Today, Calendar, Goals, Projects, Money, Me, Insights, Settings,
+Notifications) renders through `ScreenShell`, which now contains only
+the `NexaIsland` and the section's own content - no app-wide navigation
+rail.
+
+**The NeXa Island is the sole persistent global navigation element**
+while a section is open: a small dark-glass circular tile (Dynamic-
+Island-style) with the animated face inside, centered near the top.
+Clicking it opens a small quick menu: **Home** (closes the current
+section, animates back out the way it entered, restores the large Home
+face) and **Menu** (expands a compact list of every section to jump
+directly, without returning Home first). Clicking the island again
+closes the quick menu.
+
+**Chat keeps its own dedicated sidebar** (`ChatSidebar` - New Chat,
+search placeholder, demo chat list with per-chat transcripts) - this is
+Chat's own feature, unaffected by the global-sidebar removal, and sits
+directly inside Chat's content area, not as global navigation.
+
+**Transitions:** entering a screen from an edge slides the whole section
+in from that edge (CSS `@keyframes`, ~460ms); entering from the radial
+menu or the Island's quick menu uses a calm fade+scale instead (no
+literal edge to slide from). Returning Home reverses whichever motion
+the screen entered with (CSS transition, ~420ms), keyed off the same
+`entryDirection` the screen was opened with. See the navigation-
+correction report §4-§5 for the exact state model and CSS mechanism.
 
 ### Visual verification status (IMPORTANT)
 
-**This second refinement pass has NOT been visually re-verified by you
+**This navigation correction has NOT been visually re-verified by you
 yet.** `npm run build` and `cargo check` both pass (§3), which proves the
-code compiles and type-checks - it does **not** prove the edge drawers,
-face geometry, strengthened background motion/constellation, or Chat
-sidebar actually look right. Per `CLAUDE.md`, automated build success
-must not be reported as a visual PASS. Run `npm run tauri dev` and look
-at it.
+code compiles and type-checks - it does **not** prove the four slide
+directions, the reverse-close motion, or the Island's quick menu actually
+look and feel right. Per `CLAUDE.md`, automated build success must not be
+reported as a visual PASS. Run `npm run tauri dev` and look at it.
 
 ---
 
@@ -144,36 +126,31 @@ at it.
 | Node.js / npm | `v24.18.0` / `11.1.0` |
 | Git | `2.47.1.windows.2` |
 | WebView2 Runtime | `153.0.4234.32` |
-| Visual Studio "Desktop development with C++" workload | **Installed (by you, manually) — resolved between the last run and this one** |
-
-The manual unblock step recorded previously in this document is no
-longer needed and has been removed. `cargo check --manifest-path
-src-tauri/Cargo.toml` now compiles the whole dependency graph and links
-successfully (see §3 for this run's exact output).
+| Visual Studio "Desktop development with C++" workload | Installed (by you, manually) |
 
 **Standing note, still true:** this automated session cannot perform
-admin-elevated installs on this machine (confirmed in the prior run - two
-elevation approaches both failed). This will recur for any future
+admin-elevated installs on this machine. This will recur for any future
 milestone needing one (code signing, driver-level audio work for voice,
 etc.) and will need the same human-in-the-loop step again.
 
 ---
 
-## 3. M1 status — Visual shell refinement #2 (BUILDS CLEAN, VISUAL RE-VERIFICATION PENDING)
+## 3. M1 status — Navigation correction (BUILDS CLEAN, VISUAL RE-VERIFICATION PENDING)
 
 | Test | Command | Result |
 |---|---|---|
-| Frontend build | `npm run build` (`tsc && vite build`) | **PASS** — 28 modules transformed, built in 142ms, no TypeScript errors |
-| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | **PASS** — full dependency graph compiled and linked in 9.30s, no errors |
-| Real window appears | (visual) | Previously confirmed by you, before either refinement pass |
-| Home edge drawers (open/close, all 4 edges) | (visual) | **NOT YET VERIFIED** — new this pass |
-| Face geometry (elongated eyes, lower mouth) | (visual) | **NOT YET VERIFIED** — new this pass |
-| Background motion + constellation | (visual) | **NOT YET VERIFIED** — new this pass |
-| Chat sidebar (New Chat, chat list, per-chat transcript) | (visual) | **NOT YET VERIFIED** — new this pass |
+| Frontend build | `npm run build` (`tsc && vite build`) | **PASS** — 27 modules transformed, built in 165-175ms, no TypeScript errors |
+| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | **PASS** — full dependency graph compiled and linked in 9.49s, no errors |
+| Real window appears | (visual) | Previously confirmed by you, before any refinement pass |
+| Edge-triggered full-screen slide transitions (all 4 directions) | (visual) | **NOT YET VERIFIED** — new this pass |
+| Reverse slide-out on returning Home | (visual) | **NOT YET VERIFIED** — new this pass |
+| No global sidebar visible on any open section | (visual) | **NOT YET VERIFIED** — implemented and code-inspected, not eyeballed |
+| NeXa Island quick menu (Home / Menu) as sole global nav | (visual) | **NOT YET VERIFIED** — new this pass |
+| Chat sidebar still present and distinct | (visual) | **NOT YET VERIFIED** — unchanged code, but not re-looked-at |
 
 No LifeOS-authored code changes caused any build/check failure this run.
 Full change detail:
-`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`.
+`docs/reports/REPORT_NAVIGATION_CORRECTION_FULLSCREEN_EDGE_TRANSITIONS_2026-09-17.md`.
 
 ---
 
@@ -191,15 +168,15 @@ this file.)
 - Git 2.47.1.windows.2, Node v24.18.0, npm 11.1.0, Python 3.12.7
 - Rust: rustc 1.98.1, cargo 1.98.1
 - Ollama: still not installed (needed starting M4)
-- Visual Studio: Community 2022, 17.13.35931.197, **C++ workload now installed** (see §2)
+- Visual Studio: Community 2022, 17.13.35931.197, C++ workload installed
 - WebView2 Runtime: 153.0.4234.32 present
 
 ### NeXa local accessibility (unchanged, carried forward)
 
 No live NeXa git repository is accessible from this environment — only
-Desktop planning documents (docx/txt). See prior audit detail in git
-history; conclusion unchanged: `RESEARCH_DECISIONS.md` §3 treats NeXa as
-prior research, not a code dependency.
+Desktop planning documents (docx/txt). Conclusion unchanged:
+`RESEARCH_DECISIONS.md` §3 treats NeXa as prior research, not a code
+dependency.
 
 ---
 
@@ -217,70 +194,75 @@ prior research, not a code dependency.
   6. `feat: scaffold Tauri 2 + React + TS app and build the M1 visual shell`
   7. `docs: record M0/M1 build-start results`
   8. `feat: refine M1 visual shell and NeXa navigation`
-  9. (this run) `feat: restore home edge drawers, refine face/background,
-     add chat sidebar` — see this run's report and chat reply for the
-     exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8 and 9 were not
-  pushed** — not authorized in either run's instructions.
+  9. `feat: restore home edge drawers, refine face/background, add chat sidebar`
+  10. (this run) `fix: full-screen edge transitions, remove global
+      sidebar, NeXa Island as sole global nav` — see this run's report
+      and chat reply for the exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8, 9, and 10 were
+  not pushed** — not authorized in any of those runs' instructions.
 
-### Note on an incident in a prior run (kept for reference)
+### Note on an incident in an earlier run (kept for reference)
 
 `npm create tauri-app@latest -- . --force` briefly deleted `CLAUDE.md`
 and all `docs/*.md` files and overwrote `.gitignore` during the original
 M1 scaffold. Both were restored immediately via `git checkout` since
-everything was already committed - no data was lost. Not relevant to this
-run (no scaffolding tool was used), kept here as a standing lesson for
-any future scaffold-into-existing-directory operation.
+everything was already committed - no data was lost. Kept here as a
+standing lesson for any future scaffold-into-existing-directory
+operation.
 
 ---
 
 ## 6. What can the user actually do right now?
 
-Launch the real app (`npm run tauri dev`) and see the refined visual
-shell described in §1 - a large centered NeXa face with elongated eyes on
-a calm, clearly-moving dark galaxy with a visible constellation, edge
-drawers at all four screen edges, a radial menu, a demo focused-message
-display, and full-screen sections - especially Chat, which now has its
-own chat-list sidebar alongside the global navigation. There is still no
-real functionality behind any of it - no data, no AI, no persistence - by
-design, this is a visual milestone.
+Launch the real app (`npm run tauri dev`) and see: a large centered NeXa
+face on a calm dark galaxy with a visible constellation; a radial menu
+and four edge handles on Home; clicking any of them opens the real
+section as a full-screen slide-in from that direction, with only the
+compact NeXa Island (not a sidebar) persisting as global navigation;
+Chat additionally has its own conversation-list sidebar. There is still
+no real functionality behind any of it - no data, no AI, no persistence -
+by design, this is a visual/interaction milestone.
 
 ---
 
 ## 7. Next recommended step
 
-**You:** run `npm run tauri dev` and visually review this second
-refinement pass specifically: do the four edge drawers open/close
-smoothly and feel like intentional handles rather than clutter; does the
-face read correctly with the new eye/mouth geometry; does the background
-motion feel alive-but-calm now (not too much, not too little) and is the
-constellation visible; does the Chat sidebar clearly read as "which
-conversation" rather than a second copy of the app's section menu. Report
-back anything that doesn't match so it can be corrected before M2
-(LifeOS Core + encrypted storage) begins.
+**You:** run `npm run tauri dev` and visually review this correction
+specifically: do the four edge-to-fullscreen transitions feel right
+(direction, speed, "premium" feel); does returning Home via the Island
+correctly reverse the same motion; is the global sidebar really gone
+from every section; does the Island's quick menu (Home / Menu) work as
+the only way to navigate while a section is open. Report back anything
+that doesn't match so it can be corrected before M2 (LifeOS Core +
+encrypted storage) begins.
 
 ---
 
 ## 8. Known problems / risks / unresolved questions
 
-- **This second visual refinement has not been visually re-verified yet**
+- **This navigation correction has not been visually re-verified yet**
   (§1, §3) - only compile/type-check evidence exists so far.
-- **A one-off dated report file was created for this pass**
-  (`docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md`),
-  explicitly requested by the user, but this directly conflicts with
+- **One-off dated report files continue to be created per explicit
+  request** (`docs/reports/*.md`, now two of them), still in tension with
   `CLAUDE.md`'s standing "Documentation policy" (no one-off/dated report
-  files). Flagged in this run's chat reply; `CLAUDE.md` was not amended
-  since it wasn't clear whether this should become a standing pattern or
-  stay a one-time exception - worth resolving explicitly before it
-  recurs.
-- The Home-drawer label "Dashboard" refers to the same screen the rest of
-  the app calls "Today" (`today` `ScreenId`) - a deliberate, narrow
-  naming inconsistency scoped to that one drawer handle, per the
-  instruction to keep the global navigation structure unchanged. Flag if
-  this should be reconciled either direction.
+  files). Not yet resolved either direction - worth an explicit decision
+  soon given this is now a recurring pattern, not a single exception.
+- **"Me / Insights" (one item in the original brief) became two separate
+  edge handles** ("Me" and "Insights") this run, since a single handle
+  can no longer offer a choice once the preview-panel step was removed.
+  Flag if a single combined handle was actually wanted instead.
+- **Notifications is now a real (placeholder) `ScreenId`** with its own
+  `PlaceholderScreen` (milestone: M7), added so its Top edge handle has
+  something real to open. Previously it was a drawer-only concept with
+  no full screen.
+- Screen-to-screen navigation via the Island's "Menu" list does not
+  animate an exit of the previously-open screen (only entry of the new
+  one) - a deliberate simplification, not a bug.
+- The Home-drawer label "Dashboard" still refers to the same screen the
+  rest of the app calls "Today" (`today` `ScreenId`) - unchanged
+  deliberate naming choice from the prior pass.
 - Star cluster and constellation placement in `Galaxy.tsx` is randomized
-  per page load (no fixed seed) - the exact look will vary slightly
-  between launches.
+  per page load (no fixed seed).
 - **This automated session still cannot perform admin-elevated installs**
   on this machine - will recur for any future milestone needing one.
 - No local helper LLM (Qwen3 4B) has been downloaded, installed, or
@@ -294,10 +276,4 @@ back anything that doesn't match so it can be corrected before M2
   AGPL prior art noted in `RESEARCH_DECISIONS.md` §5).
 - Bilingual (PL/EN) detection/normalisation mechanism is a stated design
   target (`LIFEOS_SPEC.md` §1.3) with no implementation yet — nothing in
-  the UI is language-aware, including this run's new Chat demo content
-  (English only).
-- The side-navigation item order (Today first, Settings last) and the
-  quick-menu "Menu" behavior (expanding a compact list rather than a
-  second radial layout) were judgment calls where the build-start brief
-  was ambiguous or gave only a "suggested" ordering - see this run's RUN
-  REPORT for the exact reasoning, in case you want it changed.
+  the UI is language-aware.

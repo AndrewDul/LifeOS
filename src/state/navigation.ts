@@ -1,8 +1,6 @@
 /**
- * Primary radial menu ring (LIFEOS_SPEC.md §9.1, §9.2). Secondary ring
- * items (Memory, Quick Forms, Model/AI, Settings) stay off the radial
- * ring per spec - Settings is still reachable, but only from the side
- * navigation on full-screen sections, not the first ring.
+ * Primary radial menu ring (LIFEOS_SPEC.md §9.1, §9.2). Kept to 8 items
+ * on purpose - "do not overload the first radial ring".
  */
 export type ScreenId =
   | "today"
@@ -13,7 +11,8 @@ export type ScreenId =
   | "money"
   | "me"
   | "insights"
-  | "settings";
+  | "settings"
+  | "notifications";
 
 export interface ScreenDef {
   id: ScreenId;
@@ -32,16 +31,27 @@ export const PRIMARY_SCREENS: ScreenDef[] = [
 ];
 
 /**
- * Side navigation order for full-screen sections. Same order as the
- * radial ring (kept consistent on purpose) plus Settings appended -
- * Settings has no real content yet ("Settings later"), it is just
- * navigable as a placeholder like the others.
+ * Every navigable section, including ones off the radial ring
+ * (Settings, Notifications). There is no permanent global sidebar
+ * anymore - this list now only feeds the NeXa Island's compact quick
+ * menu, which is the sole persistent way to jump between sections while
+ * one is open.
  */
-export const SIDEBAR_SCREENS: ScreenDef[] = [
+export const ALL_SCREENS: ScreenDef[] = [
   ...PRIMARY_SCREENS,
   { id: "settings", label: "Settings" },
+  { id: "notifications", label: "Notifications" },
 ];
 
 export function screenLabel(id: ScreenId): string {
-  return SIDEBAR_SCREENS.find((s) => s.id === id)?.label ?? id;
+  return ALL_SCREENS.find((s) => s.id === id)?.label ?? id;
 }
+
+/**
+ * Where an opened screen entered from, driving its slide-in animation
+ * (and, in reverse, its slide-out when returning Home). "radial" covers
+ * both the radial menu and the NeXa Island's quick-menu navigation -
+ * neither has a literal screen edge to slide from, so both use a calm
+ * fade/scale instead of a directional slide.
+ */
+export type Direction = "top" | "bottom" | "left" | "right" | "radial";

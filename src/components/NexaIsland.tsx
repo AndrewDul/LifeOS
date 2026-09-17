@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { NexaFace } from "./NexaFace";
-import { SIDEBAR_SCREENS, type ScreenId } from "../state/navigation";
+import { ALL_SCREENS, type ScreenId } from "../state/navigation";
 import type { FaceState } from "../state/faceState";
 
 interface NexaIslandProps {
@@ -11,12 +11,14 @@ interface NexaIslandProps {
 }
 
 /**
- * Compact floating "island" (LIFEOS_SPEC.md §9.1 direction, M1 visual
- * refinement) shown while a full-screen section is open - a small dark
+ * Compact floating "island" (LIFEOS_SPEC.md §9.1 direction; canonical as
+ * of the M1 navigation correction) - the ONLY persistent global
+ * navigation element while a full-screen section is open. A small dark
  * glass tile holding the animated face, so NeXa still feels present.
  * Clicking it opens a small quick menu (Home / Menu); "Menu" expands a
- * compact list of the other sections. Deliberately kept small - this is
- * not a second full navigation system.
+ * compact list of the other sections, attached to the island itself -
+ * there is no permanent sidebar anywhere in the app anymore. Clicking
+ * the island again closes the quick menu.
  */
 export function NexaIsland({ faceState, currentScreen, onHome, onNavigate }: NexaIslandProps) {
   const [open, setOpen] = useState(false);
@@ -68,7 +70,7 @@ export function NexaIsland({ faceState, currentScreen, onHome, onNavigate }: Nex
           </button>
           {showList && (
             <div className="island-menu-list">
-              {SIDEBAR_SCREENS.map((s) => (
+              {ALL_SCREENS.map((s) => (
                 <button
                   key={s.id}
                   type="button"

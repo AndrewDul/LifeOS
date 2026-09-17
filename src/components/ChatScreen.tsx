@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { ScreenShell } from "./ScreenShell";
 import { ChatSidebar, type ChatListItem } from "./ChatSidebar";
-import type { ScreenId } from "../state/navigation";
+import type { Direction, ScreenId } from "../state/navigation";
 import type { FaceState } from "../state/faceState";
 
 interface ChatScreenProps {
   faceState: FaceState;
   onNavigate: (id: ScreenId) => void;
   onHome: () => void;
+  direction: Direction;
+  closing: boolean;
 }
 
 interface DemoMessage {
@@ -46,16 +48,23 @@ const DEMO_TRANSCRIPTS: Record<string, DemoMessage[]> = {
  * demo conversation only - no AI, no backend, no persistence. Traditional
  * message bubbles are appropriate here (unlike the unboxed
  * CommunicationDisplay), kept restrained and dark. The chat-specific
- * sidebar (New Chat / recent chats) is intentionally separate from the
- * global section navigation that ScreenShell already provides.
+ * sidebar (New Chat / recent chats) is Chat's own and stays - ScreenShell
+ * no longer provides a global sidebar at all, only the NeXa Island.
  */
-export function ChatScreen({ faceState, onNavigate, onHome }: ChatScreenProps) {
+export function ChatScreen({ faceState, onNavigate, onHome, direction, closing }: ChatScreenProps) {
   const [activeChatId, setActiveChatId] = useState<string>(DEMO_CHATS[0].id);
 
   const messages = activeChatId === NEW_CHAT_ID ? [] : DEMO_TRANSCRIPTS[activeChatId] ?? [];
 
   return (
-    <ScreenShell activeId="chat" faceState={faceState} onNavigate={onNavigate} onHome={onHome}>
+    <ScreenShell
+      activeId="chat"
+      faceState={faceState}
+      onNavigate={onNavigate}
+      onHome={onHome}
+      direction={direction}
+      closing={closing}
+    >
       <div className="chat-screen">
         <ChatSidebar
           chats={DEMO_CHATS}

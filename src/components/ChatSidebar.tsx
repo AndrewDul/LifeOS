@@ -13,11 +13,11 @@ interface ChatSidebarProps {
 
 /**
  * Chat's own dedicated sidebar (build-start visual-refinement brief §4) -
- * New Chat / recent chats, ChatGPT-style. This is deliberately separate
- * from the global SideNavigation (still rendered by ScreenShell to the
- * left of this) - one is "which app section", this is "which
- * conversation". No AI, no persistence: selecting a chat only changes
- * which demo transcript ChatScreen shows.
+ * New Chat / recent chats, ChatGPT-style. This is the only sidebar in
+ * the app - there is no global section-navigation rail anymore (that was
+ * removed from ScreenShell; the NeXa Island is the sole persistent
+ * global navigation element). No AI, no persistence: selecting a chat
+ * only changes which demo transcript ChatScreen shows.
  */
 export function ChatSidebar({ chats, activeChatId, onSelectChat, onNewChat }: ChatSidebarProps) {
   return (
