@@ -7770,8 +7770,10 @@ const DET_SERVICE: &str = "LifeOS-det-test";
 /// Requirement 1 (deterministic): DB absent + key absent -> a fresh key
 /// is generated, stored, AND is exactly the key the initializer used to
 /// create the database (not merely "some key was stored somewhere") -
-/// also checks the generated key's format (64 lowercase hex chars = 256
-/// bits).
+/// also checks the generated key's format is EXACTLY 64 lowercase
+/// hexadecimal characters (`0`-`9`, `a`-`f` only = 256 bits) - not
+/// merely `is_ascii_hexdigit()`, which would also accept uppercase
+/// `A`-`F` and so would not actually prove lowercase output.
 #[test]
 fn req_dkl1_db_absent_key_absent_generates_and_stores_key_and_creates_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -7804,8 +7806,10 @@ fn req_dkl1_db_absent_key_absent_generates_and_stores_key_and_creates_db() {
         stored.len()
     );
     assert!(
-        stored.chars().all(|c| c.is_ascii_hexdigit()),
-        "[req_dkl1] FAIL - stored key is not pure hex: {stored}"
+        stored
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "[req_dkl1] FAIL - stored key is not lowercase hex (0-9, a-f only): {stored}"
     );
     assert_eq!(
         Some(stored.clone()),
@@ -8042,8 +8046,16 @@ fn req_dkl6_pre_file_creation_failure_cleans_up_fresh_credential() {
 /// longer manufacture "db exists, credential absent" (Case C) as a side
 /// effect of its own cleanup path. Uses a custom initializer closure (not
 /// `bootstrap_db_at`, which cannot be made to fail deterministically
-/// AFTER writing a file) that writes bytes to `path` and then
-/// deliberately returns an error.
+/// AFTER writing a file) that writes SYNTHETIC (not real encrypted
+/// database) bytes to `path` and then deliberately returns an error.
+///
+/// What this proves: the DB/key ASSOCIATION is retained and a
+/// subsequent bootstrap attempt can retry with the same key. What this
+/// does NOT prove: that a genuinely partially-written encrypted database
+/// would itself be valid, that SQLCipher could successfully reopen it,
+/// or that migrations could successfully resume - actual recovery of a
+/// partially-created database is a separate, unproven question outside
+/// this test's synthetic-bytes initializer.
 #[test]
 fn req_dkl7_post_file_creation_failure_retains_fresh_credential() {
     let dir = tempfile::tempdir().unwrap();
@@ -8058,11 +8070,20 @@ fn req_dkl7_post_file_creation_failure_retains_fresh_credential() {
         DET_SERVICE,
         account,
         |p, _key_hex| {
-            // Simulates bootstrap_db_at creating/writing the db file
+            // Stands in for bootstrap_db_at creating/writing the db file
             // using the fresh key, THEN failing later (e.g. during
-            // verification or migration) - a partially-created but real
-            // file now exists at `p`.
-            std::fs::write(p, b"partially-initialized encrypted db bytes").unwrap();
+            // verification or migration) - a real FILE now exists at
+            // `p`, but its bytes are synthetic placeholder content, NOT
+            // an actual encrypted database. This test proves the
+            // credential-cleanup decision (retain, not delete) is
+            // correct once a file exists; it says nothing about whether
+            // a genuinely partially-written encrypted database would
+            // itself be recoverable.
+            std::fs::write(
+                p,
+                b"synthetic placeholder bytes, not a real encrypted database",
+            )
+            .unwrap();
             Err(BootstrapError::Io(std::io::Error::other(
                 "[req_dkl7] deliberate forced failure AFTER db file creation",
             )))

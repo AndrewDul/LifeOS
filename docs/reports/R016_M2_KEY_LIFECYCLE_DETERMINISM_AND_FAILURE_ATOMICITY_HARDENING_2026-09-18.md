@@ -281,8 +281,11 @@ reimplementation:
 1. `req_dkl1` - DB absent + key absent: a fresh key is generated,
    stored, and is *exactly* the key the initializer used to create the
    database (captured via a wrapping closure, not merely "some key was
-   stored somewhere"); also checks the key's format (64 lowercase hex
-   characters = 256 bits) and that exactly one `set()` call occurred.
+   stored somewhere"); also checks the key's format is EXACTLY 64
+   lowercase hexadecimal characters (`0`-`9`, `a`-`f` only - not merely
+   `is_ascii_hexdigit()`, which would also accept uppercase `A`-`F` and
+   so would not actually prove lowercase output) and that exactly one
+   `set()` call occurred.
 2. `req_dkl2` - DB exists + key exists: the exact same key is reused
    across two bootstraps, with zero additional `set()` calls on reuse.
 3. `req_dkl3` (CRITICAL) - DB exists + key absent: typed
@@ -301,15 +304,24 @@ reimplementation:
    call.
 7. `req_dkl7` (**the R016 fix, the critical new proof**) -
    initialization failure AFTER the database file has already been
-   created (a custom initializer closure writes bytes to `path`, then
-   returns an error - the one case `bootstrap_db_at` cannot be forced
-   into portably) - the freshly-generated credential is **retained**,
-   zero `delete()` calls; additionally, `resolve_master_key_with_store`
-   is called again against the same `(store, path)` afterward and
-   confirmed to resolve as `Reused` (Case B), never `FreshlyGenerated`
-   or `MasterKeyMissingForExistingDatabase` (Case C) - proving the
-   resulting state is genuinely safe to reopen, not merely "not
-   immediately broken".
+   created (a custom initializer closure writes SYNTHETIC bytes to
+   `path`, then returns an error - the one case `bootstrap_db_at`
+   cannot be forced into portably) - the freshly-generated credential
+   is **retained**, zero `delete()` calls; additionally,
+   `resolve_master_key_with_store` is called again against the same
+   `(store, path)` afterward and confirmed to resolve as `Reused` (Case
+   B), never `FreshlyGenerated` or `MasterKeyMissingForExistingDatabase`
+   (Case C). **What this proves, precisely:** the DB/key ASSOCIATION is
+   retained, LifeOS does not manufacture Case C as a side effect of its
+   own cleanup, and a subsequent bootstrap attempt can retry using the
+   same key. **What this does NOT prove:** the synthetic bytes
+   `req_dkl7`'s closure writes are not a real SQLCipher database, so
+   this test says nothing about whether an actual partially-created
+   database (real encrypted bytes, a migration interrupted mid-way)
+   would itself be valid, whether SQLCipher could successfully reopen
+   it, or whether migrations could successfully resume - that is a
+   separate, unproven recovery question, deliberately out of scope for
+   this pass.
 8. `req_dkl8` - initialization failure with a pre-existing credential
    (seeded) leaves it completely untouched regardless of whether a
    database file now exists - `delete()` is never called at all for a
@@ -358,17 +370,23 @@ Both required proofs exist and are independent of each other:
   `storage::open_encrypted` is ever reached, so no database file can
   exist afterward by construction.
 - **Post-file-creation (new, R016):** `req_dkl7` - a custom initializer
-  closure writes real bytes to `path`, then deliberately fails,
-  simulating `bootstrap_db_at` having already created/encrypted the
-  file before a later step (verification/migration) fails. This is only
-  possible via the new injectable-initializer seam
+  closure writes SYNTHETIC (not real encrypted database) bytes to
+  `path`, then deliberately fails, standing in for `bootstrap_db_at`
+  having already created/encrypted the file before a later step
+  (verification/migration) fails. This is only possible via the new
+  injectable-initializer seam
   (`bootstrap_db_with_key_lifecycle_with_store`'s `F` parameter) -
   `bootstrap_db_at` itself cannot be driven into this exact sequence
   deterministically, since it depends on SQLCipher/refinery internals,
   not a simple filesystem precondition. Production bootstrap
   (`bootstrap_db_with_key_lifecycle`) always passes the real
   `bootstrap_db_at` as the initializer - the injectable closure is a
-  test-only seam, never reachable from `bootstrap_production_db`.
+  test-only seam, never reachable from `bootstrap_production_db`. This
+  test proves the credential-cleanup DECISION is correct (retain, not
+  delete) once a file exists; it does not, and cannot by construction,
+  prove anything about whether a genuinely partially-written encrypted
+  database would itself be recoverable - that remains a separate,
+  unproven question (§7 item 7 above).
 
 ---
 
@@ -464,8 +482,13 @@ updated numbers.
   `Debug` impl - implemented by hand, not derived, to avoid ever printing
   the raw key, see §6).
 - `cargo test -- --test-threads=1`: **262 passed; 0 failed; 0 ignored**
-  (up from 250). All 250 prior tests remain green, unmodified. Verified
-  with a targeted `--nocapture` run of just `req_dkl*` (12/12 PASS,
+  (up from 250). The aggregate count rose 250 → 262 because 12 NEW
+  deterministic key-lifecycle tests (`req_dkl1`-`req_dkl12`) were added;
+  one PRE-EXISTING test, `req_snap1`, was additionally strengthened
+  (§10 above) to assert diagnostic redaction - it is not new, and is
+  not counted among the 12. All previously-covered behavior remains
+  green. Verified with a targeted `--nocapture` run of just `req_dkl*`
+  (12/12 PASS,
   including `req_dkl7`, the critical new proof) and just `req_kl*`
   (11/11 genuinely PASS in this environment - the real OS keyring was
   available this run, so none of them returned BLOCKED; confirmed by

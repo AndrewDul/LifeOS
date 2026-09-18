@@ -1213,8 +1213,13 @@ text) plus one narrow diagnostic-safety hardening:
    injectable database-initializer closure that writes real bytes to
    the target path before deliberately failing - the one sequence
    `bootstrap_db_at` cannot be forced into portably - which also
-   confirms the resulting state re-resolves as Case B (safe to reopen),
-   never Case C.
+   confirms the resulting state re-resolves as Case B (`Reused`), never
+   Case C. This proves the DB/key ASSOCIATION is retained and a
+   subsequent bootstrap attempt can retry with the same key - it does
+   NOT prove the partially-created database file itself is valid, or
+   that SQLCipher/migrations can actually complete against it; that is
+   a separate recovery question `req_dkl7`'s synthetic-bytes initializer
+   does not exercise.
 2. **Key-lifecycle tests made deterministic, independent of OS keyring
    availability.** R015's `req_kl1`-`req_kl10` ran against the real OS
    credential store and could return early as "BLOCKED" (still counted
@@ -1260,10 +1265,13 @@ text) plus one narrow diagnostic-safety hardening:
    appears in the resulting `CoreError`'s `Display`, `Debug`, or
    `diagnostic()` - structural proof, not an inspection of today's
    `serde_json` wording.
-4. **12 new tests** (262 total, up from 250; all 250 prior tests remain
-   green, unmodified): `req_dkl1`-`req_dkl12` (deterministic key
-   lifecycle, in-memory credential store), plus the strengthened
-   `req_snap1`. An incidental fix found along the way: `ResolvedMasterKey`
+4. **12 new deterministic key-lifecycle tests** (`req_dkl1`-`req_dkl12`,
+   in-memory credential store) - aggregate count rose 250 → 262 because
+   only these 12 new functions increase the test count. One
+   PRE-EXISTING test, `req_snap1`, was additionally strengthened (§3
+   above) to assert diagnostic redaction, not added as new - all other
+   previously-covered behavior remains green, unmodified. An incidental
+   fix found along the way: `ResolvedMasterKey`
    needed a `Debug` impl for a new test's `{:?}` formatting - implemented
    by hand (not derived) so only the variant name prints, never the
    actual master key, which a derived `Debug` would have exposed in any
@@ -1448,9 +1456,11 @@ case (12 new tests: `req_dkl1`-`req_dkl12`) - plus that the mandatory
 audit-snapshot serialization-failure diagnostic structurally excludes
 the underlying serializer's own error text, proven with a deliberate
 marker string that must never appear in the resulting error's
-Display/Debug (`req_snap1`, strengthened). **Test count rose from 200
-to 233 to 250 to 262 across these two days' runs** (250→262 this run,
-+12) - all 250 prior tests remain green, unmodified.
+Display/Debug (`req_snap1`, strengthened - a PRE-EXISTING test, not
+new). **Test count rose from 200 to 233 to 250 to 262 across these two
+days' runs** (250→262 this run, +12 - only the 12 new `req_dkl*`
+functions increase the count) - all previously-covered behavior
+remains green.
 
 ---
 
@@ -1578,8 +1588,12 @@ planning/freeze decision - see R016 §15.
   deleted by this cleanup path either way). Proven with a new
   deterministic test (`req_dkl7`) that forces failure AFTER a file is
   written, confirming both that the credential survives and that the
-  resulting state correctly re-resolves as Case B (safe to reopen),
-  never Case C.
+  resulting state correctly re-resolves as Case B (`Reused`), never
+  Case C. This proves the DB/key association is retained and a
+  subsequent bootstrap can retry with the same key - it does NOT prove
+  the partially-created database file is itself valid or that
+  SQLCipher/migrations can actually complete against it, a separate
+  recovery question outside this test's synthetic-bytes initializer.
 - **RESOLVED (2026-09-18, M2 Key Lifecycle Determinism and Failure
   Atomicity Hardening, R016 §4n above): R015's key-lifecycle tests
   could return early as "BLOCKED" (still counted as PASS by Cargo) if
