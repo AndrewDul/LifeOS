@@ -52,6 +52,18 @@ database file exists afterward, and proven deterministically
 (independent of OS credential-store availability) via a new
 `CredentialStore` test seam. See `PROJECT_STATE.md` §4n and
 `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`.
+**(2026-09-18, R017, documentation/architecture only - no code
+changed)** The Personal Knowledge Layer's v0.1 field-level design is now
+frozen: exact schemas for `Entity`/`Fact`/`Relation`/`Episode`/
+`Source`/`Evidence` plus supporting join tables, the sensitivity/
+confidence/epistemic-state model, the correction-vs-contradiction
+distinction, and exact semantics for `AddMemory`/`CorrectMemory`/
+`ConfirmMemory`/`ForgetMemory` (confirmation floors confirmed unchanged
+from R003/§5.5). Several genuine gaps/contradictions in R003's original
+one-paragraph sketch were identified and explicitly corrected (not
+silently overwritten) - see R017 §2. Nothing is implemented yet; see
+`PROJECT_STATE.md` §4o and
+`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -681,36 +693,78 @@ yet"). Corrected in that report and here.
 
 ### 5.3 Personal Knowledge / Memory
 
-**Schema frozen at M2** (M2 report §B): `Entity`, `Fact`, `Relation`,
-`Episode`, `Evidence`, `Source` — do **not** flatten LifeOS memory into
-one text-memory table. **This `Relation`'s `relation_type` is an
-intentionally free string, not a constrained enum** — deferred until M6
-usage patterns exist (§13's open questions). It is unrelated to, and
-must not be confused with, `GoalRelation.relation_type` (§5.2), a
-completely different, frozen, closed 11-value enum on a completely
-different entity — the two only share a field name. Facts distinguish
-at least these categories:
+**Schema field-level design frozen 2026-09-18** (M2 Personal Knowledge
+Layer Architecture Freeze, R017 — superseding R003 §B's original
+table-shape-only sketch on several specific points, each an explicit,
+documented correction, not a silent rewrite; see R017 §2 for the full
+list). Six tables, unchanged in count and purpose from R003: `Entity`,
+`Fact`, `Relation`, `Episode`, `Evidence`, `Source` — do **not** flatten
+LifeOS memory into one text-memory table, a vector store, or chat
+history. `Fact` is a structured subject-predicate-object assertion
+(`subject_entity_id`/`predicate`/exactly one of `value_json` or
+`object_entity_id`), not a free-text blob. **`Relation`'s
+`relation_type` is an intentionally free string, not a constrained
+enum** — deferred until M6 usage patterns exist (§13's open questions,
+reaffirmed by R017). It is unrelated to, and must not be confused with,
+`GoalRelation.relation_type` (§5.2), a completely different, frozen,
+closed 11-value enum on a completely different entity — the two only
+share a field name; `Relation` in this layer connects two `Entity` rows
+only (`from_entity_id`/`to_entity_id`), never `GoalRelation`'s domain.
+Facts distinguish exactly these categories:
 `FACT`, `PREFERENCE`, `EXPERIENCE`, `DECISION`, `OBSERVATION`,
 `HYPOTHESIS`, `EFFECTIVE_SOLUTION`, `INEFFECTIVE_SOLUTION`, `SKILL`,
-`HABIT`, `CURRENT_STATE`, and at least these epistemic states:
-`USER_CONFIRMED`, `OBSERVED`, `INFERRED`, `DISPUTED`, `STALE`.
+`HABIT`, `CURRENT_STATE`, and exactly these epistemic states:
+`USER_CONFIRMED`, `OBSERVED`, `INFERRED`, `DISPUTED`, `STALE` — R017 §6-7
+defines each precisely, distinguishing e.g. `FACT` vs. `OBSERVATION` vs.
+`HYPOTHESIS`, and `EXPERIENCE` vs. `EFFECTIVE_SOLUTION`/
+`INEFFECTIVE_SOLUTION`, so future work does not use them
+interchangeably. **Sensitivity is now a frozen four-value closed set**
+(`PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`, R017 §13,
+resolving the previously-open §13-below question below) — a dimension
+independent of `epistemic_state` and `confidence` (three separate axes,
+never derived from one another).
 
-Provenance is structural, not conventional: every `Fact` carries
-`source_id`, `created_at`, `valid_from`, `valid_until`, `confidence`,
-`sensitivity`, and an `epistemic_state`. **Facts are never overwritten in
+Provenance is structural, not conventional, but the exact mechanism
+changed from R003's sketch: a `Fact` has **no direct `source_id`** —
+provenance flows exclusively through a normalized `fact_evidence` link
+table to `Evidence.source_id` to `Source` (R017 §5/§12), so the same
+piece of `Evidence` can support more than one `Fact`/`Relation`/
+`Episode` without duplication. **Facts are never overwritten in
 place** — updates insert a new row and set the old row's `valid_until` +
-`superseded_by_fact_id`, so full temporal history is the data model
-itself, not a bolted-on audit log.
+`superseded_by_fact_id` (+ `epistemic_state = STALE`), so full temporal
+history is the data model itself, not a bolted-on audit log (R017 §15).
+A `Fact` is otherwise immutable after creation except for
+`epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
+`superseded_by_fact_id` (R017 §5's mutability contract).
+
+**Four frozen actions, confirmation floors confirmed (unchanged from
+R003 §F/`LIFEOS_SPEC.md` §5.5's existing table, documented precisely in
+R017 §17-20):** `AddMemory` (`EXPLICIT_ADD`), `CorrectMemory`
+(`IMPORTANT_CHANGE`), `ConfirmMemory` (`EXPLICIT_ADD`, updates the same
+Fact's `epistemic_state` in place — never creates a duplicate temporal
+successor), `ForgetMemory` (`DELETE`, true permanent deletion — R017
+§20 freezes the exact deterministic, privacy-safe deletion algorithm,
+including that its audit row's `previous_snapshot` is unconditionally
+`NULL`, never the mandatory-snapshot helper used by every other Update*
+action).
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
 user can see *why* LifeOS believes something about them, not just *what*
-— though the mirror mechanism itself is not built at M2.
+— though the mirror mechanism itself is not built at M2 (R017 §32).
 
 The *intelligence* — producing memory candidates from conversation/
 journal input via the local helper model (§4), and the UI for reviewing/
 confirming them — is implemented starting at M6 (Personal Intelligence,
-§12); M2 only freezes the schema those candidates will be written into.
+§12); M2 only freezes the schema and action contracts those candidates
+will be written through (Qwen/Luna never mutate Personal Knowledge
+directly — they propose typed, `Provenance::Inferred` candidates that
+still go through the same Core validation/confirmation path as any
+other actor, R017 §27). **Not implemented in code at M2** — R017 is a
+documentation-only architecture freeze; see `docs/PROJECT_STATE.md`
+§4o and
+`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`
+for full detail and the recommended implementation slicing.
 
 ### 5.4 Action layer (frozen, M2)
 
@@ -1296,9 +1350,15 @@ These are genuinely unresolved and should not be treated as decided:
   `RESEARCH_DECISIONS.md` §2 still needs to run against Qwen3 4B at M4,
   and a small internal Polish eval still needs to run against GPT-5.6
   Luna once chat exists (M5).
-- Exact data-sensitivity classification levels and which specific fields
-  fall into each tier (§4.3) — needs to be defined alongside the actual
-  schema, not abstractly.
+- **Resolved 2026-09-18 (M2 Personal Knowledge Layer Architecture
+  Freeze, R017 §13):** exact data-sensitivity classification levels for
+  the Personal Knowledge Layer (§4.3/§5.3) — four frozen values,
+  `PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`, applied to
+  `Fact`/`Relation`/`Episode`/`Evidence` (deliberately not `Source`,
+  which is metadata-only by design and structurally cannot hold
+  sensitive payload). Still open: whether/how this same four-value
+  scheme extends to non-Personal-Knowledge domain fields (Goal/Project/
+  Task/etc.) — R017 only froze it for the Personal Knowledge Layer.
 - Multi-device sync strategy — CRDT-based (AFFiNE's y-octo/OctoBase
   pattern) vs. a sidecar tool like Syncthing vs. no sync in v1. Deferred;
   not needed for a single-device initial release.

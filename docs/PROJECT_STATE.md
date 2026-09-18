@@ -5,33 +5,32 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-18 (M2 Key Lifecycle Determinism and Failure
-Atomicity Hardening, R016 - a focused correctness/verification pass on
-top of R015, **not** a new entity/action. Fixes two review findings
-against R015's own implementation, found by re-inspecting R015's actual
-code rather than trusting its report text: (A) R015's Case-A
-orphan-credential cleanup deleted a freshly-generated credential on ANY
-subsequent database-initialization failure, even one occurring AFTER a
-database file had already been created under that key - which could
-self-inflict "database exists, credential absent" (Case C) as a side
-effect of its own cleanup path; corrected so the credential is deleted
-only if the database path still does not exist afterward. (B) R015's
-key-lifecycle tests ran against the real OS keyring and could return
-early as "BLOCKED" (still counted as PASS by Cargo) - not sufficient
-deterministic proof of the canonical A/B/C/D state machine; a new
-`security::CredentialStore` seam + deterministic in-memory test double
-now proves all four cases, orphan cleanup (both pre- and
-post-file-creation), and three backend-error paths independent of OS
-keyring availability (12 new tests). Also hardened
-`serialize_required_snapshot`'s diagnostic to structurally exclude the
-underlying serializer's raw error text (previously safe only by
-assumption about `serde_json`'s current wording). See §4n. On top of
-2026-09-18's M2 Storage and Audit Safety Hardening (R015, §4m),
-2026-09-17's Goal vertical slice/storage hardening, Goal hardening
-pass, Project vertical slice, Project/storage integrity hardening,
-GoalRelation vertical slice, Project Child Action Freeze pass,
-Milestone vertical slice, Task vertical slice, Task parent-validation
-hardening, and UpdateProject implementation).
+Last updated: 2026-09-18 (M2 Personal Knowledge Layer Architecture
+Freeze, R017 - **documentation/architecture only, no Rust or React code
+changed, no migration created.** Freezes the v0.1 field-level design of
+the Personal Knowledge Layer (R003's six-table minimum - `Entity`/
+`Fact`/`Relation`/`Episode`/`Evidence`/`Source` - specified in full for
+the first time) and its four actions (`AddMemory`/`CorrectMemory`/
+`ConfirmMemory`/`ForgetMemory`, confirmation floors confirmed unchanged
+from R003/§5.5). Seven genuine contradictions/under-specifications in
+R003's original one-paragraph sketch were found and explicitly
+corrected, not silently carried forward (§4o/R017 §2) - most
+significantly, `Fact` becomes a structured subject-predicate-object
+triple rather than an opaque text blob, and `Relation`'s polymorphic
+`ENTITY|FACT` endpoints are simplified to Entity-only with real FKs.
+`Sensitivity` (`PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`) is
+newly frozen, resolving a standing `LIFEOS_SPEC.md` §13 open question.
+`ForgetMemory`'s deterministic, privacy-safe true-deletion algorithm is
+fully specified. Not implemented in code - the recommended next slice
+is R017 §29's Slice A+B (`Entity`+`Source`+`Evidence`+`Fact` foundation,
+then `AddMemory`). See §4o. On top of 2026-09-18's M2 Key Lifecycle
+Determinism and Failure Atomicity Hardening (R016, §4n) and M2 Storage
+and Audit Safety Hardening (R015, §4m), and 2026-09-17's Goal vertical
+slice/storage hardening, Goal hardening pass, Project vertical slice,
+Project/storage integrity hardening, GoalRelation vertical slice,
+Project Child Action Freeze pass, Milestone vertical slice, Task
+vertical slice, Task parent-validation hardening, and UpdateProject
+implementation).
 
 ---
 
@@ -41,7 +40,7 @@ hardening, and UpdateProject implementation).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); **Personal Knowledge Layer v0.1 architecture fully frozen at field level (docs-only, not implemented)** 2026-09-18 (§4o); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
@@ -217,6 +216,7 @@ LiFeOS/
 │                    R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md
 │                    R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md
 │                    R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md
+│                    R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -1287,23 +1287,170 @@ text) plus one narrow diagnostic-safety hardening:
 Full evidence, exact code, and every test result:
 `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`.
 
+### 4o. M2 Personal Knowledge Layer Architecture Freeze (2026-09-18, R017, documentation/architecture only)
+
+**No Rust or React code changed. No migration created.** A dedicated
+design/freeze pass - the kind of planning pass §4n above said was
+needed before starting either `RecurringRule` or the Personal Knowledge
+Layer - for the Personal Knowledge Layer specifically: LifeOS's central
+differentiator (facts, preferences, decisions, experiences, what
+worked/didn't, skills, habits, current state, relationships, history,
+provenance about the user - not just a planner/calendar/chatbot). R003
+had already named the six-table minimum (`Entity`/`Fact`/`Relation`/
+`Episode`/`Evidence`/`Source`) and the 11 memory-type/5 epistemic-state
+closed sets, but only as a one-paragraph-per-table sketch ("table
+shape, not final column-level SQL"). R017 freezes the actual field-level
+design and the four Memory actions' exact semantics:
+
+- **Genuine contradictions found against R003's original sketch,
+  identified explicitly and resolved (not silently overwritten) -
+  R017 §2, seven items:** `Entity.kind` (closed enum) → `entity_type`
+  (open string) + `is_self: bool`; `Fact.content` (opaque blob) → a
+  structured subject-predicate-object triple
+  (`subject_entity_id`/`predicate`/exactly one of `value_json` or
+  `object_entity_id`); `Fact.subject_entity_id` nullable → `NOT NULL`
+  (tightened, now that a frozen SELF entity always exists);
+  `Fact.source_id` (direct FK) removed entirely - provenance now flows
+  exclusively through `fact_evidence` → `Evidence.source_id` → `Source`;
+  `Relation`'s polymorphic `ENTITY|FACT` endpoints → Entity-to-Entity
+  only, both sides real FKs; `Evidence.fact_id` (embedded single-parent
+  FK) → normalized `fact_evidence`/`relation_evidence`/
+  `episode_evidence` link tables, so one `Evidence` row can support more
+  than one `Fact`/`Relation`/`Episode`; `Source.kind` (ambiguously
+  closed) → explicitly frozen OPEN (`source_type`, plain validated
+  `TEXT`, R003's six values plus three more as a documented starting
+  vocabulary, not an enforced ceiling).
+- **`Entity`**: `id`, `entity_type` (open vocabulary), `canonical_name`,
+  `is_self: bool`, `domain_ref_type`/`domain_ref_id` (nullable, NOT an
+  enforced FK - deliberately, since the referenced domain table varies
+  and this module must not need schema-time knowledge of every domain
+  table that will ever exist; validity is a Core-level check reusing
+  the existing domain module's own `*_exists` functions, same pattern
+  as `Project.goal_id`), `created_at`/`updated_at`. **Exactly one SELF
+  entity**, enforced via a partial unique index on `is_self = 1`.
+  Aliases/entity-resolution explicitly deferred.
+- **`Fact`**: the central assertion, subject-predicate-object shape
+  above, `memory_type` (11 frozen values, unchanged/unrenamed) +
+  `epistemic_state` (5 frozen values, unchanged/unrenamed) both closed
+  `CHECK`-constrained enums, `confidence` (`Option<f32>`, 0.0-1.0, `NULL`
+  = no fabricated percentage - never conflated with "user confirmed
+  saying this"), `sensitivity` (new 4-value closed set, below),
+  `valid_from`/`valid_until`/`superseded_by_fact_id` for temporal
+  supersession (never in-place semantic overwrite). **Mutability
+  contract frozen**: after creation, only `epistemic_state`/
+  `confidence`/`sensitivity`/`valid_until`/`superseded_by_fact_id`/
+  `updated_at` may ever change - everything else is immutable for the
+  row's life; changing what a Fact asserts always means a new Fact.
+- **11 memory types preserved exactly**, each given a precise,
+  non-overlapping definition (R017 §6) - `FACT` (stable/general) vs.
+  `OBSERVATION` (a single noticed data point) vs. `HYPOTHESIS`
+  (unconfirmed candidate pattern); `EXPERIENCE` (neutral, no verdict) vs.
+  `EFFECTIVE_SOLUTION`/`INEFFECTIVE_SOLUTION` (same family, with a
+  positive/negative efficacy verdict); `CURRENT_STATE` vs. a long-lived
+  `FACT` (same mechanism, distinguished only by expected churn rate and
+  framing, not a different technical mechanism).
+- **5 epistemic states preserved exactly**, each precisely defined
+  (R017 §7) - `INFERRED` is never equivalent to `USER_CONFIRMED` and
+  must never silently become it (only `ConfirmMemory` can make that
+  transition); `DISPUTED` means unresolved/conflicting, never silently
+  treated as settled; `STALE` means historically retained, excluded
+  from active-knowledge retrieval by default. Kept structurally separate
+  from `confidence` and `sensitivity` - three independent dimensions,
+  never derived from one another.
+- **`Relation` (Personal Knowledge) reaffirmed completely distinct from
+  `GoalRelation`** - open `relation_type` string (never
+  `GoalRelation`'s closed 11-value enum), Entity-to-Entity only, no
+  automatic generation in either direction between the two layers. No
+  action mutates `Relation` yet in this freeze - schema only, its own
+  action family needs a dedicated freeze pass before implementation
+  (slice F, below), mirroring how Milestone/Task's schema was frozen
+  ahead of their actions (R010's precedent).
+- **`Episode`** (a bounded historical event/context unit - not chat
+  history, not a `Fact`, not a `CalendarEvent`) and **`Source`**
+  (provenance metadata only - `source_type` open, `label`/`reference`
+  bounded locator strings, deliberately no `sensitivity` field since it
+  structurally never holds sensitive payload) and **`Evidence`** (the
+  specific supporting payload/snippet, `content`/`locator`, its own
+  independent `sensitivity` - never inherited from the Fact it
+  supports) all schema-frozen, with normalized join tables
+  (`fact_evidence`/`relation_evidence`/`episode_evidence`/
+  `episode_entities`) rather than embedded polymorphic FKs.
+- **Sensitivity: new frozen 4-value closed set** -
+  `PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE` (promoted from
+  `LIFEOS_SPEC.md` §4.3's illustrative example list to the actual
+  frozen v0.1 set) - resolves the `LIFEOS_SPEC.md` §13 open question
+  "exact data-sensitivity classification levels... needs to be defined
+  alongside the actual schema." Applied to `Fact`/`Relation`/`Episode`/
+  `Evidence`, deliberately not `Source`.
+- **Four Memory actions, exact semantics frozen, confirmation floors
+  CONFIRMED unchanged from R003 §F/`LIFEOS_SPEC.md` §5.5 (not
+  re-decided this run):** `AddMemory` (`EXPLICIT_ADD` - creates
+  Fact+Source(new-or-existing)+Evidence+link atomically; inferred
+  candidates block with zero writes until confirmed, exactly like every
+  other `INFERRED_CHANGE` action already proven for `CreateGoal`),
+  `CorrectMemory` (`IMPORTANT_CHANGE` - creates a successor Fact,
+  closes/supersedes the predecessor atomically, mandatory
+  `previous_snapshot` via the existing `serialize_required_snapshot`
+  discipline), `ConfirmMemory` (`EXPLICIT_ADD` - updates the SAME Fact's
+  `epistemic_state` in place, never creates a duplicate temporal
+  successor; rejects an already-`USER_CONFIRMED` or non-active target),
+  `ForgetMemory` (`DELETE`, true permanent deletion - a fully specified,
+  deterministic, privacy-safe deletion algorithm: removes the Fact,
+  removes now-orphaned Evidence, never touches shared Entities, never
+  touches Source metadata at all, `previous_snapshot` is UNCONDITIONALLY
+  `NULL` for this action - it must never route through the ordinary
+  mandatory-snapshot helper, or the "forgotten" content would survive in
+  the audit log; the residual marker is the Fact's own random UUIDv7 id,
+  already non-sensitive with no hashing needed).
+- **Retrieval/Context Pack contract frozen as an architectural target
+  only** - no embeddings, no vector DB, no retrieval code this run;
+  the encrypted relational model remains the sole source of truth,
+  any future embedding index must be rebuildable from it and
+  invalidated when knowledge is forgotten.
+- **Qwen/Luna boundary reaffirmed** - neither ever mutates Personal
+  Knowledge directly; both only ever propose typed, `Provenance::
+  Inferred` candidates through the same Core validation/confirmation
+  path as any other actor.
+- **Explicitly deferred, not speculatively scaffolded** (R017 §26):
+  locked/pinned memory, `last_used`/usage tracking, memory importance/
+  weight, entity alias/resolution, ontology management for
+  `predicate`/`relation_type`, embeddings/semantic retrieval,
+  `Relation`/`Episode`'s own action families, bulk "forget everything
+  about X", backdating `valid_from`, the Memory inspection UI.
+- **Recommended implementation order** (not started): Slice A (`Entity`
+  + `Source` + `Evidence` + `Fact` foundation, schema + narrow read-side)
+  → Slice B (`AddMemory`) → Slice C (`CorrectMemory`) → Slice D
+  (`ConfirmMemory`) → Slice E (`ForgetMemory`) → Slice F (`Relation`,
+  needs its own action-freeze pass first) → Slice G (`Episode`, same) →
+  Slice H (retrieval/Context Pack foundation). A+B are the recommended
+  *next* slice specifically - nothing else in the family can exist
+  before them, and `AddMemory` is the only Memory action with no
+  dependency on another Memory action already having run.
+
+Full evidence, exact field-by-field schemas, and every design decision:
+`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
-on an existing M2 entity is now built. What remains needs its own
-planning/freeze pass first, not a direct implementation slice:
-**`RecurringRule`** (deliberately deferred, needs its own design/freeze
-pass before any code - `Task.recurring_rule_id` stays `NULL`-only until
-then, §4j) or the **Personal Knowledge Layer** (the next real net-new
-entity family, larger in scope). Neither should be started without that
-planning pass first, the way Milestone/Task both got a Project Child
-Action Freeze pass before implementation - do not invent product rules
-inside an implementation pass; flag them as open questions instead
-(§4c's lesson from the removed terminal-status rule; §4e's/§4g's
-action-set-gap documentation-before-code discipline; §4f's
-relation-integrity rules and §4i's order_index-uniqueness rule both
-being frozen/resolved *before or as part of* coding rather than
-invented ad hoc mid-implementation).
+on an existing M2 entity is now built, and (2026-09-18, R017, §4o) the
+Personal Knowledge Layer's v0.1 architecture is now fully frozen at the
+field level. Two real options now exist for the next *implementation*
+slice: **the Personal Knowledge Layer's Slice A+B** (`Entity`+`Source`+
+`Evidence`+`Fact` foundation, then `AddMemory` - R017 §29's
+recommended next slice, ready to implement directly since the freeze
+pass is done) or **`RecurringRule`** (deliberately deferred, still
+needs its own design/freeze pass before any code - `Task.
+recurring_rule_id` stays `NULL`-only until then, §4j). Personal
+Knowledge is no longer blocked on a freeze pass the way it was before
+this run - do not invent product rules inside the implementation pass;
+R017 already resolved the open questions a Personal Knowledge vertical
+slice would otherwise have hit mid-implementation (§4c's lesson from the
+removed terminal-status rule; §4e's/§4g's action-set-gap
+documentation-before-code discipline; §4f's relation-integrity rules and
+§4i's order_index-uniqueness rule both being frozen/resolved *before or
+as part of* coding rather than invented ad hoc mid-implementation - the
+same discipline R017 just applied to Personal Knowledge).
 
 ---
 
@@ -1470,16 +1617,19 @@ See §4l's "Next implementation step" for the exact reasoning (this
 duplicates it so it is visible without scrolling past the M2 detail
 section). With Goal/Project/GoalRelation/Milestone/Task all
 implemented, `UpdateProject` closing out the last frozen, shovel-ready
-action, and (2026-09-18, R015 §4m then R016 §4n) the master-key
-lifecycle and mandatory audit-snapshot safety gaps closed and then
-verified deterministically/corrected for a post-file-creation failure
-edge case, what remains needs its own planning/freeze pass first:
-**`RecurringRule`** (deliberately deferred, §4j) or the **Personal
-Knowledge Layer** (the next real net-new entity family). A direct
-implementation slice is not recommended for either without that
-planning pass first, the way Milestone/Task both got one. M2's
-storage/security foundation is safe to proceed into that next
-planning/freeze decision - see R016 §15.
+action, (2026-09-18, R015 §4m then R016 §4n) the master-key lifecycle
+and mandatory audit-snapshot safety gaps closed and then verified
+deterministically/corrected for a post-file-creation failure edge case,
+and (2026-09-18, R017 §4o) the Personal Knowledge Layer's v0.1
+architecture now fully frozen at the field level, the recommended next
+step is the **Personal Knowledge Layer's implementation Slice A+B**
+(`Entity`+`Source`+`Evidence`+`Fact` foundation, then `AddMemory` -
+R017 §29) - a real implementation slice can now begin there without
+inventing product rules mid-implementation, since the freeze pass is
+already done. `RecurringRule` remains deliberately deferred (§4j),
+still needing its own design/freeze pass before any code. M2's
+storage/security foundation is safe to proceed into implementation - see
+R016 §15 and R017 §29.
 
 ---
 
@@ -1532,6 +1682,23 @@ planning/freeze decision - see R016 §15.
   — not available in this environment.
 - **The Personal Knowledge Layer's `Relation.relation_type`** remains an
   intentionally free string — revisit once M6 usage patterns exist.
+  **Reaffirmed unchanged 2026-09-18 (R017 §8)** during the full
+  field-level architecture freeze — not a stale note, still the current
+  decision.
+- **RESOLVED (2026-09-18, M2 Personal Knowledge Layer Architecture
+  Freeze, R017 §2 above): R003's original Personal Knowledge sketch had
+  several under-specified or genuinely contradictory points** (a closed
+  `Entity.kind` enum instead of an open, extensible `entity_type`; an
+  opaque `Fact.content` blob instead of a structured
+  subject/predicate/value triple; a polymorphic, FK-unenforceable
+  `Relation`; an embedded single-parent `Evidence.fact_id` instead of
+  normalized link tables; an ambiguously-closed `Source.kind`). All
+  identified explicitly and corrected in R017, not silently carried
+  forward into an eventual implementation that would have had to guess.
+- **Personal Knowledge Layer is still not implemented in code** — R017
+  freezes the architecture only; `Entity`/`Fact`/`Relation`/`Episode`/
+  `Source`/`Evidence` do not exist as real tables yet. The recommended
+  next implementation slice is R017 §29's Slice A+B (§4o/§9 above).
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -1680,5 +1847,6 @@ summaries - open the file for full reasoning.
 | R014 | M2 UpdateProject Implementation | `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` |
 | R015 | M2 Storage and Audit Safety Hardening | `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md` |
 | R016 | M2 Key Lifecycle Determinism and Failure Atomicity Hardening | `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md` |
+| R017 | M2 Personal Knowledge Layer Architecture Freeze | `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md` |
 
-Next report allocated will be **R017**.
+Next report allocated will be **R018**.
