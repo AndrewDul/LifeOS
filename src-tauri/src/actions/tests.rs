@@ -1963,3 +1963,255 @@ fn forget_memory_payload_validates_trivially_and_passes_fact_id_through() {
         validate_forget_memory(&payload).expect("ForgetMemoryPayload should always validate");
     assert_eq!(normalized.fact_id, fact_id);
 }
+
+// =========================================================================
+// AddRelation (M2 Personal Knowledge Relation Foundation, R026,
+// 2026-09-18) - pure structural validation only, no I/O. Database-
+// dependent behavior (Existing/domain-ref existence, the AUTHORITATIVE
+// self-edge check) lives in `services::tests` instead, same split as
+// every other action.
+// =========================================================================
+
+fn base_add_relation_payload() -> AddRelationPayload {
+    AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::New(NewEntityData {
+            entity_type: "project".to_string(),
+            canonical_name: "Relation Target".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        relation_type: "works_on".to_string(),
+        note: None,
+        epistemic_state: EpistemicState::UserConfirmed,
+        confidence: None,
+        sensitivity: Sensitivity::Internal,
+        source: SourceRef::New(NewSourceData {
+            source_type: "conversation".to_string(),
+            label: None,
+            reference: None,
+            sensitivity: Sensitivity::Internal,
+            captured_at: Utc::now(),
+        }),
+        evidence: NewEvidenceData {
+            content: Some("evidence for the relation".to_string()),
+            locator: None,
+            sensitivity: Sensitivity::Internal,
+        },
+    }
+}
+
+#[test]
+fn add_relation_valid_baseline_payload_is_accepted() {
+    assert!(validate_add_relation(&base_add_relation_payload()).is_ok());
+}
+
+#[test]
+fn add_relation_inferred_provenance_effective_class_blocks_with_zero_writes_property() {
+    // Same generic-ladder safety property AddMemory's own test proves -
+    // AddRelation's ExplicitAdd floor (severity 1) is already dominated
+    // by InferredChange (severity 2), so no Personal-Knowledge-specific
+    // override is needed (R025 §17).
+    let class = effective_class(ConfirmationClass::ExplicitAdd, Provenance::Inferred);
+    assert_eq!(class, ConfirmationClass::InferredChange);
+    assert!(blocks_until_confirmed(class));
+
+    let explicit_class = effective_class(ConfirmationClass::ExplicitAdd, Provenance::Explicit);
+    assert_eq!(explicit_class, ConfirmationClass::ExplicitAdd);
+    assert!(!blocks_until_confirmed(explicit_class));
+}
+
+/// PURE self-edge fast path (R025 §20/R026 §10): `SelfEntity` +
+/// `SelfEntity` is structurally provable as a self-edge with no
+/// database access at all.
+#[test]
+fn add_relation_pure_self_edge_self_to_self_rejected() {
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::SelfEntity,
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Err(errors) => assert!(errors.contains(&ValidationError::SelfPersonalKnowledgeRelation)),
+        Ok(_) => panic!("Self -> Self should have been rejected"),
+    }
+}
+
+/// PURE self-edge fast path: `Existing(id)` + `Existing(id)` with equal
+/// ids is structurally provable with no database access.
+#[test]
+fn add_relation_pure_self_edge_existing_same_id_rejected() {
+    let id = EntityId::new();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::Existing(id),
+        to: EntityInputRef::Existing(id),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Err(errors) => assert!(errors.contains(&ValidationError::SelfPersonalKnowledgeRelation)),
+        Ok(_) => panic!("Existing(id) -> Existing(id) should have been rejected"),
+    }
+}
+
+/// `SelfEntity` + `Existing(some other id)` is NOT a pure self-edge -
+/// the pure fast path must not over-reject; only the AUTHORITATIVE
+/// post-resolution check in `services::add_relation` can determine
+/// whether `Existing` happens to BE SELF.
+#[test]
+fn add_relation_self_plus_existing_other_id_not_flagged_by_pure_fast_path() {
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::Existing(EntityId::new()),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Ok(normalized) => assert!(matches!(normalized.to, EntityInputRef::Existing(_))),
+        Err(errors) => panic!(
+            "SelfEntity + Existing(other id) must not be pre-emptively rejected by the pure fast path, got {errors:?}"
+        ),
+    }
+}
+
+/// Same-payload duplicate `domain_ref`: two `New` endpoint candidates
+/// sharing the same `domain_ref` are rejected before any SQL runs
+/// (R025 §11/§17 - same rule `AddMemory` already applies to
+/// subject/object).
+#[test]
+fn add_relation_same_payload_duplicate_domain_ref_rejected() {
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: GoalId::new().to_string(),
+    };
+    let payload = AddRelationPayload {
+        from: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "From Goal".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref.clone()),
+        }),
+        to: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "To Goal".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref),
+        }),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Err(errors) => assert!(errors.contains(&ValidationError::DuplicateDomainReference)),
+        Ok(_) => panic!("two New endpoints sharing one domain_ref should have been rejected"),
+    }
+}
+
+/// Two `New` endpoints with DIFFERENT `domain_ref`s are not a duplicate.
+#[test]
+fn add_relation_new_to_new_different_domain_refs_accepted() {
+    let payload = AddRelationPayload {
+        from: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "From Goal".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Goal".to_string(),
+                domain_ref_id: GoalId::new().to_string(),
+            }),
+        }),
+        to: EntityInputRef::New(NewEntityData {
+            entity_type: "project".to_string(),
+            canonical_name: "To Project".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Project".to_string(),
+                domain_ref_id: ProjectId::new().to_string(),
+            }),
+        }),
+        ..base_add_relation_payload()
+    };
+    assert!(validate_add_relation(&payload).is_ok());
+}
+
+#[test]
+fn add_relation_relation_type_blank_rejected() {
+    let payload = AddRelationPayload {
+        relation_type: "   ".to_string(),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Err(errors) => assert!(
+            errors.contains(&ValidationError::PersonalKnowledgeFieldEmpty {
+                field: "relation_type"
+            })
+        ),
+        Ok(_) => panic!("blank relation_type should have been rejected"),
+    }
+}
+
+#[test]
+fn add_relation_relation_type_over_max_len_rejected() {
+    let payload = AddRelationPayload {
+        relation_type: "x".repeat(RELATION_TYPE_MAX_LEN + 1),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&payload) {
+        Err(errors) => assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PersonalKnowledgeFieldTooLong { field, .. } if *field == "relation_type"
+        ))),
+        Ok(_) => panic!("over-max-length relation_type should have been rejected"),
+    }
+}
+
+#[test]
+fn add_relation_note_over_max_len_rejected_but_empty_and_none_accepted() {
+    let too_long = AddRelationPayload {
+        note: Some("n".repeat(RELATION_NOTE_MAX_LEN + 1)),
+        ..base_add_relation_payload()
+    };
+    match validate_add_relation(&too_long) {
+        Err(errors) => assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PersonalKnowledgeFieldTooLong { field, .. } if *field == "note"
+        ))),
+        Ok(_) => panic!("over-max-length note should have been rejected"),
+    }
+
+    let empty = AddRelationPayload {
+        note: Some(String::new()),
+        ..base_add_relation_payload()
+    };
+    assert!(
+        validate_add_relation(&empty).is_ok(),
+        "empty note must be accepted, never trimmed-to-None or rejected"
+    );
+
+    let none = AddRelationPayload {
+        note: None,
+        ..base_add_relation_payload()
+    };
+    assert!(validate_add_relation(&none).is_ok());
+}
+
+#[test]
+fn add_relation_confidence_out_of_bounds_rejected() {
+    for bad in [
+        -0.01f32,
+        1.01f32,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        let payload = AddRelationPayload {
+            confidence: Some(bad),
+            ..base_add_relation_payload()
+        };
+        match validate_add_relation(&payload) {
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ConfidenceOutOfBounds { .. })),
+                "confidence {bad} should report ConfidenceOutOfBounds, got {errors:?}"
+            ),
+            Ok(_) => panic!("confidence {bad} should have been rejected"),
+        }
+    }
+}

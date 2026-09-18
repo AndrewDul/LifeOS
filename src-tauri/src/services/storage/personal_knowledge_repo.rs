@@ -29,7 +29,7 @@ use super::{actor_str, confirmation_class_str, parse_rfc3339, provenance_str};
 use crate::actions::{Actor, ConfirmationClass, Provenance};
 use crate::domain::{
     DomainRef, Entity, EntityId, Evidence, EvidenceId, Fact, FactId, FactValue, MemoryType,
-    Sensitivity, Source, SourceId,
+    Relation, RelationId, Sensitivity, Source, SourceId,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -741,4 +741,144 @@ pub(in crate::services) fn delete_entity_if_orphan_non_self(
         params![id],
     )?;
     Ok(changed > 0)
+}
+
+// --- Relation (M2 Personal Knowledge Relation Foundation, R026,
+// 2026-09-18) -------------------------------------------------------------
+//
+// `AddRelation`'s production write path - the first production writer
+// of `relations`/`relation_evidence`/`relation_audit_log` (all three
+// previously schema-only, R019 §13/R025). Mirrors `insert_fact`/
+// `get_fact`/`insert_fact_evidence_link`/`insert_fact_audit_log`'s exact
+// shape and discipline. No `update_relation`/`delete_relation`/
+// `confirm_relation`/`list_relations`/`search_relations` exist -
+// `CorrectRelation`/`ConfirmRelation`/`ForgetRelation` and any read
+// beyond `get_relation` are explicitly out of scope for R026 (R025 §21 -
+// "not freezing broad retrieval/Context Pack here").
+
+fn row_to_relation(row: &Row) -> rusqlite::Result<Relation> {
+    let id_str: String = row.get("id")?;
+    let from_entity_id_str: String = row.get("from_entity_id")?;
+    let to_entity_id_str: String = row.get("to_entity_id")?;
+    let epistemic_state_str: String = row.get("epistemic_state")?;
+    let sensitivity_str: String = row.get("sensitivity")?;
+    let valid_from_str: String = row.get("valid_from")?;
+    let valid_until_str: Option<String> = row.get("valid_until")?;
+    let created_at_str: String = row.get("created_at")?;
+
+    Ok(Relation {
+        id: RelationId::parse(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        from_entity_id: EntityId::parse(&from_entity_id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        to_entity_id: EntityId::parse(&to_entity_id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        relation_type: row.get("relation_type")?,
+        note: row.get("note")?,
+        epistemic_state: crate::domain::EpistemicState::parse(&epistemic_state_str).ok_or_else(
+            || {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    format!("unknown epistemic_state: {epistemic_state_str}").into(),
+                )
+            },
+        )?,
+        confidence: row.get("confidence")?,
+        sensitivity: parse_sensitivity(&sensitivity_str)?,
+        valid_from: parse_rfc3339(&valid_from_str)?,
+        valid_until: valid_until_str.map(|s| parse_rfc3339(&s)).transpose()?,
+        created_at: parse_rfc3339(&created_at_str)?,
+    })
+}
+
+pub(in crate::services) fn insert_relation(
+    conn: &Connection,
+    relation: &Relation,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            relation.id.to_string(),
+            relation.from_entity_id.to_string(),
+            relation.to_entity_id.to_string(),
+            relation.relation_type,
+            relation.note,
+            relation.epistemic_state.as_str(),
+            relation.confidence,
+            relation.sensitivity.as_str(),
+            relation.valid_from.to_rfc3339(),
+            relation.valid_until.map(|d| d.to_rfc3339()),
+            relation.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(in crate::services) fn get_relation(
+    conn: &Connection,
+    id: RelationId,
+) -> rusqlite::Result<Option<Relation>> {
+    conn.query_row(
+        "SELECT id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at
+         FROM relations WHERE id = ?1",
+        params![id.to_string()],
+        row_to_relation,
+    )
+    .optional()
+}
+
+/// Links a Relation to Evidence via `relation_evidence` - same shape as
+/// `insert_fact_evidence_link`.
+pub(in crate::services) fn insert_relation_evidence_link(
+    conn: &Connection,
+    relation_id: RelationId,
+    evidence_id: EvidenceId,
+    created_at: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        params![
+            relation_id.to_string(),
+            evidence_id.to_string(),
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+/// First production writer of `relation_audit_log` (`V8__create_relation_audit_log.sql`)
+/// - same shape and discipline as `insert_fact_audit_log`.
+/// `previous_snapshot` is always `None` for `AddRelation` (this creates a
+/// Relation, it does not update one).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::services) fn insert_relation_audit_log(
+    conn: &Connection,
+    relation_id: RelationId,
+    action_type: &str,
+    actor: Actor,
+    provenance: Provenance,
+    confirmation_class: ConfirmationClass,
+    previous_snapshot_json: Option<String>,
+    occurred_at: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            Uuid::now_v7().to_string(),
+            relation_id.to_string(),
+            action_type,
+            actor_str(actor),
+            provenance_str(provenance),
+            confirmation_class_str(confirmation_class),
+            previous_snapshot_json,
+            occurred_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }

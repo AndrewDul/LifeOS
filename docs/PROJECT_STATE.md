@@ -2579,11 +2579,21 @@ code is written. `relations.updated_at` is **not part of Relation v0.1**
 contradicted a CLOSED verdict; the addendum resolved this by excluding it
 entirely - `CorrectRelation`/`ConfirmRelation` mutation timestamps are
 fully carried by `relation_audit_log.occurred_at`). No schema/code/tests
-changed in R025 or its addendum - both are documentation only. The
-recommended next step is R026 (V8 `relation_audit_log` + Relation domain
-struct/read-side + `AddRelation`, combined since the foundation this time
-is small), followed by R027 `CorrectRelation`, R028 `ConfirmRelation`,
-R029 `ForgetRelation`. `RecurringRule`
+changed in R025 or its addendum - both are documentation only. **(2026-09-18,
+R026) V8 (`relation_audit_log` only) is now real, migrated, and tested,
+and `AddRelation` - the first production Relation mutation - is implemented
+and proven (461/461 tests)**: `Relation`'s domain struct and
+`is_active_relation` exist, `get_relation` is the minimum read, and
+`AddRelation` reuses the Memory family's `EntityInputRef`/`SourceRef`/
+`resolve_entity_input_ref`/`resolve_source_ref`/confirmation-gate-before-DB
+ordering verbatim, adding only a two-layer self-edge defense (a pure
+structural fast path plus an authoritative post-resolution check) and the
+new `ValidationError::SelfPersonalKnowledgeRelation` variant. `CorrectRelation`/
+`ConfirmRelation`/`ForgetRelation` remain unimplemented; the recommended
+next step is R027 `CorrectRelation` (in-place metadata-only correction per
+R025's corrected contract), followed by R028 `ConfirmRelation`, then R029
+`ForgetRelation` (built with `TransactionBehavior::Immediate` from the
+start this time). `RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2741,6 +2751,25 @@ to proceed into implementation - see R016 §15 and R019 §23.
   implementation slices: R026 (V8 `relation_audit_log` + Relation domain
   struct/read-side + `AddRelation`, combined), R027 `CorrectRelation`,
   R028 `ConfirmRelation`, R029 `ForgetRelation`.
+- **RESOLVED (2026-09-18, M2 Personal Knowledge Relation Foundation and
+  AddRelation, R026 above): `V8` (`relation_audit_log` only, exactly as
+  R025's addenda froze it) is real, migrated, and tested; `Relation`'s
+  domain struct, `is_active_relation`, and the minimum `get_relation`
+  read all exist; `AddRelation` - the first production Relation mutation
+  - is real, implemented, and tested (461/461).** `AddRelation` reuses
+  `EntityInputRef`/`SourceRef`/`resolve_entity_input_ref`/
+  `resolve_source_ref`/the confirmation-gate-before-DB-dependent-
+  validation ordering all verbatim from the Memory family; the only new
+  logic is a two-layer self-edge defense (a pure structural fast path in
+  `validate_add_relation`, catching `SelfEntity`+`SelfEntity` and
+  `Existing(id)`+`Existing(id)`, plus an authoritative post-resolution
+  check in `services::add_relation` catching every remaining case
+  including `SelfEntity` + `Existing(actual SELF id)`) and one new
+  `ValidationError::SelfPersonalKnowledgeRelation` variant.
+  `CorrectRelation`/`ConfirmRelation`/`ForgetRelation` remain
+  unimplemented; no Tauri command wires `AddRelation` into the running
+  app yet; Episode actions and retrieval/Context Pack remain entirely
+  unstarted.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2898,5 +2927,6 @@ summaries - open the file for full reasoning.
 | R023 | M2 Personal Knowledge ConfirmMemory Slice D | `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md` |
 | R024 | M2 Personal Knowledge ForgetMemory Slice E | `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md` |
 | R025 | M2 Personal Knowledge Relation Action-Family Architecture Freeze | `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md` |
+| R026 | M2 Personal Knowledge Relation Foundation and AddRelation | `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md` |
 
-Next report allocated will be **R026**.
+Next report allocated will be **R027**.

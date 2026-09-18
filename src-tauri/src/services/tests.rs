@@ -7,17 +7,20 @@
 
 use super::*;
 use crate::actions::{
-    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmMemoryPayload, ConfirmationClass,
-    CorrectMemoryPayload, EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload,
-    NewEntityData, NewEvidenceData, NewSourceData, Provenance, SourceRef, ValidationError,
+    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, AddRelationPayload, ConfirmMemoryPayload,
+    ConfirmationClass, CorrectMemoryPayload, EntityInputRef, FactValueInput, FieldPatch,
+    ForgetMemoryPayload, NewEntityData, NewEvidenceData, NewSourceData, Provenance, SourceRef,
+    ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
-    DomainRef, EpistemicState, Evidence, EvidenceId, FactValue, GoalRelationType, LifecycleStatus,
-    MemoryType, MilestoneStatus, Source, SourceId, TaskStatus,
+    is_active_relation, DomainRef, EpistemicState, Evidence, EvidenceId, FactValue,
+    GoalRelationType, LifecycleStatus, MemoryType, MilestoneStatus, Relation, RelationId, Source,
+    SourceId, TaskStatus,
 };
 use std::fs;
 use std::io::Read;
+use uuid::Uuid;
 
 /// Independent of `storage::spike`'s key helper on purpose - this test
 /// module should not depend on the spike's internals, which are a
@@ -15192,5 +15195,1940 @@ fn req_fm_repo_delete_fact_forget_target_direct_proof() {
     assert!(
         missing_result.is_err(),
         "[req_fm_repo_delete_direct] FAIL - missing FactId delete should be a real Err, not silently Ok, got {missing_result:?}"
+    );
+}
+
+// =========================================================================
+// M2 Personal Knowledge Relation Foundation and AddRelation (R026,
+// 2026-09-18)
+//
+// Evidence for
+// `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`.
+// V8 migration proofs, Relation read-side proofs, and the first
+// production Relation mutation (`AddRelation`). Database-dependent
+// behavior only - pure `validate_add_relation` structural tests live in
+// `actions::tests` instead, same split as every other action.
+// =========================================================================
+
+fn mk_pk_relation(
+    from_entity_id: EntityId,
+    to_entity_id: EntityId,
+    relation_type: &str,
+    epistemic_state: EpistemicState,
+    sensitivity: Sensitivity,
+) -> Relation {
+    let now = Utc::now();
+    Relation {
+        id: RelationId::new(),
+        from_entity_id,
+        to_entity_id,
+        relation_type: relation_type.to_string(),
+        note: None,
+        epistemic_state,
+        confidence: None,
+        sensitivity,
+        valid_from: now,
+        valid_until: None,
+        created_at: now,
+    }
+}
+
+fn relation_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM relations", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn relation_evidence_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM relation_evidence", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn relation_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM relation_audit_log", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// `(entities, sources, evidence, relations, relation_evidence,
+/// relation_audit_log)` - every table `AddRelation` can possibly mutate,
+/// same reasoning as `am_full_table_snapshot`.
+fn ar_full_table_snapshot(conn: &Connection) -> (i64, i64, i64, i64, i64, i64) {
+    (
+        entity_row_count(conn),
+        am_source_row_count(conn),
+        am_evidence_row_count(conn),
+        relation_row_count(conn),
+        relation_evidence_row_count(conn),
+        relation_audit_row_count(conn),
+    )
+}
+
+/// Same forced-failure mechanism as `install_fact_audit_failure_trigger` -
+/// `RAISE(FAIL, ...)` aborts only the failing statement, proving
+/// `add_relation`'s own `Transaction`-drop rollback, not SQLite doing it
+/// unprompted.
+fn install_relation_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_relation_audit_failure
+         BEFORE INSERT ON relation_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced relation audit failure');
+         END;",
+    )
+    .expect("failed to install the forced relation-audit-failure trigger");
+}
+
+fn remove_relation_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_relation_audit_failure;")
+        .expect("failed to remove the forced relation-audit-failure trigger");
+}
+
+fn mk_ar_to_new(entity_type: &str, canonical_name: &str) -> EntityInputRef {
+    EntityInputRef::New(NewEntityData {
+        entity_type: entity_type.to_string(),
+        canonical_name: canonical_name.to_string(),
+        sensitivity: Sensitivity::Internal,
+        domain_ref: None,
+    })
+}
+
+/// A minimal, always-valid baseline payload - Self `from`, brand-new
+/// `to` Entity, open `relation_type`, brand-new Source, Evidence with
+/// content only. Every test below overrides only the fields it cares
+/// about via struct-update syntax, same convention as `mk_am_payload`.
+fn mk_ar_payload() -> AddRelationPayload {
+    AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: mk_ar_to_new("project", "Relation Target Entity"),
+        relation_type: "works_on".to_string(),
+        note: None,
+        epistemic_state: EpistemicState::UserConfirmed,
+        confidence: None,
+        sensitivity: Sensitivity::Internal,
+        source: mk_am_source_new(),
+        evidence: mk_am_evidence(),
+    }
+}
+
+// --- V8 migration proofs (R026 §2 A-M) -----------------------------------
+
+/// A. Fresh V1-through-V8 migration succeeds. C. `relation_audit_log`
+/// exists with exactly the frozen 8 columns, in order.
+#[test]
+fn req_mig3_fresh_v1_through_v8_migration_succeeds_relation_audit_log_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig3.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'relation_audit_log'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exists, 1,
+        "[req_mig3] FAIL - relation_audit_log table missing after fresh migration"
+    );
+
+    let mut cols: Vec<String> = Vec::new();
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(relation_audit_log)")
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let name: String = row.get(1).unwrap();
+        cols.push(name);
+    }
+    assert_eq!(
+        cols,
+        vec![
+            "id",
+            "relation_id",
+            "action_type",
+            "actor",
+            "provenance",
+            "confirmation_class",
+            "previous_snapshot",
+            "occurred_at",
+        ],
+        "[req_mig3] FAIL - relation_audit_log columns do not match the frozen R025 shape exactly"
+    );
+    println!("[req_mig3] PASS - fresh V1-V8 migration succeeds; relation_audit_log exists with exactly the 8 frozen columns");
+}
+
+/// B. A populated V7 database (a real pre-existing Fact/Entity, the
+/// actual shape of an existing user's database before this run)
+/// upgrades to V8 non-destructively: old data unchanged,
+/// `relation_audit_log` exists, and the upgraded connection is genuinely
+/// usable for `AddRelation` (not merely schema-present) - folds in the
+/// encrypted-reopen proof (R026 §44).
+#[test]
+fn req_mig4_populated_v7_database_upgrades_non_destructively_to_v8() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig4.db");
+
+    let fact_id;
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 7).unwrap();
+        ensure_self_entity(&conn).unwrap();
+        let fact = match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        fact_id = fact.id;
+    }
+
+    {
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        assert!(
+            get_fact(&conn, fact_id).unwrap().is_some(),
+            "[req_mig4] FAIL - pre-V8 Fact lost during V7->V8 upgrade"
+        );
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'relation_audit_log'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "[req_mig4] FAIL - relation_audit_log missing after V7->V8 upgrade"
+        );
+
+        match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+            ActionOutcome::Success { .. } => {}
+            other => {
+                panic!("[req_mig4] FAIL - AddRelation failed on the upgraded V7->V8 DB: {other:?}")
+            }
+        }
+        println!("[req_mig4] PASS - populated V7 database upgrades to V8 non-destructively: pre-existing Fact survives, relation_audit_log exists, AddRelation works on the upgraded DB");
+    }
+}
+
+/// D/E. `action_type` CHECK accepts all 4 frozen values, rejects an
+/// unknown one.
+#[test]
+fn req_mig5_relation_audit_log_action_type_check_accepts_valid_rejects_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig5.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let fake_relation_id = RelationId::new();
+
+    for action_type in [
+        "AddRelation",
+        "CorrectRelation",
+        "ConfirmRelation",
+        "ForgetRelation",
+    ] {
+        conn.execute(
+            "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+             VALUES (?1, ?2, ?3, 'UI', 'Explicit', 'EXPLICIT_ADD', NULL, ?4)",
+            rusqlite::params![
+                Uuid::now_v7().to_string(),
+                fake_relation_id.to_string(),
+                action_type,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap_or_else(|e| panic!("[req_mig5] FAIL - valid action_type {action_type} rejected: {e:?}"));
+    }
+
+    let result = conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, 'NotARealAction', 'UI', 'Explicit', 'EXPLICIT_ADD', NULL, ?3)",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            fake_relation_id.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "[req_mig5] FAIL - invalid action_type was NOT rejected by the CHECK constraint"
+    );
+    println!("[req_mig5] PASS - relation_audit_log.action_type CHECK accepts all 4 frozen values, rejects an unknown one");
+}
+
+/// F/G/H/I/J. `actor`/`provenance` CHECKs accept every frozen value and
+/// reject an unknown one; `previous_snapshot` accepts both NULL and
+/// non-NULL text.
+#[test]
+fn req_mig6_relation_audit_log_actor_provenance_previous_snapshot_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig6.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let fake_relation_id = RelationId::new();
+
+    for actor in ["UI", "CloudLLM", "NeXa"] {
+        conn.execute(
+            "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+             VALUES (?1, ?2, 'AddRelation', ?3, 'Explicit', 'EXPLICIT_ADD', NULL, ?4)",
+            rusqlite::params![
+                Uuid::now_v7().to_string(),
+                fake_relation_id.to_string(),
+                actor,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap_or_else(|e| panic!("[req_mig6] FAIL - valid actor {actor} rejected: {e:?}"));
+    }
+    let bad_actor = conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, 'AddRelation', 'NotAnActor', 'Explicit', 'EXPLICIT_ADD', NULL, ?3)",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            fake_relation_id.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    );
+    assert!(
+        bad_actor.is_err(),
+        "[req_mig6] FAIL - invalid actor was NOT rejected"
+    );
+
+    for provenance in ["Explicit", "Inferred"] {
+        conn.execute(
+            "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+             VALUES (?1, ?2, 'AddRelation', 'UI', ?3, 'EXPLICIT_ADD', NULL, ?4)",
+            rusqlite::params![
+                Uuid::now_v7().to_string(),
+                fake_relation_id.to_string(),
+                provenance,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap_or_else(|e| panic!("[req_mig6] FAIL - valid provenance {provenance} rejected: {e:?}"));
+    }
+    let bad_provenance = conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, 'AddRelation', 'UI', 'NotAProvenance', 'EXPLICIT_ADD', NULL, ?3)",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            fake_relation_id.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    );
+    assert!(
+        bad_provenance.is_err(),
+        "[req_mig6] FAIL - invalid provenance was NOT rejected"
+    );
+
+    conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, 'CorrectRelation', 'UI', 'Explicit', 'IMPORTANT_CHANGE', ?3, ?4)",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            fake_relation_id.to_string(),
+            "{\"some\":\"snapshot\"}",
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .unwrap();
+
+    println!("[req_mig6] PASS - relation_audit_log actor/provenance CHECK constraints accept every frozen value and reject an unknown one; previous_snapshot accepts NULL and non-NULL text");
+}
+
+/// K. `relation_id` accepts a syntactically valid, nonexistent
+/// `RelationId` - directly proving there is NO foreign key.
+#[test]
+fn req_mig7_relation_audit_log_relation_id_is_not_a_foreign_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig7.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let nonexistent = RelationId::new();
+    let result = conn.execute(
+        "INSERT INTO relation_audit_log (id, relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, 'AddRelation', 'UI', 'Explicit', 'EXPLICIT_ADD', NULL, ?3)",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            nonexistent.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    );
+    assert!(
+        result.is_ok(),
+        "[req_mig7] FAIL - relation_id rejected a syntactically valid nonexistent RelationId - it must NOT be a foreign key: {result:?}"
+    );
+    assert_eq!(
+        relation_row_count(&conn),
+        0,
+        "[req_mig7] FAIL - no relations row should exist for this test"
+    );
+    println!("[req_mig7] PASS - relation_audit_log.relation_id accepts a nonexistent RelationId, proving it is deliberately NOT a foreign key");
+}
+
+/// L. `relations` itself gained NO columns from V8 - byte-for-byte the
+/// frozen V7 shape, no `updated_at`, no `superseded_by_relation_id`.
+#[test]
+fn req_mig8_relations_table_not_altered_by_v8() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig8.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let mut cols: Vec<String> = Vec::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(relations)").unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let name: String = row.get(1).unwrap();
+        cols.push(name);
+    }
+    assert_eq!(
+        cols,
+        vec![
+            "id",
+            "from_entity_id",
+            "to_entity_id",
+            "relation_type",
+            "note",
+            "epistemic_state",
+            "confidence",
+            "sensitivity",
+            "valid_from",
+            "valid_until",
+            "created_at",
+        ],
+        "[req_mig8] FAIL - relations columns changed by V8 - must remain exactly the frozen V7 shape"
+    );
+    println!("[req_mig8] PASS - relations table is byte-for-byte unaltered by V8: no updated_at, no superseded_by_relation_id");
+}
+
+/// M. An existing V7-shaped raw `Relation` fixture row remains fully
+/// schema-compatible after the V8 migration.
+#[test]
+fn req_mig9_existing_v7_relation_raw_fixtures_remain_compatible_after_v8() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig9.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let from = mk_pk_entity("person", "Fixture From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("project", "Fixture To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+
+    let relation = mk_pk_relation(
+        from.id,
+        to.id,
+        "collaborates_with",
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+
+    let fetched = get_relation(&conn, relation.id)
+        .unwrap()
+        .expect("[req_mig9] FAIL - fixture Relation not found after V8 migration");
+    assert_eq!(
+        fetched, relation,
+        "[req_mig9] FAIL - V7 Relation fixture round-trip mismatch after V8 migration"
+    );
+    println!("[req_mig9] PASS - a raw V7-shaped Relation fixture row remains fully schema-compatible after the V8 migration");
+}
+
+// --- Relation read-side proofs (R026 §6) ---------------------------------
+
+/// `get_relation` round-trips every field exactly.
+#[test]
+fn req_pkrt3_get_relation_round_trip_all_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt3.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let from = mk_pk_entity("person", "Relation From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("project", "Relation To", Sensitivity::Public);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+
+    let mut relation = mk_pk_relation(
+        from.id,
+        to.id,
+        "works_on",
+        EpistemicState::UserConfirmed,
+        Sensitivity::Internal,
+    );
+    relation.note = Some("full round trip note".to_string());
+    relation.confidence = Some(0.85);
+    storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+
+    let fetched = get_relation(&conn, relation.id)
+        .unwrap()
+        .expect("[req_pkrt3] FAIL - relation not found");
+    assert_eq!(
+        fetched, relation,
+        "[req_pkrt3] FAIL - full-field round-trip mismatch"
+    );
+    println!("[req_pkrt3] PASS - get_relation round-trips every field exactly");
+}
+
+/// `note`/`confidence`/`valid_until` all round-trip as `None` when NULL.
+#[test]
+fn req_pkrt4_get_relation_nullable_fields_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt4.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let from = mk_pk_entity("person", "Nullable From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("project", "Nullable To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+
+    let relation = mk_pk_relation(
+        from.id,
+        to.id,
+        "nullable_test",
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+
+    let fetched = get_relation(&conn, relation.id).unwrap().unwrap();
+    assert!(
+        fetched.note.is_none(),
+        "[req_pkrt4] FAIL - note should be None"
+    );
+    assert!(
+        fetched.confidence.is_none(),
+        "[req_pkrt4] FAIL - confidence should be None"
+    );
+    assert!(
+        fetched.valid_until.is_none(),
+        "[req_pkrt4] FAIL - valid_until should be None"
+    );
+    println!("[req_pkrt4] PASS - note/confidence/valid_until all round-trip as None when NULL");
+}
+
+/// All 5 `EpistemicState` values parse correctly for `Relation`.
+#[test]
+fn req_pkrt5_get_relation_all_epistemic_states_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt5.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let from = mk_pk_entity("person", "ES From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+
+    for state in [
+        EpistemicState::UserConfirmed,
+        EpistemicState::Observed,
+        EpistemicState::Inferred,
+        EpistemicState::Disputed,
+        EpistemicState::Stale,
+    ] {
+        let to = mk_pk_entity(
+            "project",
+            &format!("ES To {state:?}"),
+            Sensitivity::Internal,
+        );
+        storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+        let relation = mk_pk_relation(
+            from.id,
+            to.id,
+            "epistemic_test",
+            state,
+            Sensitivity::Internal,
+        );
+        storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+        let fetched = get_relation(&conn, relation.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.epistemic_state, state,
+            "[req_pkrt5] FAIL - {state:?} did not round-trip"
+        );
+    }
+    println!("[req_pkrt5] PASS - all 5 EpistemicState values parse correctly for Relation");
+}
+
+/// All 4 `Sensitivity` values parse correctly for `Relation`.
+#[test]
+fn req_pkrt6_get_relation_all_sensitivity_values_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt6.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let from = mk_pk_entity("person", "Sens From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+
+    for sens in [
+        Sensitivity::Public,
+        Sensitivity::Internal,
+        Sensitivity::Sensitive,
+        Sensitivity::NeverLeavesDevice,
+    ] {
+        let to = mk_pk_entity(
+            "project",
+            &format!("Sens To {sens:?}"),
+            Sensitivity::Internal,
+        );
+        storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+        let relation = mk_pk_relation(
+            from.id,
+            to.id,
+            "sensitivity_test",
+            EpistemicState::Observed,
+            sens,
+        );
+        storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+        let fetched = get_relation(&conn, relation.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.sensitivity, sens,
+            "[req_pkrt6] FAIL - {sens:?} did not round-trip"
+        );
+    }
+    println!("[req_pkrt6] PASS - all 4 Sensitivity values parse correctly for Relation");
+}
+
+/// An arbitrary open-vocabulary `relation_type` round-trips exactly - no
+/// enum conversion, never confused with `GoalRelationType`.
+#[test]
+fn req_pkrt7_get_relation_open_relation_type_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt7.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let from = mk_pk_entity("person", "Type From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("project", "Type To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+
+    let relation = mk_pk_relation(
+        from.id,
+        to.id,
+        "THIS_IS_NOT_A_GOALRELATION_VALUE",
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_relation(&conn, &relation).unwrap();
+    let fetched = get_relation(&conn, relation.id).unwrap().unwrap();
+    assert_eq!(fetched.relation_type, "THIS_IS_NOT_A_GOALRELATION_VALUE");
+    println!("[req_pkrt7] PASS - an arbitrary open-vocabulary relation_type round-trips exactly, no enum conversion");
+}
+
+/// A nonexistent id returns `None`, never an error.
+#[test]
+fn req_pkrt8_get_relation_nonexistent_id_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt8.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    assert!(get_relation(&conn, RelationId::new()).unwrap().is_none());
+    println!("[req_pkrt8] PASS - get_relation returns None for a nonexistent id");
+}
+
+/// `is_active_relation` A-D matrix - pure logic, no I/O, mirroring
+/// `is_active_fact` exactly.
+#[test]
+fn req_iar_is_active_relation_matrix() {
+    let from = EntityId::new();
+    let to = EntityId::new();
+    let mk = |state: EpistemicState, valid_until: Option<chrono::DateTime<Utc>>| Relation {
+        id: RelationId::new(),
+        from_entity_id: from,
+        to_entity_id: to,
+        relation_type: "test".to_string(),
+        note: None,
+        epistemic_state: state,
+        confidence: None,
+        sensitivity: Sensitivity::Internal,
+        valid_from: Utc::now(),
+        valid_until,
+        created_at: Utc::now(),
+    };
+
+    assert!(
+        is_active_relation(&mk(EpistemicState::UserConfirmed, None)),
+        "[req_iar_a] FAIL - valid_until None + non-STALE must be active"
+    );
+    assert!(
+        !is_active_relation(&mk(EpistemicState::UserConfirmed, Some(Utc::now()))),
+        "[req_iar_b] FAIL - valid_until Some + non-STALE must be inactive"
+    );
+    assert!(
+        !is_active_relation(&mk(EpistemicState::Stale, None)),
+        "[req_iar_c] FAIL - valid_until None + STALE must be inactive"
+    );
+    assert!(
+        !is_active_relation(&mk(EpistemicState::Stale, Some(Utc::now()))),
+        "[req_iar_d] FAIL - valid_until Some + STALE must be inactive"
+    );
+    println!("[req_iar] PASS - is_active_relation matrix A-D all correct, mirroring is_active_fact exactly");
+}
+
+// --- AddRelation: confirmation gate/matrix (R026 §12-14/§39) ------------
+
+#[test]
+fn req_ar_conf_a_explicit_unconfirmed_executes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd),
+        other => panic!("[req_ar_conf_a] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(relation_row_count(&conn), 1);
+}
+
+/// Central safety proof: `Provenance::Inferred` at `AddRelation`'s
+/// `ExplicitAdd` floor must block with genuinely zero writes across
+/// every table it could otherwise touch - no override code exists for
+/// this (unlike `CorrectRelation`, not implemented this run), proving
+/// the *generic* `effective_class`/`blocks_until_confirmed` machinery
+/// alone is sufficient, matching `AddMemory`.
+#[test]
+fn req_ar_conf_b_inferred_unconfirmed_blocks_with_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match add_relation(&mut conn, meta, mk_ar_payload()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange)
+        }
+        other => panic!("[req_ar_conf_b] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        ar_full_table_snapshot(&conn),
+        (1, 0, 0, 0, 0, 0),
+        "[req_ar_conf_b] FAIL - zero writes expected across every Relation-family table (only the bootstrap SELF entity should exist)"
+    );
+}
+
+#[test]
+fn req_ar_conf_c_inferred_confirmed_persists_user_confirmed_and_audit_provenance_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    let payload = AddRelationPayload {
+        epistemic_state: EpistemicState::Observed,
+        ..mk_ar_payload()
+    };
+    let relation_id;
+    match add_relation(&mut conn, meta, payload) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(
+                value.epistemic_state,
+                EpistemicState::UserConfirmed,
+                "[req_ar_conf_c] FAIL - a confirmed Inferred resubmission must persist USER_CONFIRMED, not the payload's originally-proposed state"
+            );
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            relation_id = value.id;
+        }
+        other => panic!("[req_ar_conf_c] FAIL - expected Success, got {other:?}"),
+    }
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM relation_audit_log WHERE relation_id = ?1",
+            rusqlite::params![relation_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_ar_conf_c] FAIL - audit provenance must remain Inferred, never silently rewritten to Explicit"
+    );
+}
+
+#[test]
+fn req_ar_conf_d_structurally_invalid_inferred_unconfirmed_returns_validation_failed_before_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    let payload = AddRelationPayload {
+        relation_type: "   ".to_string(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, meta, payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::PersonalKnowledgeFieldEmpty {
+                field: "relation_type"
+            }));
+        }
+        other => panic!(
+            "[req_ar_conf_d] FAIL - expected ValidationFailed BEFORE the confirmation gate, got {other:?}"
+        ),
+    }
+}
+
+/// Post-run correctness boundary (mirrors `req_am_conf_gate_precedes_db_dependent_validation`
+/// exactly): a structurally valid but database-invalid payload (an
+/// `Existing` reference to a nonexistent `EntityId`/`SourceId`, each
+/// tried independently) must still return `ConfirmationRequired` for an
+/// unconfirmed `Inferred` call - never `ValidationFailed` - proving the
+/// database-dependent resolution stage was never reached.
+#[test]
+fn req_ar_conf_gate_precedes_db_dependent_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_conf_gate_order.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+
+    let payload_from = AddRelationPayload {
+        from: EntityInputRef::Existing(EntityId::new()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, meta, payload_from) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange)
+        }
+        other => panic!(
+            "[req_ar_conf_gate_order] FAIL - gate must precede DB-dependent from-resolution, got {other:?}"
+        ),
+    }
+
+    let payload_to = AddRelationPayload {
+        to: EntityInputRef::Existing(EntityId::new()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, meta, payload_to) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange)
+        }
+        other => panic!(
+            "[req_ar_conf_gate_order] FAIL - gate must precede DB-dependent to-resolution, got {other:?}"
+        ),
+    }
+
+    let payload_source = AddRelationPayload {
+        source: SourceRef::Existing(SourceId::new()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, meta, payload_source) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange)
+        }
+        other => panic!(
+            "[req_ar_conf_gate_order] FAIL - gate must precede DB-dependent source-resolution, got {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        ar_full_table_snapshot(&conn),
+        (1, 0, 0, 0, 0, 0),
+        "[req_ar_conf_gate_order] FAIL - zero writes expected"
+    );
+}
+
+/// The only path that can persist a deliberate non-`USER_CONFIRMED`
+/// state (mirrors `AddMemory`'s `HYPOTHESIS`+`INFERRED` precedent): a
+/// direct `Explicit` call persists exactly the caller's requested
+/// `epistemic_state`.
+#[test]
+fn req_ar_explicit_persists_payload_epistemic_state_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_explicit_state.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        epistemic_state: EpistemicState::Disputed,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => assert_eq!(
+            value.epistemic_state,
+            EpistemicState::Disputed,
+            "[req_ar_explicit_state] FAIL - explicit call must persist exactly the requested epistemic_state"
+        ),
+        other => panic!("[req_ar_explicit_state] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+// --- AddRelation: endpoint matrix (R026 §15/§19 A-K) ---------------------
+
+/// A-F: every Self/Existing/New from/to combination succeeds correctly.
+#[test]
+fn req_ar_endpoint_matrix_success_combinations() {
+    // A: Self -> Existing
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_a.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let existing = mk_pk_entity("project", "EP-A Existing", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &existing).unwrap();
+        let self_id = self_entity_id(&conn);
+        let payload = AddRelationPayload {
+            from: EntityInputRef::SelfEntity,
+            to: EntityInputRef::Existing(existing.id),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.from_entity_id, self_id);
+                assert_eq!(value.to_entity_id, existing.id);
+            }
+            other => panic!("[req_ar_ep_a] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    // B: Existing -> Self
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_b.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let existing = mk_pk_entity("person", "EP-B Existing", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &existing).unwrap();
+        let self_id = self_entity_id(&conn);
+        let payload = AddRelationPayload {
+            from: EntityInputRef::Existing(existing.id),
+            to: EntityInputRef::SelfEntity,
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.from_entity_id, existing.id);
+                assert_eq!(value.to_entity_id, self_id);
+            }
+            other => panic!("[req_ar_ep_b] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    // C: Existing -> Existing (different)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_c.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let e1 = mk_pk_entity("person", "EP-C From", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &e1).unwrap();
+        let e2 = mk_pk_entity("project", "EP-C To", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &e2).unwrap();
+        let payload = AddRelationPayload {
+            from: EntityInputRef::Existing(e1.id),
+            to: EntityInputRef::Existing(e2.id),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.from_entity_id, e1.id);
+                assert_eq!(value.to_entity_id, e2.id);
+            }
+            other => panic!("[req_ar_ep_c] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    // D: New -> Existing
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_d.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let existing = mk_pk_entity("project", "EP-D Existing", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &existing).unwrap();
+        let payload = AddRelationPayload {
+            from: mk_ar_to_new("person", "EP-D New From"),
+            to: EntityInputRef::Existing(existing.id),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.to_entity_id, existing.id);
+                assert!(get_entity(&conn, value.from_entity_id).unwrap().is_some());
+            }
+            other => panic!("[req_ar_ep_d] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    // E: Existing -> New
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_e.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let existing = mk_pk_entity("person", "EP-E Existing", Sensitivity::Internal);
+        storage::personal_knowledge_repo::insert_entity(&conn, &existing).unwrap();
+        let payload = AddRelationPayload {
+            from: EntityInputRef::Existing(existing.id),
+            to: mk_ar_to_new("project", "EP-E New To"),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.from_entity_id, existing.id);
+                assert!(get_entity(&conn, value.to_entity_id).unwrap().is_some());
+            }
+            other => panic!("[req_ar_ep_e] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    // F: New -> New (different Entities)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = temp_db(&dir, "ar_ep_f.db");
+        let mut conn = bootstrap_db_at(&path, &key).unwrap();
+        let payload = AddRelationPayload {
+            from: mk_ar_to_new("person", "EP-F New From"),
+            to: mk_ar_to_new("project", "EP-F New To"),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => {
+                assert_ne!(value.from_entity_id, value.to_entity_id);
+                assert!(get_entity(&conn, value.from_entity_id).unwrap().is_some());
+                assert!(get_entity(&conn, value.to_entity_id).unwrap().is_some());
+            }
+            other => panic!("[req_ar_ep_f] FAIL - expected Success, got {other:?}"),
+        }
+    }
+    println!("[req_ar_endpoint_matrix_success] PASS - A-F: Self/Existing/New in every from/to combination succeed correctly");
+}
+
+/// G: Self -> Self rejected.
+#[test]
+fn req_ar_endpoint_g_self_to_self_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_ep_g.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::SelfEntity,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::SelfPersonalKnowledgeRelation))
+        }
+        other => panic!(
+            "[req_ar_ep_g] FAIL - expected ValidationFailed(SelfPersonalKnowledgeRelation), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+/// H: Existing(X) -> Existing(X) rejected.
+#[test]
+fn req_ar_endpoint_h_existing_x_to_existing_x_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_ep_h.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let x = mk_pk_entity("person", "EP-H X", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &x).unwrap();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::Existing(x.id),
+        to: EntityInputRef::Existing(x.id),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::SelfPersonalKnowledgeRelation))
+        }
+        other => panic!(
+            "[req_ar_ep_h] FAIL - expected ValidationFailed(SelfPersonalKnowledgeRelation), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+/// I: `SelfEntity` + `Existing(actual SELF id)` - the pure structural
+/// fast path in `validate_add_relation` cannot catch this (it never
+/// resolves `SelfEntity` to a concrete id); only the AUTHORITATIVE check
+/// in `services::add_relation`, after resolution, catches it.
+#[test]
+fn req_ar_endpoint_i_self_to_existing_self_id_rejected_after_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_ep_i.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::Existing(self_id),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::SelfPersonalKnowledgeRelation))
+        }
+        other => panic!(
+            "[req_ar_ep_i] FAIL - expected ValidationFailed(SelfPersonalKnowledgeRelation), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+/// J: missing `from` Existing reference.
+#[test]
+fn req_ar_endpoint_j_missing_from_existing_returns_validation_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_ep_j.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::Existing(EntityId::new()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedEntityNotFound))
+        }
+        other => panic!(
+            "[req_ar_ep_j] FAIL - expected ValidationFailed(ReferencedEntityNotFound), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+/// K: missing `to` Existing reference.
+#[test]
+fn req_ar_endpoint_k_missing_to_existing_returns_validation_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_ep_k.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        to: EntityInputRef::Existing(EntityId::new()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedEntityNotFound))
+        }
+        other => panic!(
+            "[req_ar_ep_k] FAIL - expected ValidationFailed(ReferencedEntityNotFound), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+// --- AddRelation: duplicate domain_ref (R026 §11/§17 A-D) ---------------
+
+/// A/D: same-payload duplicate - both `from`/`to` are `New` with the
+/// SAME `domain_ref` - rejected by the PURE, no-SQL same-payload
+/// preflight check.
+#[test]
+fn req_ar_dup_domainref_same_payload_both_new_same_ref_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_dup_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("AR dup goal a")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal.id.to_string(),
+    };
+    let from = EntityInputRef::New(NewEntityData {
+        entity_type: "goal".to_string(),
+        canonical_name: "AR Dup From".to_string(),
+        sensitivity: Sensitivity::Internal,
+        domain_ref: Some(domain_ref.clone()),
+    });
+    let to = EntityInputRef::New(NewEntityData {
+        entity_type: "goal".to_string(),
+        canonical_name: "AR Dup To".to_string(),
+        sensitivity: Sensitivity::Internal,
+        domain_ref: Some(domain_ref),
+    });
+    let payload = AddRelationPayload {
+        from,
+        to,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateDomainReference))
+        }
+        other => panic!(
+            "[req_ar_dup_a] FAIL - expected ValidationFailed(DuplicateDomainReference), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+    assert_eq!(
+        entity_row_count(&conn),
+        1,
+        "[req_ar_dup_a] FAIL - only SELF should exist, zero writes"
+    );
+}
+
+/// B: persisted duplicate on `from`.
+#[test]
+fn req_ar_dup_domainref_persisted_on_from_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_dup_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("AR dup goal b")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal.id.to_string(),
+    };
+    let mut existing_entity = mk_pk_entity("goal", "AR Dup B Existing", Sensitivity::Internal);
+    existing_entity.domain_ref = Some(domain_ref.clone());
+    storage::personal_knowledge_repo::insert_entity(&conn, &existing_entity).unwrap();
+
+    let from = EntityInputRef::New(NewEntityData {
+        entity_type: "goal".to_string(),
+        canonical_name: "AR Dup B New".to_string(),
+        sensitivity: Sensitivity::Internal,
+        domain_ref: Some(domain_ref),
+    });
+    let payload = AddRelationPayload {
+        from,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateDomainReference))
+        }
+        other => panic!(
+            "[req_ar_dup_b] FAIL - expected ValidationFailed(DuplicateDomainReference), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+/// C: persisted duplicate on `to`.
+#[test]
+fn req_ar_dup_domainref_persisted_on_to_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_dup_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("AR dup goal c")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal.id.to_string(),
+    };
+    let mut existing_entity = mk_pk_entity("goal", "AR Dup C Existing", Sensitivity::Internal);
+    existing_entity.domain_ref = Some(domain_ref.clone());
+    storage::personal_knowledge_repo::insert_entity(&conn, &existing_entity).unwrap();
+
+    let to = EntityInputRef::New(NewEntityData {
+        entity_type: "goal".to_string(),
+        canonical_name: "AR Dup C New".to_string(),
+        sensitivity: Sensitivity::Internal,
+        domain_ref: Some(domain_ref),
+    });
+    let payload = AddRelationPayload {
+        to,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateDomainReference))
+        }
+        other => panic!(
+            "[req_ar_dup_c] FAIL - expected ValidationFailed(DuplicateDomainReference), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+// --- AddRelation: no duplicate-edge dedup (R026 §20) ---------------------
+
+/// R025 froze NO Relation deduplication - two successful AddRelation
+/// calls with identical (from, relation_type, to) create two distinct
+/// Relations with distinct RelationIds; both rows survive.
+#[test]
+fn req_ar_no_dedup_two_identical_edges_both_survive_distinct_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_no_dedup.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let to_entity = mk_pk_entity("project", "No Dedup Target", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to_entity).unwrap();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::Existing(to_entity.id),
+        relation_type: "works_on".to_string(),
+        ..mk_ar_payload()
+    };
+
+    let id1 = match add_relation(&mut conn, ui_explicit(), payload.clone()) {
+        ActionOutcome::Success { value, .. } => value.id,
+        other => panic!("[req_ar_no_dedup] FAIL - first call: expected Success, got {other:?}"),
+    };
+    let id2 = match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => value.id,
+        other => panic!("[req_ar_no_dedup] FAIL - second call: expected Success, got {other:?}"),
+    };
+    assert_ne!(
+        id1, id2,
+        "[req_ar_no_dedup] FAIL - two independent AddRelation calls must create distinct RelationIds"
+    );
+    assert_eq!(
+        relation_row_count(&conn),
+        2,
+        "[req_ar_no_dedup] FAIL - both identical-looking Relations must survive, no implicit dedup/merge/auto-STALE"
+    );
+}
+
+// --- AddRelation: relation_type policy (R026 §16/§36) --------------------
+
+#[test]
+fn req_ar_relation_type_open_value_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_rt_open.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        relation_type: "THIS_IS_NOT_A_GOALRELATION_VALUE".to_string(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.relation_type, "THIS_IS_NOT_A_GOALRELATION_VALUE")
+        }
+        other => panic!("[req_ar_rt_open] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+#[test]
+fn req_ar_relation_type_blank_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_rt_blank.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        relation_type: "   ".to_string(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::PersonalKnowledgeFieldEmpty {
+                    field: "relation_type"
+                })
+            )
+        }
+        other => panic!("[req_ar_rt_blank] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(relation_row_count(&conn), 0);
+}
+
+#[test]
+fn req_ar_relation_type_length_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_rt_len.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let exact = "x".repeat(crate::domain::RELATION_TYPE_MAX_LEN);
+    let payload_exact = AddRelationPayload {
+        relation_type: exact.clone(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_exact) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value.relation_type, exact),
+        other => {
+            panic!("[req_ar_rt_len] FAIL - exact-length relation_type rejected, got {other:?}")
+        }
+    }
+
+    let too_long = "x".repeat(crate::domain::RELATION_TYPE_MAX_LEN + 1);
+    let payload_too_long = AddRelationPayload {
+        relation_type: too_long,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_too_long) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PersonalKnowledgeFieldTooLong { field, .. } if *field == "relation_type"
+            )))
+        }
+        other => {
+            panic!("[req_ar_rt_len] FAIL - N+1-length relation_type NOT rejected, got {other:?}")
+        }
+    }
+}
+
+// --- AddRelation: note policy (R026 §16/§37) -----------------------------
+
+#[test]
+fn req_ar_note_none_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_note_none.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddRelationPayload {
+        note: None,
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => assert!(value.note.is_none()),
+        other => panic!("[req_ar_note_none] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// R025 §12's frozen policy: no trim, no semantic normalization -
+/// empty/whitespace-only note is accepted and preserved exactly.
+#[test]
+fn req_ar_note_empty_and_whitespace_preserved_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_note_ws.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload_empty = AddRelationPayload {
+        note: Some("".to_string()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_empty) {
+        ActionOutcome::Success { value, .. } => assert_eq!(
+            value.note,
+            Some("".to_string()),
+            "[req_ar_note_ws] FAIL - empty note must be preserved exactly, no trim-to-None"
+        ),
+        other => panic!("[req_ar_note_ws] FAIL - expected Success for empty note, got {other:?}"),
+    }
+
+    let payload_ws = AddRelationPayload {
+        note: Some("   ".to_string()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_ws) {
+        ActionOutcome::Success { value, .. } => assert_eq!(
+            value.note,
+            Some("   ".to_string()),
+            "[req_ar_note_ws] FAIL - whitespace-only note must be preserved exactly"
+        ),
+        other => {
+            panic!("[req_ar_note_ws] FAIL - expected Success for whitespace note, got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn req_ar_note_length_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_note_len.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let exact = "n".repeat(crate::domain::RELATION_NOTE_MAX_LEN);
+    let payload_exact = AddRelationPayload {
+        note: Some(exact.clone()),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_exact) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value.note, Some(exact)),
+        other => panic!("[req_ar_note_len] FAIL - exact-length note rejected, got {other:?}"),
+    }
+
+    let too_long = "n".repeat(crate::domain::RELATION_NOTE_MAX_LEN + 1);
+    let payload_too_long = AddRelationPayload {
+        note: Some(too_long),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload_too_long) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PersonalKnowledgeFieldTooLong { field, .. } if *field == "note"
+            )))
+        }
+        other => panic!("[req_ar_note_len] FAIL - N+1-length note NOT rejected, got {other:?}"),
+    }
+}
+
+// --- AddRelation: confidence matrix (R026 §38) ---------------------------
+
+#[test]
+fn req_ar_confidence_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_confidence.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for accepted in [None, Some(0.0f32), Some(1.0f32), Some(0.5f32)] {
+        let payload = AddRelationPayload {
+            confidence: accepted,
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => assert_eq!(value.confidence, accepted),
+            other => {
+                panic!("[req_ar_confidence] FAIL - {accepted:?} should be accepted, got {other:?}")
+            }
+        }
+    }
+
+    for rejected in [
+        -0.01f32,
+        1.01f32,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        let payload = AddRelationPayload {
+            confidence: Some(rejected),
+            ..mk_ar_payload()
+        };
+        match add_relation(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::ValidationFailed(errors) => assert!(errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfidenceOutOfBounds { .. }))),
+            other => {
+                panic!("[req_ar_confidence] FAIL - {rejected:?} should be rejected, got {other:?}")
+            }
+        }
+    }
+}
+
+// --- AddRelation: Source/Evidence lifecycle (R026 §21/§22/§35) ----------
+
+#[test]
+fn req_ar_source_existing_reused_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_source_existing.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let source = mk_pk_source("document", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let before = read_source_fields(&conn, source.id);
+
+    let payload = AddRelationPayload {
+        source: SourceRef::Existing(source.id),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_ar_source_existing] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        before,
+        read_source_fields(&conn, source.id),
+        "[req_ar_source_existing] FAIL - Existing Source must never be mutated"
+    );
+    assert_eq!(
+        am_source_row_count(&conn),
+        1,
+        "[req_ar_source_existing] FAIL - no new Source should be created"
+    );
+}
+
+/// Evidence is always fresh (never reused across two `AddRelation`
+/// calls sharing the same Source), and the resulting `relation_evidence`
+/// link is exact: `relation_id`/`evidence_id`/`created_at` correct,
+/// exactly one link per Relation, Evidence row exists.
+#[test]
+fn req_ar_evidence_always_fresh_and_relation_evidence_link_defense() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_evidence_fresh.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let source = mk_pk_source("document", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+
+    let payload = AddRelationPayload {
+        source: SourceRef::Existing(source.id),
+        ..mk_ar_payload()
+    };
+    let relation1 = match add_relation(&mut conn, ui_explicit(), payload.clone()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => {
+            panic!("[req_ar_evidence_fresh] FAIL - first call: expected Success, got {other:?}")
+        }
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { .. } => {}
+        other => {
+            panic!("[req_ar_evidence_fresh] FAIL - second call: expected Success, got {other:?}")
+        }
+    }
+
+    assert_eq!(
+        am_evidence_row_count(&conn),
+        2,
+        "[req_ar_evidence_fresh] FAIL - each AddRelation call must create its own fresh Evidence, never reuse"
+    );
+
+    let (rel_id, ev_id, created_at): (String, String, String) = conn
+        .query_row(
+            "SELECT relation_id, evidence_id, created_at FROM relation_evidence WHERE relation_id = ?1",
+            rusqlite::params![relation1.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rel_id, relation1.id.to_string());
+    let link_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relation_evidence WHERE relation_id = ?1",
+            rusqlite::params![relation1.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        link_count, 1,
+        "[req_ar_evidence_fresh] FAIL - exactly one relation_evidence link expected per Relation"
+    );
+    let evidence_row_exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE id = ?1",
+            rusqlite::params![ev_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_row_exists, 1);
+    assert_eq!(created_at, relation1.created_at.to_rfc3339());
+    println!("[req_ar_evidence_fresh] PASS - Evidence is always fresh; relation_evidence link is exact and unique per Relation");
+}
+
+// --- AddRelation: timestamps and audit exactness (R026 §23/§25/§26) -----
+
+#[test]
+fn req_ar_timestamps_exact_from_fixed_requested_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_timestamps.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let fixed = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let meta = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: fixed,
+        confirmed: false,
+    };
+    match add_relation(&mut conn, meta, mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(
+                value.valid_from, fixed,
+                "[req_ar_timestamps] FAIL - valid_from must equal meta.requested_at exactly"
+            );
+            assert_eq!(
+                value.created_at, fixed,
+                "[req_ar_timestamps] FAIL - created_at must equal meta.requested_at exactly"
+            );
+            assert!(
+                value.valid_until.is_none(),
+                "[req_ar_timestamps] FAIL - valid_until must always start None"
+            );
+        }
+        other => panic!("[req_ar_timestamps] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+#[test]
+fn req_ar_audit_exact_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_audit_explicit.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let fixed = chrono::DateTime::parse_from_rfc3339("2026-02-01T08:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Explicit,
+        requested_at: fixed,
+        confirmed: false,
+    };
+    let relation = match add_relation(&mut conn, meta, mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_ar_audit_explicit] FAIL - expected Success, got {other:?}"),
+    };
+    let (relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at FROM relation_audit_log WHERE relation_id = ?1",
+            rusqlite::params![relation.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap();
+    assert_eq!(relation_id, relation.id.to_string());
+    assert_eq!(action_type, "AddRelation");
+    assert_eq!(actor, "CloudLLM");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    assert_eq!(previous_snapshot, None);
+    assert_eq!(occurred_at, fixed.to_rfc3339());
+}
+
+#[test]
+fn req_ar_audit_exact_inferred_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_audit_inferred.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let fixed = chrono::DateTime::parse_from_rfc3339("2026-02-02T09:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Inferred,
+        requested_at: fixed,
+        confirmed: true,
+    };
+    let relation = match add_relation(&mut conn, meta, mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed);
+            value
+        }
+        other => panic!("[req_ar_audit_inferred] FAIL - expected Success, got {other:?}"),
+    };
+    let (provenance, confirmation_class): (String, String) = conn
+        .query_row(
+            "SELECT provenance, confirmation_class FROM relation_audit_log WHERE relation_id = ?1",
+            rusqlite::params![relation.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(provenance, "Inferred");
+    assert_eq!(confirmation_class, "INFERRED_CHANGE");
+}
+
+// --- AddRelation: transaction atomicity / rollback (R026 §27-29) --------
+
+/// MANDATORY: the richest possible `AddRelation` (New `from`, New `to`,
+/// New Source, fresh Evidence, Relation, `relation_evidence`), with the
+/// FINAL audit-log insert forced to fail - every newly-created row must
+/// roll back, SELF must survive untouched, and the connection must
+/// remain usable afterward.
+#[test]
+fn req_ar_forced_final_audit_failure_rolls_back_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_rollback_final.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = ar_full_table_snapshot(&conn);
+
+    install_relation_audit_failure_trigger(&conn);
+    let payload = AddRelationPayload {
+        from: mk_ar_to_new("person", "Rollback New From"),
+        to: mk_ar_to_new("project", "Rollback New To"),
+        source: mk_am_source_new(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_ar_rollback_final] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_relation_audit_failure_trigger(&conn);
+
+    let after = ar_full_table_snapshot(&conn);
+    assert_eq!(
+        before, after,
+        "[req_ar_rollback_final] FAIL - forced final-audit failure must roll back EVERY newly-created row (Entities/Source/Relation/Evidence/relation_evidence/audit)"
+    );
+    assert!(
+        storage::personal_knowledge_repo::get_self_entity(&conn)
+            .unwrap()
+            .is_some(),
+        "[req_ar_rollback_final] FAIL - SELF must still exist"
+    );
+
+    match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => {
+            panic!("[req_ar_rollback_final] FAIL - connection unusable after rollback: {other:?}")
+        }
+    }
+}
+
+/// An earlier-stage forced failure (Evidence insert, before the final
+/// audit write) must also roll back the already-created Entities/
+/// Source/Relation in the same transaction, not only the last step.
+#[test]
+fn req_ar_earlier_stage_evidence_failure_rolls_back_entities_source_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_rollback_earlier.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = ar_full_table_snapshot(&conn);
+
+    install_evidence_insert_failure_trigger(&conn);
+    let payload = AddRelationPayload {
+        from: mk_ar_to_new("person", "Earlier Rollback From"),
+        to: mk_ar_to_new("project", "Earlier Rollback To"),
+        source: mk_am_source_new(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_ar_rollback_earlier] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_evidence_insert_failure_trigger(&conn);
+
+    let after = ar_full_table_snapshot(&conn);
+    assert_eq!(
+        before, after,
+        "[req_ar_rollback_earlier] FAIL - an earlier-stage forced failure (Evidence insert) must also roll back the already-created Entities/Source/Relation in the same transaction"
+    );
+}
+
+// --- AddRelation: immutability of reused rows (R026 §30/§31) ------------
+
+#[test]
+fn req_ar_existing_entity_and_source_immutable_after_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_immutable.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let entity = mk_pk_entity("person", "Immutable Entity", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &entity).unwrap();
+    let source = mk_pk_source("document", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let entity_before = get_entity(&conn, entity.id).unwrap().unwrap();
+    let source_before = read_source_fields(&conn, source.id);
+
+    let payload = AddRelationPayload {
+        from: EntityInputRef::Existing(entity.id),
+        source: SourceRef::Existing(source.id),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_ar_immutable] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        get_entity(&conn, entity.id).unwrap().unwrap(),
+        entity_before,
+        "[req_ar_immutable] FAIL - Existing Entity must never be mutated"
+    );
+    assert_eq!(
+        read_source_fields(&conn, source.id),
+        source_before,
+        "[req_ar_immutable] FAIL - Existing Source must never be mutated"
+    );
+}
+
+#[test]
+fn req_ar_self_entity_immutable_after_use_as_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_self_immutable.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_before = storage::personal_knowledge_repo::get_self_entity(&conn)
+        .unwrap()
+        .unwrap();
+
+    match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value.from_entity_id, self_before.id),
+        other => panic!("[req_ar_self_immutable] FAIL - expected Success, got {other:?}"),
+    }
+    let self_after = storage::personal_knowledge_repo::get_self_entity(&conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        self_after, self_before,
+        "[req_ar_self_immutable] FAIL - SELF must be byte-for-byte unchanged after use as a Relation endpoint"
+    );
+}
+
+// --- AddRelation: zero Fact/Episode side effects, no temporal/inverse
+// side effects (R026 §34/§42/§43) ----------------------------------------
+
+#[test]
+fn req_ar_zero_fact_episode_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_zero_side_effects.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = relation_episode_side_effect_counts(&conn);
+    let before_facts = am_fact_row_count(&conn);
+    let before_fact_evidence = am_fact_evidence_row_count(&conn);
+
+    match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_ar_zero_side_effects] FAIL - expected Success, got {other:?}"),
+    }
+
+    let after = relation_episode_side_effect_counts(&conn);
+    // `relations`/`relation_evidence` (indices 0/2) are EXPECTED to
+    // change - that is AddRelation's whole point.
+    assert_eq!(
+        after.1, before.1,
+        "[req_ar_zero_side_effects] FAIL - episodes must be untouched"
+    );
+    assert_eq!(
+        after.3, before.3,
+        "[req_ar_zero_side_effects] FAIL - episode_evidence must be untouched"
+    );
+    assert_eq!(
+        after.4, before.4,
+        "[req_ar_zero_side_effects] FAIL - episode_entities must be untouched"
+    );
+    assert_eq!(
+        am_fact_row_count(&conn),
+        before_facts,
+        "[req_ar_zero_side_effects] FAIL - facts must be untouched"
+    );
+    assert_eq!(
+        am_fact_evidence_row_count(&conn),
+        before_fact_evidence,
+        "[req_ar_zero_side_effects] FAIL - fact_evidence must be untouched"
+    );
+}
+
+#[test]
+fn req_ar_no_temporal_side_effects_on_pre_existing_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_no_temporal_side_effects.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let to_entity = mk_pk_entity("project", "Temporal Target", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to_entity).unwrap();
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::Existing(to_entity.id),
+        relation_type: "works_on".to_string(),
+        ..mk_ar_payload()
+    };
+
+    let first = match add_relation(&mut conn, ui_explicit(), payload.clone()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_ar_no_temporal] FAIL - first call: expected Success, got {other:?}"),
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_ar_no_temporal] FAIL - second call: expected Success, got {other:?}"),
+    }
+
+    let first_after = get_relation(&conn, first.id).unwrap().unwrap();
+    assert_eq!(
+        first_after, first,
+        "[req_ar_no_temporal] FAIL - a second AddRelation must never close/supersede/mark STALE a pre-existing identical Relation"
+    );
+}
+
+#[test]
+fn req_ar_no_inverse_or_symmetric_auto_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_no_inverse.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let to_entity = mk_pk_entity("project", "Inverse Target", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to_entity).unwrap();
+    let self_id = self_entity_id(&conn);
+    let payload = AddRelationPayload {
+        from: EntityInputRef::SelfEntity,
+        to: EntityInputRef::Existing(to_entity.id),
+        relation_type: "works_on".to_string(),
+        ..mk_ar_payload()
+    };
+    match add_relation(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_ar_no_inverse] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        relation_row_count(&conn),
+        1,
+        "[req_ar_no_inverse] FAIL - exactly one edge expected, no automatic inverse/symmetric counterpart"
+    );
+    let inverse_exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relations WHERE from_entity_id = ?1 AND to_entity_id = ?2",
+            rusqlite::params![to_entity.id.to_string(), self_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        inverse_exists, 0,
+        "[req_ar_no_inverse] FAIL - no inverse edge should exist"
+    );
+}
+
+// --- AddRelation: RelationId generation and output equality (R026 §40/§41) --
+
+#[test]
+fn req_ar_relation_id_distinct_and_output_matches_get_relation_readback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "ar_id_readback.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let r1 = match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_ar_id_readback] FAIL - first call: expected Success, got {other:?}"),
+    };
+    let r2 = match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_ar_id_readback] FAIL - second call: expected Success, got {other:?}"),
+    };
+    assert_ne!(
+        r1.id, r2.id,
+        "[req_ar_id_readback] FAIL - two AddRelation calls must produce distinct RelationIds"
+    );
+
+    let readback1 = get_relation(&conn, r1.id)
+        .unwrap()
+        .expect("[req_ar_id_readback] FAIL - r1 not found via get_relation");
+    assert_eq!(
+        readback1, r1,
+        "[req_ar_id_readback] FAIL - the returned Relation must exactly equal get_relation's read-back, no partial/in-memory-only representation"
     );
 }

@@ -1022,5 +1022,50 @@ pub(crate) fn is_active_fact(fact: &Fact) -> bool {
     fact.valid_until.is_none() && fact.epistemic_state != EpistemicState::Stale
 }
 
+/// `Relation` (M2 Personal Knowledge Relation Foundation, R026,
+/// 2026-09-18) - a directional assertion connecting two Personal
+/// Knowledge `Entity` rows: `from_entity_id --relation_type-->
+/// to_entity_id`. Field set is exactly the frozen v0.1 shape (R025 §24,
+/// corrected by R025's own post-freeze schema-scope consistency
+/// addendum) - **deliberately no `updated_at`**: `relation_type` is
+/// open-vocabulary text, identical in kind to `Fact.predicate`, never a
+/// closed enum, and never confused with `GoalRelation.relation_type` (a
+/// completely different, closed 11-value enum on a completely different
+/// entity, R017 §8). Structurally analogous to `Fact` (same
+/// `epistemic_state`/`confidence`/`sensitivity`/`valid_from`/
+/// `valid_until` shape), but its identity is the full triple
+/// `(from_entity_id, relation_type, to_entity_id)` with no separate
+/// correctable "value" the way `Fact` has - see R025 §16 for the full
+/// reasoning behind why this struct has no `superseded_by_relation_id`
+/// either.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Relation {
+    pub id: RelationId,
+    pub from_entity_id: EntityId,
+    pub to_entity_id: EntityId,
+    pub relation_type: String,
+    pub note: Option<String>,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Canonical "is this Relation currently active" predicate (R026,
+/// mirroring `is_active_fact` exactly per R025 §14/§16's explicit
+/// instruction to follow the existing frozen Fact convention rather than
+/// invent a second one). `valid_until` is a pure open/closed marker,
+/// never compared against wall-clock "now" - `Some(timestamp)`
+/// unconditionally means closed, matching `is_active_fact`'s own
+/// behavior. No v0.1 action currently ever sets `valid_until` on a
+/// Relation (R025 §28's deliberately deferred "soft closure" gap) - this
+/// predicate exists as frozen future infrastructure for
+/// `CorrectRelation`/`ConfirmRelation`, neither implemented this run.
+pub(crate) fn is_active_relation(relation: &Relation) -> bool {
+    relation.valid_until.is_none() && relation.epistemic_state != EpistemicState::Stale
+}
+
 #[cfg(test)]
 mod tests;

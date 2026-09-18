@@ -136,7 +136,19 @@ and `sensitivity` (`NOT NULL`, `Option<Sensitivity>` - corrected
 2026-09-18, the original freeze had incorrectly used `FieldPatch` for
 this non-nullable field) - never `from`/`to`/`relation_type`, which
 together form Relation's identity - so, unlike `CorrectMemory`, no
-successor-row/`superseded_by_relation_id` mechanism is needed. Episode
+successor-row/`superseded_by_relation_id` mechanism is needed.
+**(2026-09-18, R026)** `V8` (`relation_audit_log` only) is now real,
+migrated, and tested; `Relation`'s domain struct, `is_active_relation`,
+and the minimum `get_relation` read all exist; `AddRelation` - the first
+production Relation mutation - is real, implemented, and tested
+(461/461 tests). It reuses `EntityInputRef`/`SourceRef`/
+`resolve_entity_input_ref`/`resolve_source_ref`/the confirmation-gate-
+before-DB-dependent-validation ordering verbatim from the Memory family;
+the only new logic is a two-layer self-edge defense (a pure structural
+fast path plus an authoritative post-resolution check) and one new
+`ValidationError::SelfPersonalKnowledgeRelation` variant.
+`CorrectRelation`/`ConfirmRelation`/`ForgetRelation` remain
+unimplemented. Episode
 actions and
 retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 §4o-§4v and §10,
@@ -149,12 +161,14 @@ retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`,
 and
 `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`,
-`docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`.
+`docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`,
+`docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
-Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E).
+Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E plus
+the Relation Foundation/`AddRelation` slice, R026).
 
 ---
 
@@ -924,6 +938,25 @@ relaxation (the existing DB `CHECK (from_entity_id <> to_entity_id)` is
 reaffirmed correct). Full reasoning, the ten-plus Relation-vs-Fact boundary
 examples, and the complete gap-analysis table are in
 `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`.
+
+**As of 2026-09-18 (R026), the frozen V8 scope and `AddRelation` are both
+real, implemented code, not just design.** `migrations/V8__create_relation_audit_log.sql`
+adds exactly the frozen `relation_audit_log` table and nothing else (no
+`ALTER TABLE relations`, confirmed by a dedicated schema-diff test);
+`domain::Relation`/`domain::is_active_relation` exist exactly as R025
+froze them; `services::get_relation` is the minimum read;
+`services::add_relation` is the first production Relation mutation,
+reusing `EntityInputRef`/`SourceRef`/`resolve_entity_input_ref`/
+`resolve_source_ref`/the hardened confirmation-gate-before-DB-dependent-
+validation ordering verbatim from `AddMemory` — the only genuinely new
+logic is a two-layer self-edge defense (a pure structural fast path in
+`actions::validate_add_relation`, plus an authoritative post-resolution
+check in `services::add_relation` that catches every case the pure path
+cannot, e.g. `SelfEntity` + `Existing(actual SELF id)`) and one new
+`ValidationError::SelfPersonalKnowledgeRelation` variant. 461/461 tests
+pass (400 prior + 61 new). `CorrectRelation`/`ConfirmRelation`/
+`ForgetRelation` remain unimplemented — see
+`docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a

@@ -24,8 +24,8 @@ use crate::domain::{
     TaskStatus, CANONICAL_NAME_MAX_LEN, DESCRIPTION_MAX_LEN, DOMAIN_REF_ID_MAX_LEN,
     DOMAIN_REF_TYPE_MAX_LEN, DOMAIN_TAG_MAX_LEN, ENTITY_TYPE_MAX_LEN, EVIDENCE_CONTENT_MAX_LEN,
     EVIDENCE_LOCATOR_MAX_LEN, ORDER_INDEX_MIN, PREDICATE_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN,
-    PROGRESS_MAX, PROGRESS_MIN, SOURCE_LABEL_MAX_LEN, SOURCE_REFERENCE_MAX_LEN,
-    SOURCE_TYPE_MAX_LEN, TITLE_MAX_LEN, VALUE_JSON_MAX_LEN,
+    PROGRESS_MAX, PROGRESS_MIN, RELATION_NOTE_MAX_LEN, RELATION_TYPE_MAX_LEN, SOURCE_LABEL_MAX_LEN,
+    SOURCE_REFERENCE_MAX_LEN, SOURCE_TYPE_MAX_LEN, TITLE_MAX_LEN, VALUE_JSON_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -351,6 +351,21 @@ pub(crate) enum ValidationError {
     /// 2026-09-18). Needs a database read, so `services::confirm_memory`
     /// performs it and reports it here.
     FactAlreadyUserConfirmed,
+    /// `AddRelation`'s `from`/`to` resolve to the same `Entity` - a
+    /// Personal Knowledge `Relation` self-edge (M2 Personal Knowledge
+    /// Relation Foundation, R026, 2026-09-18; frozen R025 §20, retaining
+    /// the existing DB `CHECK (from_entity_id <> to_entity_id)`).
+    /// Deliberately its own variant, never reused from `SelfGoalRelation`
+    /// (that variant is `GoalRelation`-specific, a completely different
+    /// entity/table, R017 §8). `actions::validate_add_relation` catches
+    /// the PURE cases structure alone already proves
+    /// (`SelfEntity`+`SelfEntity`, or `Existing(id)`+`Existing(id)` with
+    /// equal ids) as a defense/usability fast path; the AUTHORITATIVE
+    /// check, catching every case (including `SelfEntity` +
+    /// `Existing(actual SELF id)`), runs in `services::add_relation`
+    /// after both endpoints are resolved to concrete `EntityId`s - zero
+    /// writes either way.
+    SelfPersonalKnowledgeRelation,
 }
 
 #[derive(Debug, Clone)]
@@ -1407,6 +1422,129 @@ pub(crate) fn validate_add_memory(
         predicate: predicate.expect("validated above"),
         value: value.expect("validated above"),
         memory_type: payload.memory_type,
+        epistemic_state: payload.epistemic_state,
+        confidence: payload.confidence,
+        sensitivity: payload.sensitivity,
+        source: source.expect("validated above"),
+        evidence: evidence.expect("validated above"),
+    })
+}
+
+// --- Personal Knowledge: AddRelation (M2 Personal Knowledge Relation
+// Foundation, R026, 2026-09-18) -------------------------------------------
+//
+// The only way to assert a new Personal Knowledge `Relation` - a
+// directional assertion connecting two `Entity` rows (R025 §7/§8).
+// Reuses `EntityInputRef`/`SourceRef`/`NewSourceData`/`NewEvidenceData`
+// verbatim from the Memory family - no Relation-specific parallel types
+// (R025 §9's explicit instruction). No implicit deduplication ever
+// happens as a side effect of this action - two explicit `AddRelation`
+// calls may create two Relations with the same `(from, relation_type,
+// to)` and different `RelationId`s (R025 §14, "NO Relation
+// deduplication" - the same non-dedup philosophy `AddMemory` already
+// established for `Fact`).
+
+/// The frozen `AddRelation` payload (R025 §9). No `valid_from`/
+/// `valid_until`/`RelationId`/`created_at`/`updated_at` input - all
+/// Core-generated; no inverse/symmetric flag (R025 §20 - Relation is
+/// always stored directionally with no automatic inverse); no dedup
+/// flag.
+#[derive(Debug, Clone)]
+pub(crate) struct AddRelationPayload {
+    pub from: EntityInputRef,
+    pub to: EntityInputRef,
+    pub relation_type: String,
+    pub note: Option<String>,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// `validate_add_relation`'s success output - same normalization
+/// convention as `NormalizedAddMemory`: `relation_type` is an
+/// identifier-like field and gets trimmed; `note` is free text and is
+/// preserved exactly as supplied, never trimmed or normalized (R025
+/// §12 - "Do not conflate note with Evidence.content", no trim-to-`None`
+/// either).
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedAddRelation {
+    pub from: EntityInputRef,
+    pub to: EntityInputRef,
+    pub relation_type: String,
+    pub note: Option<String>,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// Pure structural validation for `AddRelation` - no database read
+/// (Entity/Source existence, domain-ref authoritative existence,
+/// persisted-duplicate-domain-ref checks, and the AUTHORITATIVE resolved
+/// self-edge check all need one; `services::add_relation` performs
+/// them). Reuses `validate_entity_input_ref`/`validate_source_ref`/
+/// `validate_new_evidence_data`/`validate_confidence` unmodified - no
+/// Relation-specific copies (R026 §9/§10 - "Do not create Relation-
+/// specific copies... if they can be safely reused").
+///
+/// Includes a PURE self-edge fast path, defense/usability only: when
+/// structure alone already proves the two endpoints are definitely the
+/// same (`SelfEntity`+`SelfEntity`, or `Existing(id)`+`Existing(id)` with
+/// equal ids), this rejects before confirmation/DB access with
+/// `ValidationError::SelfPersonalKnowledgeRelation`. It cannot catch
+/// every self-edge case (e.g. `SelfEntity` + `Existing(actual SELF id)`
+/// needs resolution first) - the AUTHORITATIVE check after endpoint
+/// resolution in `services::add_relation` is what actually enforces the
+/// rule for every case (R025 §18/§20; R026 §10/§18).
+pub(crate) fn validate_add_relation(
+    payload: &AddRelationPayload,
+) -> Result<NormalizedAddRelation, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    let from = validate_entity_input_ref(&payload.from, &mut errors);
+    let to = validate_entity_input_ref(&payload.to, &mut errors);
+    let relation_type = validate_pk_required_field(
+        "relation_type",
+        &payload.relation_type,
+        RELATION_TYPE_MAX_LEN,
+        &mut errors,
+    );
+    if let Some(note) = &payload.note {
+        validate_pk_optional_field("note", note, RELATION_NOTE_MAX_LEN, &mut errors);
+    }
+    validate_confidence(payload.confidence, &mut errors);
+    let source = validate_source_ref(&payload.source, &mut errors);
+    let evidence = validate_new_evidence_data(&payload.evidence, &mut errors);
+
+    let pure_self_edge = match (&payload.from, &payload.to) {
+        (EntityInputRef::SelfEntity, EntityInputRef::SelfEntity) => true,
+        (EntityInputRef::Existing(f), EntityInputRef::Existing(t)) => f == t,
+        _ => false,
+    };
+    if pure_self_edge {
+        errors.push(ValidationError::SelfPersonalKnowledgeRelation);
+    }
+
+    if let (Some(EntityInputRef::New(f)), Some(EntityInputRef::New(t))) = (&from, &to) {
+        if let (Some(fd), Some(td)) = (&f.domain_ref, &t.domain_ref) {
+            if fd == td {
+                errors.push(ValidationError::DuplicateDomainReference);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(NormalizedAddRelation {
+        from: from.expect("validated above"),
+        to: to.expect("validated above"),
+        relation_type: relation_type.expect("validated above"),
+        note: payload.note.clone(),
         epistemic_state: payload.epistemic_state,
         confidence: payload.confidence,
         sensitivity: payload.sensitivity,

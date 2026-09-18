@@ -19,17 +19,18 @@ mod storage;
 
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
-    AddMilestonePayload, AddTaskPayload, ConfirmMemoryPayload, ConfirmationClass,
-    CorrectMemoryPayload, CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput,
-    FieldPatch, ForgetMemoryPayload, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload,
-    UpdateMilestonePayload, UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload,
-    ValidationError,
+    AddMilestonePayload, AddRelationPayload, AddTaskPayload, ConfirmMemoryPayload,
+    ConfirmationClass, CorrectMemoryPayload, CreateGoalPayload, CreateProjectPayload,
+    EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload, LinkGoalsPayload, Provenance,
+    SourceRef, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
+    UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
     is_active_fact, Entity, EntityId, EpistemicState, Evidence, EvidenceId, Fact, FactId,
     FactValue, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
-    MilestoneStatus, Project, ProjectId, Sensitivity, Source, SourceId, Task, TaskId, TaskStatus,
+    MilestoneStatus, Project, ProjectId, Relation, RelationId, Sensitivity, Source, SourceId, Task,
+    TaskId, TaskStatus,
 };
 use crate::security;
 use chrono::Utc;
@@ -1600,6 +1601,17 @@ pub(crate) fn get_fact(conn: &Connection, id: FactId) -> Result<Option<Fact>, ru
     storage::personal_knowledge_repo::get_fact(conn, id)
 }
 
+/// The minimum required Relation read (R025 §21/R026 §5) - `get_relation`
+/// only. No `get_relations_for_entity`/`get_active_relations_for_entity`/
+/// graph traversal/search/ranking exists yet - broader retrieval/Context
+/// Pack design is explicitly out of scope for R026.
+pub(crate) fn get_relation(
+    conn: &Connection,
+    id: RelationId,
+) -> Result<Option<Relation>, rusqlite::Error> {
+    storage::personal_knowledge_repo::get_relation(conn, id)
+}
+
 /// A resolved `EntityInputRef` ready for `Fact` construction:
 /// `id` is always populated (SELF/Existing/New all resolve to a real
 /// `EntityId`), `to_insert` is `Some` only for `New` - the entity that
@@ -2593,6 +2605,199 @@ pub(crate) fn forget_memory(
 
     ActionOutcome::Success {
         value: target.id,
+        confirmation_class: class,
+    }
+}
+
+/// `AddRelation` - the first production Personal Knowledge Relation
+/// mutation (M2 Personal Knowledge Relation Foundation, R026,
+/// 2026-09-18). Confirmation floor is `ExplicitAdd`; for
+/// `Provenance::Inferred` the generic `effective_class` formula alone
+/// already forces a pre-write block (`InferredChange` dominates
+/// `ExplicitAdd`), so no Personal-Knowledge-specific overlay is needed
+/// here - same reasoning as `add_memory` (R025 §17).
+///
+/// Execution order (matches the hardened `AddMemory`/`CorrectMemory`
+/// safety boundary exactly, R026 §13): (1) pure structural validation
+/// (`actions::validate_add_relation` - no SQL); (2)/(3) the confirmation
+/// gate, immediately after pure validation succeeds; (4) if blocked,
+/// `ConfirmationRequired` - proven by
+/// `req_ar_conf_gate_precedes_db_dependent_validation` to run BEFORE any
+/// database-dependent resolution, exactly like `AddMemory`'s own gate;
+/// (5) only once confirmation is satisfied does `from`/`to`/`source`
+/// database-dependent resolution run, aggregating every reference error
+/// found (`resolve_entity_input_ref`/`resolve_source_ref`, reused
+/// verbatim, unmodified, from the Memory family - both are already fully
+/// generic over any `EntityInputRef`/`SourceRef`, not Fact-specific);
+/// (6) the AUTHORITATIVE self-edge check, comparing the two RESOLVED
+/// `EntityId`s (catches every case the pure structural fast path in
+/// `validate_add_relation` cannot, e.g. `SelfEntity` +
+/// `Existing(actual SELF id)` - R025 §18/§20); (7) any validation
+/// failure at this stage returns `ValidationFailed` with ZERO writes;
+/// (8) the atomic transaction opens only after every check above has
+/// succeeded.
+///
+/// Atomic transaction, in order: new `from` Entity (if any) -> new `to`
+/// Entity (if any) -> new Source (if `SourceRef::New`) -> Relation ->
+/// Evidence -> `relation_evidence` link -> `relation_audit_log`. Any
+/// failure at any step means `tx` drops without a commit and rusqlite
+/// rolls back everything, including any newly-created Entities/Source -
+/// pre-existing Entity/Source rows are never touched regardless
+/// (`to_insert` is `None` for both `SelfEntity` and `Existing`).
+///
+/// `relation_audit_log.previous_snapshot` is always `None` - this
+/// creates a Relation, it never updates one. `epistemic_state` persists
+/// `USER_CONFIRMED` when this is an `Inferred`, now-confirmed
+/// resubmission (regardless of the payload's originally-proposed
+/// `epistemic_state`), or exactly the caller's requested
+/// `epistemic_state` for a direct `Explicit` call - identical rule to
+/// `add_memory` (R025 §18). `provenance` itself is stored in the audit
+/// row exactly as given - confirming an inferred action never silently
+/// rewrites it to `Explicit`.
+///
+/// Always creates a fresh `Evidence` row (never reused through
+/// production `AddRelation`, R025 §13); `valid_from`/`created_at` are
+/// both `meta.requested_at` (no backdating, no `Utc::now()` inside the
+/// semantic write path); `valid_until` always starts `None`. Never
+/// performs implicit deduplication, contradiction detection, an inverse/
+/// symmetric edge, or any write to `facts`/`fact_evidence`/`episodes`/
+/// `episode_evidence`/`episode_entities` (R025 §14/§15/§20).
+pub(crate) fn add_relation(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: AddRelationPayload,
+) -> ActionOutcome<Relation> {
+    let normalized = match crate::actions::validate_add_relation(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    // Confirmation gate runs immediately after pure structural
+    // validation and BEFORE any database-dependent resolution - matches
+    // `add_memory`'s corrected safety boundary exactly.
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+    let mut errors: Vec<ValidationError> = Vec::new();
+
+    let from = match resolve_entity_input_ref(conn, &normalized.from, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+    let to = match resolve_entity_input_ref(conn, &normalized.to, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+    let source = match resolve_source_ref(conn, &normalized.source, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    // Authoritative self-edge check - runs on the RESOLVED EntityIds,
+    // catching every case the pure structural fast path in
+    // `validate_add_relation` cannot (e.g. `SelfEntity` +
+    // `Existing(actual SELF id)`). Zero writes either way.
+    if let (Some(f), Some(t)) = (&from, &to) {
+        if f.id == t.id {
+            errors.push(ValidationError::SelfPersonalKnowledgeRelation);
+        }
+    }
+
+    if !errors.is_empty() {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    let from = from.expect("no reference errors implies from resolved");
+    let to = to.expect("no reference errors implies to resolved");
+    let source = source.expect("no reference errors implies source resolved");
+
+    let persisted_epistemic_state = if meta.provenance == Provenance::Inferred && meta.confirmed {
+        EpistemicState::UserConfirmed
+    } else {
+        normalized.epistemic_state
+    };
+
+    let relation = Relation {
+        id: RelationId::new(),
+        from_entity_id: from.id,
+        to_entity_id: to.id,
+        relation_type: normalized.relation_type.clone(),
+        note: normalized.note.clone(),
+        epistemic_state: persisted_epistemic_state,
+        confidence: normalized.confidence,
+        sensitivity: normalized.sensitivity,
+        valid_from: now,
+        valid_until: None,
+        created_at: now,
+    };
+
+    let evidence = Evidence {
+        id: EvidenceId::new(),
+        source_id: source.id,
+        content: normalized.evidence.content.clone(),
+        locator: normalized.evidence.locator.clone(),
+        sensitivity: normalized.evidence.sensitivity,
+        created_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Some(new_from) = &from.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_entity(&tx, new_from) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Some(new_to) = &to.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_entity(&tx, new_to) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Some(new_source) = &source.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_source(&tx, new_source) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation(&tx, &relation) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_evidence(&tx, &evidence) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation_evidence_link(
+        &tx,
+        relation.id,
+        evidence.id,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation_audit_log(
+        &tx,
+        relation.id,
+        "AddRelation",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: relation,
         confirmation_class: class,
     }
 }
