@@ -563,3 +563,180 @@ will need its own careful review of exactly which `epistemic_state`
 transitions are frozen as valid (R017 §8's confirmation-floor rules) —
 this is the next concrete design question, not yet resolved by this
 run.
+
+---
+
+## Post-run temporal-integrity and audit hardening (2026-09-18)
+
+A small, deliberate pass conducted before Slice D, prompted by a review
+of `update_fact_as_superseded`'s actual enforcement mechanism against
+what a release build genuinely runs. Found and corrected **one genuine
+release-build correctness gap** (not a data-integrity defect that has
+occurred — every original R022 test already exercised only active
+predecessors, so `debug_assert_eq!` never actually fired incorrectly in
+this run's own test suite) and closed several verification gaps in
+R022's own coverage. **Does not create R023** — appended here as
+instructed; the original §1-§32 above are otherwise unedited.
+
+### Release-build enforcement correction
+
+**Before this pass**: `update_fact_as_superseded`'s only defense against
+an unexpected affected-row count was `debug_assert_eq!(changed, 1,
+...)` — a check that is compiled out entirely in release builds
+(`cargo build --release`, the exact build this run's own npm/Tauri
+packaging step produces). A row-count anomaly in a release binary would
+have silently returned `Ok(())` despite not having performed the
+intended mutation.
+
+**After this pass**: the check is a real runtime `if changed != 1`
+returning a typed `rusqlite::Error::SqliteFailure` (matching the exact
+`enable_foreign_keys`/`enable_secure_delete`/`ensure_self_entity`
+integrity-error-synthesis pattern already established elsewhere in this
+codebase) — present in every build profile, propagated by `services::
+correct_memory` through its existing `CoreError::from(e)` conversion,
+same as every other fallible step in the action. The diagnostic string
+is fixed (`"CorrectMemory predecessor update did not affect exactly one
+row - predecessor missing or no longer active"`) and carries no Fact
+content, value, or evidence text.
+
+### Defense-in-depth active guard in the UPDATE statement itself
+
+The guarded SQL is now:
+
+```sql
+UPDATE facts SET valid_until = ?2, superseded_by_fact_id = ?3,
+                  epistemic_state = 'STALE', updated_at = ?4
+WHERE id = ?1 AND valid_until IS NULL AND epistemic_state <> 'STALE'
+```
+
+The `WHERE` clause re-checks the exact `domain::is_active_fact`
+predicate at mutation time, not only at `services::correct_memory`'s
+earlier preflight — a row that became inactive between the preflight
+read and this statement (impossible today within one single-threaded
+transaction, but the guard does not rely on that being permanently
+true) cannot silently be superseded twice. No schema/migration change -
+this is a `WHERE`-clause addition to an existing hand-written `UPDATE`,
+not a `CHECK` constraint.
+
+### Deterministic repo-level proof
+
+Four new tests call `storage::personal_knowledge_repo::
+update_fact_as_superseded` directly (not only through `correct_memory`)
+and assert on its returned `Result`, proving release-build behavior
+rather than relying on a debug assertion or a panic-catching harness:
+
+- `req_cm_repo_update_fact_as_superseded_active_predecessor_succeeds` -
+  a real active predecessor (plus a real successor row, required by the
+  `superseded_by_fact_id` foreign key) updates exactly one row and
+  returns `Ok`.
+- `req_cm_repo_update_fact_as_superseded_stale_predecessor_rejected` - a
+  raw `STALE`-with-`NULL`-`valid_until` fixture returns `Err`, zero
+  fields changed.
+- `req_cm_repo_update_fact_as_superseded_closed_predecessor_rejected` -
+  a raw `valid_until`-already-set fixture returns `Err`, zero fields
+  changed.
+- `req_cm_repo_update_fact_as_superseded_nonexistent_fact_rejected` - a
+  nonexistent `FactId` returns `Err`, never a silent `Ok`.
+
+### Service-level rollback proof for this exact failure
+
+`req_cm_rollback_predecessor_update_guard_rejects_and_rolls_back`: a
+test-only trigger (no production failure flag) closes the exact
+predecessor row immediately after the `Evidence` insert - the step
+immediately preceding `update_fact_as_superseded` in the real
+transaction order - so the guarded `UPDATE` genuinely matches zero rows
+inside a real `correct_memory` call. Proves the whole transaction,
+including the trigger's own side effect, rolls back: the new object
+`Entity`, `Source`, successor `Fact`, `Evidence`, link, and audit row
+are all absent afterward, and the predecessor is confirmed byte-for-byte
+unchanged. The two pre-existing rollback tests
+(`req_cm_rollback_forced_audit_failure_rolls_back_everything`,
+`req_cm_rollback_earlier_stage_forced_evidence_failure`) remain green,
+unmodified.
+
+### Audit field completeness
+
+`req_cm_audit_fact_id_is_predecessor_id_with_correct_fields` now
+constructs a deliberately fixed `ActionMeta` (`Actor::CloudLlm`,
+`Provenance::Explicit`, `requested_at = "2026-09-18T15:20:00Z"`, not
+`ui_explicit()`'s implicit `Actor::Ui`/call-time timestamp) and asserts,
+in one query, all seven `fact_audit_log` columns: `fact_id ==
+predecessor.id` (and `!= successor.id`), `action_type ==
+"CorrectMemory"`, `actor == "CloudLLM"` (the exact supplied actor),
+`provenance == "Explicit"`, `confirmation_class ==
+"IMPORTANT_CHANGE"`, `previous_snapshot` non-`NULL` and deserializing
+exactly to the predecessor's captured pre-correction state, and
+`occurred_at == requested_at.to_rfc3339()` exactly. The separate
+inferred-confirmed test
+(`req_cm_conf_c_inferred_confirmed_executes_and_audit_provenance_
+remains_inferred`, proving `provenance` stays `Inferred` while the
+successor's `epistemic_state` becomes `USER_CONFIRMED`) was left as its
+own dedicated test, not merged into this one - confirmation and
+provenance remain distinct concepts, tested separately.
+
+### `Fact` doc comment clarity
+
+`domain/mod.rs`'s `Fact` doc comment previously listed
+`epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
+`superseded_by_fact_id`/`updated_at` together as fields that "may ever
+change," which left it ambiguous whether `confidence`/`sensitivity`
+could ever be mutated on an *existing* Fact row. Reworded to state
+explicitly that exactly two mutation paths exist (a future
+`ConfirmMemory`: `epistemic_state` only; `CorrectMemory`'s predecessor
+side-effect: `valid_until`/`superseded_by_fact_id`/`epistemic_state`/
+`updated_at` only), and that **`confidence`/`sensitivity` are never
+mutated on an existing Fact row by either path** - a `CorrectMemory`
+payload's overrides apply only to the brand-new successor. Documentation
+only; no semantic change (`CorrectMemory`'s actual behavior was already
+correct - only the doc comment was ambiguous).
+
+### Exact new test count
+
+**Previous (R022 original): 356. New this pass: 5**
+(`req_cm_repo_update_fact_as_superseded_active_predecessor_succeeds`,
+`..._stale_predecessor_rejected`, `..._closed_predecessor_rejected`,
+`..._nonexistent_fact_rejected`,
+`req_cm_rollback_predecessor_update_guard_rejects_and_rolls_back` - the
+audit-completeness strengthening extended a PRE-EXISTING test rather
+than adding a new one). **Final: 361. Failed: 0.** The original R022
+§28 result — **327 → 356 (+29)** — remains this report's unedited
+historical record; **361** is this pass's own separately-reported
+measured result, not a retroactive edit to §28.
+
+### Build/package results (this pass)
+
+- `cargo fmt --check`: clean (after one `cargo fmt` pass).
+- `cargo check --tests`: clean, zero warnings.
+- `cargo test -- --test-threads=1`: **361 passed; 0 failed; 0 ignored**.
+- `cargo build --release`: succeeded.
+- `npm run build`: succeeded.
+- `npm run tauri build`: run this pass (required — production
+  `CorrectMemory` storage behavior changed) — see the chat reply for
+  the measured MSI/NSIS result, verified from the captured log and the
+  actual bundle files on disk.
+
+### Files changed (this pass)
+
+- `src-tauri/src/services/storage/personal_knowledge_repo.rs` -
+  `update_fact_as_superseded`'s `debug_assert_eq!` replaced with a real
+  runtime `Result`-returning check; `WHERE` clause hardened with the
+  active-Fact predicate; doc comment updated.
+- `src-tauri/src/domain/mod.rs` - `Fact`'s mutability-contract doc
+  comment reworded for clarity (§7 above); no semantic change.
+- `src-tauri/src/services/tests.rs` - 5 new tests, 1 existing test
+  strengthened (audit field completeness).
+- `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`
+  (this addendum).
+
+**No `V7` migration change. No V8 created. `CorrectMemory`'s observable
+semantics are unchanged** - this pass only replaced a debug-only check
+with an equivalent-but-real runtime one and added a redundant defense-
+in-depth `WHERE`-clause guard; every existing R022 test (including the
+two pre-existing rollback tests) remained green throughout, unmodified.
+No `ConfirmMemory`/`ForgetMemory` code. No UI/Tauri command changes.
+
+### Next substantial report
+
+Unchanged: **R023**, allocated to whichever of Slice D (`ConfirmMemory`)
+or another explicitly-instructed run comes next. `ConfirmMemory` was
+**not** started by this pass.

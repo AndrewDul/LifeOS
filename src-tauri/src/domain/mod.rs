@@ -967,17 +967,26 @@ pub(crate) enum FactValue {
 /// provenance flows exclusively through the future `fact_evidence` link
 /// table to `Evidence.source_id` to `Source` (R017 §5 item 4).
 ///
-/// **Mutability contract (R017 §5)**: after creation, only
-/// `epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
-/// `superseded_by_fact_id`/`updated_at` may ever change - via a future
-/// `ConfirmMemory` (epistemic_state only) or as the predecessor
-/// side-effect of `CorrectMemory` (M2 Personal Knowledge Slice C,
-/// 2026-09-18 - `epistemic_state`/`valid_until`/`superseded_by_fact_id`/
-/// `updated_at` only, via `storage::personal_knowledge_repo::
-/// update_fact_as_superseded`, never a generic Fact patch). `ConfirmMemory`
-/// itself is not implemented this run. `subject_entity_id`, `predicate`,
-/// `value`, `memory_type`, and `created_at` are immutable for the life
-/// of the row.
+/// **Mutability contract (R017 §5, clarified R022 post-run hardening,
+/// 2026-09-18)**: `subject_entity_id`, `predicate`, `value`,
+/// `memory_type`, and `created_at` are immutable for the life of the
+/// row, always - no implemented or planned action ever changes them
+/// after creation. Exactly two mutation paths exist for the rest:
+///
+/// - a future `ConfirmMemory` (Slice D, not implemented this run):
+///   `epistemic_state` only.
+/// - `CorrectMemory`'s predecessor side-effect (M2 Personal Knowledge
+///   Slice C, 2026-09-18, via `storage::personal_knowledge_repo::
+///   update_fact_as_superseded`, never a generic Fact patch):
+///   `valid_until`/`superseded_by_fact_id`/`epistemic_state`/
+///   `updated_at` only.
+///
+/// **`confidence`/`sensitivity` are never mutated on an EXISTING Fact
+/// row by either path.** A `CorrectMemory` payload's `confidence`/
+/// `sensitivity` overrides apply only to the brand-new SUCCESSOR Fact
+/// it creates - the predecessor being closed keeps its original
+/// `confidence`/`sensitivity` forever, exactly as it keeps its original
+/// `value`/`memory_type`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Fact {
     pub id: FactId,

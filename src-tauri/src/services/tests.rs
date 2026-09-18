@@ -12498,17 +12498,41 @@ fn req_cm_audit_fact_id_is_predecessor_id_with_correct_fields() {
     let (path, key) = temp_db(&dir, "cm_audit.db");
     let mut conn = bootstrap_db_at(&path, &key).unwrap();
     let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_pre_correction = predecessor.clone();
 
-    let successor = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+    // A deliberately known actor/provenance/requested_at (post-run audit
+    // hardening, 2026-09-18) - not ui_explicit()'s implicit Actor::Ui, so
+    // `actor` and `occurred_at` can be proven equal to exact expected
+    // values rather than merely present.
+    let requested_at: chrono::DateTime<chrono::Utc> = "2026-09-18T15:20:00Z"
+        .parse()
+        .expect("valid RFC3339 literal");
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Explicit,
+        requested_at,
+        confirmed: false,
+    };
+
+    let successor = match correct_memory(&mut conn, meta, mk_cm_payload(predecessor.id)) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("[req_cm_audit] FAIL, got {other:?}"),
     };
 
-    let (fact_id, action_type, confirmation_class): (String, String, String) = conn
+    let (fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
         .query_row(
-            "SELECT fact_id, action_type, confirmation_class FROM fact_audit_log WHERE action_type = 'CorrectMemory'",
+            "SELECT fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at
+             FROM fact_audit_log WHERE action_type = 'CorrectMemory'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .unwrap();
     assert_eq!(
@@ -12518,7 +12542,25 @@ fn req_cm_audit_fact_id_is_predecessor_id_with_correct_fields() {
     );
     assert_ne!(fact_id, successor.id.to_string());
     assert_eq!(action_type, "CorrectMemory");
+    assert_eq!(
+        actor, "CloudLLM",
+        "[req_cm_audit] FAIL - audit actor must match the exact ActionMeta.actor supplied"
+    );
+    assert_eq!(provenance, "Explicit");
     assert_eq!(confirmation_class, "IMPORTANT_CHANGE");
+    assert_eq!(
+        occurred_at,
+        requested_at.to_rfc3339(),
+        "[req_cm_audit] FAIL - fact_audit_log.occurred_at must equal ActionMeta.requested_at exactly"
+    );
+    let snapshot_json = previous_snapshot
+        .expect("[req_cm_audit] FAIL - previous_snapshot must be non-NULL for CorrectMemory");
+    let deserialized: Fact =
+        serde_json::from_str(&snapshot_json).expect("snapshot must deserialize as a Fact");
+    assert_eq!(
+        deserialized, predecessor_pre_correction,
+        "[req_cm_audit] FAIL - previous_snapshot must deserialize exactly to the predecessor's PRE-correction state"
+    );
 }
 
 // --- Full atomic rollback (R022 - central acceptance proof, §30) -------
@@ -12597,6 +12639,180 @@ fn req_cm_rollback_earlier_stage_forced_evidence_failure() {
     assert_eq!(
         predecessor_after, predecessor_before,
         "[req_cm_rollback2] FAIL - predecessor must remain unchanged even when failure happens before its own update step"
+    );
+}
+
+/// Post-run temporal-integrity hardening (2026-09-18): forces
+/// `update_fact_as_superseded`'s own new runtime guard to fail for
+/// real, inside a genuine `correct_memory` call, and proves the whole
+/// transaction - including the trigger's own side effect - rolls back.
+/// A test-only trigger (no production failure flag) closes the exact
+/// predecessor row immediately after the Evidence insert - the step
+/// right before `update_fact_as_superseded` runs in the real
+/// transaction order - so by the time the guarded `UPDATE ... WHERE
+/// valid_until IS NULL AND epistemic_state <> 'STALE'` executes, it
+/// matches zero rows and returns the new typed error.
+#[test]
+fn req_cm_rollback_predecessor_update_guard_rejects_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_rollback3.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_before = predecessor.clone();
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER force_close_predecessor_before_update
+         AFTER INSERT ON evidence
+         BEGIN
+             UPDATE facts SET valid_until = '2000-01-01T00:00:00+00:00', epistemic_state = 'STALE'
+             WHERE id = '{}';
+         END;",
+        predecessor.id
+    ))
+    .unwrap();
+
+    let payload = CorrectMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "place".to_string(),
+            canonical_name: "Guard Rollback Object".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..mk_cm_payload(predecessor.id)
+    };
+    match correct_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!(
+            "[req_cm_rollback3] FAIL - expected StorageError from the predecessor-update guard, got {other:?}"
+        ),
+    }
+
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_close_predecessor_before_update;")
+        .unwrap();
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before,
+        "[req_cm_rollback3] FAIL - the whole transaction, including the trigger's own side effect, must roll back"
+    );
+    let predecessor_after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(
+        predecessor_after, predecessor_before,
+        "[req_cm_rollback3] FAIL - predecessor must remain completely unchanged after rollback"
+    );
+}
+
+// --- update_fact_as_superseded direct repo-level proof (post-run -------
+// temporal-integrity hardening, 2026-09-18) - proves RELEASE-build
+// behavior (a real runtime `Result`, never a `debug_assert!` that
+// compiles out), calling the repo function directly rather than only
+// through `correct_memory`.
+
+#[test]
+fn req_cm_repo_update_fact_as_superseded_active_predecessor_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_repo_update_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    // superseded_by_fact_id is a real FK (`REFERENCES facts(id)`) - a
+    // real successor row must exist first, exactly as `correct_memory`
+    // always inserts one before calling this function.
+    let successor = mk_cm_predecessor(&mut conn);
+    let ts = Utc::now();
+
+    let result = storage::personal_knowledge_repo::update_fact_as_superseded(
+        &conn,
+        predecessor.id,
+        successor.id,
+        ts,
+    );
+    assert!(
+        result.is_ok(),
+        "[req_cm_repo_update_a] FAIL - active predecessor update should succeed, got {result:?}"
+    );
+
+    let after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(after.valid_until, Some(ts));
+    assert_eq!(after.superseded_by_fact_id, Some(successor.id));
+    assert_eq!(after.epistemic_state, EpistemicState::Stale);
+    assert_eq!(after.updated_at, ts);
+}
+
+#[test]
+fn req_cm_repo_update_fact_as_superseded_stale_predecessor_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_repo_update_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    conn.execute(
+        "UPDATE facts SET epistemic_state = 'STALE' WHERE id = ?1",
+        rusqlite::params![predecessor.id.to_string()],
+    )
+    .unwrap();
+    let before = get_fact(&conn, predecessor.id).unwrap().unwrap();
+
+    let result = storage::personal_knowledge_repo::update_fact_as_superseded(
+        &conn,
+        predecessor.id,
+        FactId::new(),
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cm_repo_update_b] FAIL - STALE predecessor update should be rejected at runtime, got {result:?}"
+    );
+
+    let after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(
+        before, after,
+        "[req_cm_repo_update_b] FAIL - no field should change on a rejected update"
+    );
+}
+
+#[test]
+fn req_cm_repo_update_fact_as_superseded_closed_predecessor_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_repo_update_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    conn.execute(
+        "UPDATE facts SET valid_until = ?2 WHERE id = ?1",
+        rusqlite::params![predecessor.id.to_string(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    let before = get_fact(&conn, predecessor.id).unwrap().unwrap();
+
+    let result = storage::personal_knowledge_repo::update_fact_as_superseded(
+        &conn,
+        predecessor.id,
+        FactId::new(),
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cm_repo_update_c] FAIL - closed (valid_until set) predecessor update should be rejected, got {result:?}"
+    );
+
+    let after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn req_cm_repo_update_fact_as_superseded_nonexistent_fact_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_repo_update_d.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let result = storage::personal_knowledge_repo::update_fact_as_superseded(
+        &conn,
+        FactId::new(),
+        FactId::new(),
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cm_repo_update_d] FAIL - nonexistent predecessor update should be rejected, not silently Ok, got {result:?}"
     );
 }
 

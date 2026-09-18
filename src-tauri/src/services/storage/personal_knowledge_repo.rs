@@ -424,6 +424,21 @@ pub(in crate::services) fn insert_fact_audit_log(
 /// are structurally impossible to touch through this function's
 /// parameter list - the storage API makes the frozen contract hard to
 /// violate rather than merely documenting it.
+///
+/// **Post-run temporal-integrity hardening (2026-09-18)**: the `WHERE`
+/// clause itself now re-checks the exact `domain::is_active_fact`
+/// predicate (`valid_until IS NULL AND epistemic_state <> 'STALE'`) at
+/// mutation time, as defense-in-depth alongside `services::
+/// correct_memory`'s own preflight check - this row can never be
+/// superseded twice, and a row that became inactive between the
+/// preflight and this statement (or a nonexistent id) cannot silently
+/// succeed. `changed != 1` (0 rows: missing id, already-inactive
+/// predecessor; >1 is structurally impossible against a primary key) is
+/// now a REAL runtime error, not a `debug_assert!` that compiles out of
+/// release builds - the caller's transaction rolls back the successor
+/// Fact/Entity/Source/Evidence/link/audit exactly as any other failure
+/// in this action does. The diagnostic is fixed and carries no Fact
+/// content.
 pub(in crate::services) fn update_fact_as_superseded(
     conn: &Connection,
     predecessor_fact_id: FactId,
@@ -431,7 +446,8 @@ pub(in crate::services) fn update_fact_as_superseded(
     correction_timestamp: DateTime<Utc>,
 ) -> rusqlite::Result<()> {
     let changed = conn.execute(
-        "UPDATE facts SET valid_until = ?2, superseded_by_fact_id = ?3, epistemic_state = 'STALE', updated_at = ?4 WHERE id = ?1",
+        "UPDATE facts SET valid_until = ?2, superseded_by_fact_id = ?3, epistemic_state = 'STALE', updated_at = ?4
+         WHERE id = ?1 AND valid_until IS NULL AND epistemic_state <> 'STALE'",
         params![
             predecessor_fact_id.to_string(),
             correction_timestamp.to_rfc3339(),
@@ -439,9 +455,14 @@ pub(in crate::services) fn update_fact_as_superseded(
             correction_timestamp.to_rfc3339(),
         ],
     )?;
-    debug_assert_eq!(
-        changed, 1,
-        "update_fact_as_superseded should affect exactly one row - caller must check predecessor existence first"
-    );
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(
+                "CorrectMemory predecessor update did not affect exactly one row - predecessor missing or no longer active"
+                    .to_string(),
+            ),
+        ));
+    }
     Ok(())
 }
