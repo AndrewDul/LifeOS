@@ -1130,3 +1130,74 @@ dependency on another Memory action already having run (`CorrectMemory`/
 This mirrors the exact dependency reasoning that made Goal → Project →
 GoalRelation → Milestone → Task the correct real order in M2 so far —
 each slice needs the previous one to already exist, never the reverse.
+
+---
+
+## Addendum (R018, 2026-09-18) — architecture consistency corrections
+
+A dedicated post-freeze review
+(`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`)
+found eleven consistency/privacy gaps in this report before any `V7`
+migration or implementation slice was written, all fixed in R018:
+
+- The SELF partial unique index (§4 above) guarantees *at most one*
+  row, never existence — R018 freezes a Core-level `ensure_self_entity`
+  bootstrap to guarantee *at least one*, together giving *exactly one*.
+- `AddMemory` (§17 above) had no path to create a *new* Entity — every
+  subject/object reference required one to already exist. R018 freezes
+  a typed `EntityInputRef` (`SelfEntity`/`Existing`/`New`) usable
+  inside `AddMemory` (and `CorrectMemory`'s value), with new-Entity
+  creation folded into the same atomic transaction.
+- `CorrectMemory`'s payload (§18 above) had no `epistemic_state`
+  field, but its mutation prose said the successor's epistemic state
+  was "the caller's requested starting state" — a direct
+  contradiction. R018 freezes that a `CorrectMemory` successor is
+  *always* `USER_CONFIRMED`, with a Personal-Knowledge-specific
+  confirmation overlay ensuring an inferred correction still blocks
+  before writing (the generic `effective_class` formula alone would
+  not have forced that block for this specific action's type-floor).
+- `CorrectMemoryPayload.confidence` (§18 above) used `Option<f32>`,
+  which cannot express "clear the old confidence back to `NULL`."
+  R018 freezes `FieldPatch<f32>` instead, matching M2's established
+  nullable-field convention.
+- `CorrectMemory`/`ConfirmMemory`'s "is this Fact active" checks (§18-19
+  above) validated only `valid_until IS NULL`, not the full two-part
+  active-Fact definition this report's own §22 already used elsewhere.
+  R018 freezes one canonical `is_active_fact` predicate, reused
+  everywhere.
+- `ConfirmMemory` confirming a `DISPUTED` Fact (§19 above) was
+  described as "a resolution path for a contradiction" — overstated.
+  R018 clarifies it resolves only the one target assertion; sibling
+  disputes remain, and retrieval must keep surfacing them.
+- **Critical:** `ForgetMemory` (§20-21 above) only guaranteed its own
+  *new* audit row had no payload — it never accounted for pre-existing
+  `CorrectMemory`/`ConfirmMemory` audit rows for the same Fact, which
+  this report's own §18-19 require to carry mandatory, non-`NULL`,
+  payload-bearing snapshots. R018 freezes a mandatory scrub step
+  (`UPDATE fact_audit_log SET previous_snapshot = NULL WHERE fact_id =
+  ... AND previous_snapshot IS NOT NULL`) before the Fact is deleted.
+- **Critical:** `facts.superseded_by_fact_id ... REFERENCES facts(id)`
+  (§5 above) has no `ON DELETE` clause, defaulting to `RESTRICT` —
+  meaning `ForgetMemory` on any Fact that was ever someone's successor
+  would be rejected outright by the database. R018 freezes an explicit
+  step clearing every inbound reference before deletion, deliberately
+  *not* rewiring predecessors to point at the forgotten Fact's own
+  successor.
+- `ForgetMemory`'s Evidence handling (§20 above) retained Evidence
+  still linked elsewhere — but that Evidence could itself contain the
+  forgotten payload. R018 freezes unconditional deletion of all
+  Evidence directly linked to the forgotten Fact, accepting that this
+  may remove supporting evidence from other, still-retained knowledge.
+- `Source` (§10, §20 above) was frozen with no `sensitivity` field and
+  described as carrying "no privacy risk" and never deleted. R018
+  corrects this: `Source` gains a `sensitivity` column (metadata can
+  still be sensitive), and `ForgetMemory` now deletes orphaned Source
+  rows while retaining genuinely shared ones.
+- This report's field-level freeze (§5, §28 above) still left several
+  fields as merely "bounded... exact number set at implementation
+  time." R018 freezes exact numeric maximum lengths for every bounded
+  Personal Knowledge field now.
+
+See R018 for the full corrected design, the rewritten `ForgetMemory`
+transaction algorithm, and updated Slice A/B acceptance criteria.
+R018 is authoritative wherever it corrects this report.

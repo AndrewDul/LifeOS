@@ -61,9 +61,17 @@ distinction, and exact semantics for `AddMemory`/`CorrectMemory`/
 `ConfirmMemory`/`ForgetMemory` (confirmation floors confirmed unchanged
 from R003/§5.5). Several genuine gaps/contradictions in R003's original
 one-paragraph sketch were identified and explicitly corrected (not
-silently overwritten) - see R017 §2. Nothing is implemented yet; see
-`PROJECT_STATE.md` §4o and
-`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`.
+silently overwritten) - see R017 §2. **(2026-09-18, R018, same day,
+documentation/architecture only)** A dedicated post-freeze consistency
+review found and corrected eleven further gaps in R017 before any code
+existed - two critical (a foreign key that would have blocked
+`ForgetMemory` outright on any previously-superseded Fact; pre-existing
+audit snapshots that could have retained exactly the text `ForgetMemory`
+exists to erase) - see R018 §2. Nothing is implemented yet; see
+`PROJECT_STATE.md` §4o-§4p,
+`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
+and
+`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -697,7 +705,12 @@ yet"). Corrected in that report and here.
 Layer Architecture Freeze, R017 — superseding R003 §B's original
 table-shape-only sketch on several specific points, each an explicit,
 documented correction, not a silent rewrite; see R017 §2 for the full
-list). Six tables, unchanged in count and purpose from R003: `Entity`,
+list), **then corrected by a dedicated post-freeze consistency review
+the same day** (M2 Personal Knowledge Architecture Consistency
+Hardening, R018 — eleven further gaps found and fixed before any `V7`
+migration or implementation existed, two critical; see R018 §2/§17 for
+the full list and R017's own addendum). Six tables, unchanged in count
+and purpose from R003: `Entity`,
 `Fact`, `Relation`, `Episode`, `Evidence`, `Source` — do **not** flatten
 LifeOS memory into one text-memory table, a vector store, or chat
 history. `Fact` is a structured subject-predicate-object assertion
@@ -722,7 +735,12 @@ interchangeably. **Sensitivity is now a frozen four-value closed set**
 (`PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`, R017 §13,
 resolving the previously-open §13-below question below) — a dimension
 independent of `epistemic_state` and `confidence` (three separate axes,
-never derived from one another).
+never derived from one another). **Applies to `Fact`/`Relation`/
+`Episode`/`Source`/`Evidence`** (R018 §13 corrected this to include
+`Source` — metadata can still be privacy-sensitive even though it never
+holds a raw excerpt, which R017 had understated). `Entity` remains the
+one table without a `sensitivity` field — structural identity metadata,
+not a knowledge assertion.
 
 Provenance is structural, not conventional, but the exact mechanism
 changed from R003's sketch: a `Fact` has **no direct `source_id`** —
@@ -735,18 +753,40 @@ place** — updates insert a new row and set the old row's `valid_until` +
 history is the data model itself, not a bolted-on audit log (R017 §15).
 A `Fact` is otherwise immutable after creation except for
 `epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
-`superseded_by_fact_id` (R017 §5's mutability contract).
+`superseded_by_fact_id` (R017 §5's mutability contract) —
+`superseded_by_fact_id` may also now be cleared (not only set) by
+`ForgetMemory` on an inbound reference (R018 §11).
 
 **Four frozen actions, confirmation floors confirmed (unchanged from
 R003 §F/`LIFEOS_SPEC.md` §5.5's existing table, documented precisely in
-R017 §17-20):** `AddMemory` (`EXPLICIT_ADD`), `CorrectMemory`
-(`IMPORTANT_CHANGE`), `ConfirmMemory` (`EXPLICIT_ADD`, updates the same
+R017 §17-20, corrected by R018 §5-9):** `AddMemory` (`EXPLICIT_ADD`) can
+now create a **new** subject/object `Entity` atomically alongside the
+Fact, not only reference an existing one, via a typed `EntityInputRef`
+(`SelfEntity`/`Existing`/`New` — R018 §4); confirming an inferred
+candidate always persists `epistemic_state = USER_CONFIRMED`, never the
+model's original tag (R018 §5). `CorrectMemory` (`IMPORTANT_CHANGE`)
+always produces a `USER_CONFIRMED` successor — never a caller-chosen
+epistemic state — and, specifically for Personal Knowledge, an inferred
+correction always blocks with zero writes before confirmation
+regardless of `IMPORTANT_CHANGE`'s own generic default behavior (a
+narrow, documented overlay found necessary by checking against the
+actual `effective_class` code — no other M2 action's behavior changed,
+R018 §6); its `confidence` field is `FieldPatch<f32>`, not
+`Option<f32>`, so a correction can explicitly clear confidence back to
+`NULL` (R018 §7). `ConfirmMemory` (`EXPLICIT_ADD`, updates the same
 Fact's `epistemic_state` in place — never creates a duplicate temporal
-successor), `ForgetMemory` (`DELETE`, true permanent deletion — R017
-§20 freezes the exact deterministic, privacy-safe deletion algorithm,
-including that its audit row's `previous_snapshot` is unconditionally
-`NULL`, never the mandatory-snapshot helper used by every other Update*
-action).
+successor) confirming a `DISPUTED` Fact resolves only that one
+assertion — sibling disputes remain and retrieval must keep surfacing
+them (R018 §9). `ForgetMemory` (`DELETE`, true permanent deletion — R018
+§14 freezes the corrected, exact deterministic, privacy-safe deletion
+algorithm) now also scrubs any pre-existing `CorrectMemory`/
+`ConfirmMemory` audit snapshots for the forgotten Fact before deleting
+it (R018 §10 — R017 had only guaranteed `ForgetMemory`'s own new audit
+row was payload-free), and explicitly clears any inbound
+`superseded_by_fact_id` reference first, since that FK would otherwise
+block the deletion outright (R018 §11); its own audit row's
+`previous_snapshot` is unconditionally `NULL`, never the mandatory-
+snapshot helper used by every other Update* action.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
@@ -760,11 +800,12 @@ confirming them — is implemented starting at M6 (Personal Intelligence,
 will be written through (Qwen/Luna never mutate Personal Knowledge
 directly — they propose typed, `Provenance::Inferred` candidates that
 still go through the same Core validation/confirmation path as any
-other actor, R017 §27). **Not implemented in code at M2** — R017 is a
-documentation-only architecture freeze; see `docs/PROJECT_STATE.md`
-§4o and
+other actor, R017 §27). **Not implemented in code at M2** — R017/R018
+are documentation-only; see `docs/PROJECT_STATE.md` §4o-§4p,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`
-for full detail and the recommended implementation slicing.
+(with its own R018 addendum), and
+`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`
+for full detail and the corrected recommended implementation slicing.
 
 ### 5.4 Action layer (frozen, M2)
 

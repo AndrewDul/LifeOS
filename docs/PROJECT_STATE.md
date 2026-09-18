@@ -5,31 +5,45 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-18 (M2 Personal Knowledge Layer Architecture
-Freeze, R017 - **documentation/architecture only, no Rust or React code
-changed, no migration created.** Freezes the v0.1 field-level design of
-the Personal Knowledge Layer (R003's six-table minimum - `Entity`/
-`Fact`/`Relation`/`Episode`/`Evidence`/`Source` - specified in full for
-the first time) and its four actions (`AddMemory`/`CorrectMemory`/
-`ConfirmMemory`/`ForgetMemory`, confirmation floors confirmed unchanged
-from R003/§5.5). Seven genuine contradictions/under-specifications in
-R003's original one-paragraph sketch were found and explicitly
-corrected, not silently carried forward (§4o/R017 §2) - most
-significantly, `Fact` becomes a structured subject-predicate-object
-triple rather than an opaque text blob, and `Relation`'s polymorphic
-`ENTITY|FACT` endpoints are simplified to Entity-only with real FKs.
-`Sensitivity` (`PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`) is
-newly frozen, resolving a standing `LIFEOS_SPEC.md` §13 open question.
-`ForgetMemory`'s deterministic, privacy-safe true-deletion algorithm is
-fully specified. Not implemented in code - the recommended next slice
-is R017 §29's Slice A+B (`Entity`+`Source`+`Evidence`+`Fact` foundation,
-then `AddMemory`). See §4o. On top of 2026-09-18's M2 Key Lifecycle
-Determinism and Failure Atomicity Hardening (R016, §4n) and M2 Storage
-and Audit Safety Hardening (R015, §4m), and 2026-09-17's Goal vertical
-slice/storage hardening, Goal hardening pass, Project vertical slice,
-Project/storage integrity hardening, GoalRelation vertical slice,
-Project Child Action Freeze pass, Milestone vertical slice, Task
-vertical slice, Task parent-validation hardening, and UpdateProject
+Last updated: 2026-09-18 (M2 Personal Knowledge Architecture
+Consistency Hardening, R018 - **documentation/architecture only, no
+Rust or React code changed, no migration created.** A dedicated
+post-freeze review of R017 (M2 Personal Knowledge Layer Architecture
+Freeze) before any `V7` migration or implementation slice was written -
+found and corrected eleven consistency/privacy gaps, two critical: (1)
+R017's SELF-entity invariant only ever guaranteed *at most one* row via
+a DB unique index, never existence - a new Core-level
+`ensure_self_entity` bootstrap now guarantees *at least one*, together
+giving exactly one; (2) `AddMemory` had no path to create a *new*
+Entity at all - a typed `EntityInputRef` (`SelfEntity`/`Existing`/`New`)
+now allows atomic new-Entity creation on both the subject and object
+side; (3) `CorrectMemory`'s payload/prose contradicted itself on
+successor `epistemic_state` - resolved to always `USER_CONFIRMED`, with
+a narrow Personal-Knowledge-specific confirmation overlay (found by
+checking R017 against the actual unmodified `effective_class` code,
+`actions/mod.rs`) ensuring an inferred correction still blocks before
+writing; (4, **critical**) `ForgetMemory` never scrubbed pre-existing
+`CorrectMemory`/`ConfirmMemory` audit snapshots for the same Fact, which
+could have retained the exact forgotten text; (5, **critical**) the
+`facts.superseded_by_fact_id` foreign key had no `ON DELETE` clause,
+meaning `ForgetMemory` on any Fact that was ever a successor's
+predecessor would have been rejected by the database outright - both
+now fixed with an explicit scrub-then-clear-then-delete transaction
+order. `Source` gains a `sensitivity` field (metadata can still be
+sensitive - R017's "carries no privacy risk" claim was too strong), and
+exact numeric length bounds are now frozen for every Personal Knowledge
+text/JSON field. R017's original text is unedited - a labelled
+addendum was appended; R018 is authoritative wherever it corrects R017.
+Not implemented in code - the recommended next slice is unchanged
+(Slice A then B), now on the corrected foundation (R018 §18/§20). See
+§4p (and §4o for the original freeze). On top of 2026-09-18's M2 Key
+Lifecycle Determinism and Failure Atomicity Hardening (R016, §4n) and
+M2 Storage and Audit Safety Hardening (R015, §4m), and 2026-09-17's
+Goal vertical slice/storage hardening, Goal hardening pass, Project
+vertical slice, Project/storage integrity hardening, GoalRelation
+vertical slice, Project Child Action Freeze pass, Milestone vertical
+slice, Task vertical slice, Task parent-validation hardening, and
+UpdateProject
 implementation).
 
 ---
@@ -40,7 +54,7 @@ implementation).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); **Personal Knowledge Layer v0.1 architecture fully frozen at field level (docs-only, not implemented)** 2026-09-18 (§4o); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); **Personal Knowledge Layer v0.1 architecture fully frozen at field level (docs-only, not implemented)** 2026-09-18 (§4o), **then a post-freeze consistency review found and fixed eleven gaps, two critical, before any implementation** 2026-09-18 (§4p); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
@@ -217,6 +231,7 @@ LiFeOS/
 │                    R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md
 │                    R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md
 │                    R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md
+│                    R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -1289,6 +1304,15 @@ Full evidence, exact code, and every test result:
 
 ### 4o. M2 Personal Knowledge Layer Architecture Freeze (2026-09-18, R017, documentation/architecture only)
 
+**Eleven points below were found inconsistent/under-specified by a
+dedicated post-freeze review and corrected in R018 (§4p below) before
+any implementation - most importantly the SELF-entity invariant, the
+lack of any way for `AddMemory` to create a new Entity, and three
+privacy/integrity gaps in `ForgetMemory` (old audit snapshots, an
+inbound FK that would have blocked deletion outright, and Source having
+no sensitivity field). This section is left as originally written for
+history; §4p is authoritative wherever it disagrees with this section.**
+
 **No Rust or React code changed. No migration created.** A dedicated
 design/freeze pass - the kind of planning pass §4n above said was
 needed before starting either `RecurringRule` or the Personal Knowledge
@@ -1430,16 +1454,160 @@ design and the four Memory actions' exact semantics:
 Full evidence, exact field-by-field schemas, and every design decision:
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`.
 
+### 4p. M2 Personal Knowledge Architecture Consistency Hardening (2026-09-18, R018, documentation/architecture only)
+
+**No Rust or React code changed. No migration created.** A dedicated
+post-freeze review of R017 (§4o) before any `V7` migration or
+implementation slice was written - found and corrected eleven
+consistency/privacy gaps, two of them critical (an inbound foreign key
+that would have blocked `ForgetMemory` outright on any Fact that was
+ever superseded; pre-existing `CorrectMemory`/`ConfirmMemory` audit
+snapshots that could have retained the exact text `ForgetMemory` exists
+to erase). R017's original text is unedited - a clearly labelled
+addendum was appended to it, and R018 is authoritative wherever it
+corrects R017:
+
+- **SELF-entity invariant corrected to two cooperating layers.** R017's
+  partial unique index only ever guaranteed *at most one* SELF Entity,
+  never existence. R018 freezes a Core-level `ensure_self_entity`
+  bootstrap call - invoked eagerly, from the normal trusted bootstrap
+  path (lazy-vs-eager, left undecided by R017, is now resolved to
+  eager) - guaranteeing *at least one* exists before any Personal
+  Knowledge action/read-side becomes reachable. DB + Core together now
+  actually guarantee *exactly one*. Canonical initial row frozen:
+  `entity_type = "person"`, `canonical_name = "SELF"`, `is_self =
+  true`.
+- **`AddMemory` can now create a NEW Entity, not only reference an
+  existing one.** R017 had no path to record the first fact about a
+  brand-new person/place/vehicle/device/concept at all. A new typed
+  `EntityInputRef` (`SelfEntity` / `Existing(EntityId)` /
+  `New(NewEntityData)`) replaces `AddMemory`'s plain `Option<EntityId>`
+  subject and its `FactValue::EntityRef(EntityId)` object - usable on
+  *both* the subject and object side, and inside `CorrectMemory`'s
+  value too. A new Entity created this way is created **inside the
+  same atomic `AddMemory` transaction** as the Fact/Source/Evidence/
+  audit - a forced-failure rollback must now also prove the
+  newly-created Entity disappears, not just the Fact/Evidence. No
+  entity aliasing/merging - a `New()` that collides with an existing
+  Entity's `domain_ref` is a structured `DuplicateDomainReference`
+  rejection, never a silent merge. Still exactly four Memory actions -
+  no new `CreateEntity` action was added.
+- **`CorrectMemory`'s payload/prose contradiction resolved.** R017's
+  payload had no `epistemic_state` field, but its prose said the
+  successor's epistemic state was "the caller's requested starting
+  state." R018 freezes: a `CorrectMemory` successor is **always**
+  `USER_CONFIRMED` - there is no v0.1 path where a model silently
+  replaces current knowledge with a durable `INFERRED` successor.
+  **A genuine gap was also found by checking R017's design against the
+  actual, unmodified `effective_class = max(type_floor,
+  provenance_class)` code** (`actions/mod.rs`): `CorrectMemory`'s
+  `IMPORTANT_CHANGE` floor (severity 3) already dominates
+  `InferredChange`'s severity (2), so the generic formula alone would
+  *not* have forced a pre-write block for a model-proposed correction
+  - only `IMPORTANT_CHANGE`'s own default "execute immediately with an
+  acknowledgement step," not a real block. R018 freezes a narrow,
+  explicitly-documented Personal-Knowledge-specific overlay: any of the
+  four Memory actions, when `Provenance::Inferred`, unconditionally
+  blocks with zero durable writes before confirmation, regardless of
+  the action's own type-floor - **no change to `ConfirmationClass`/
+  `effective_class`/any other M2 action anywhere else in the system.**
+  (`AddMemory`/`ConfirmMemory`/`ForgetMemory` were checked too and need
+  no such override - their own floors already interact correctly with
+  the generic formula.)
+- **`CorrectMemory`'s nullable `confidence` field is now `FieldPatch<f32>`**,
+  not `Option<f32>` - the existing M2 nullable-field convention
+  (R006), since `Option<f32>` could never express "replace the Fact and
+  clear the old confidence back to `NULL`" once `None` already meant
+  "inherit." `memory_type`/`sensitivity` correctly stay plain
+  `Option<T>` (non-nullable columns, no `Clear` invented for either).
+- **One canonical `is_active_fact` predicate** (`valid_until IS NULL
+  AND epistemic_state <> 'STALE'`) now explicitly reused by
+  `CorrectMemory`'s predecessor check, `ConfirmMemory`'s target check,
+  and the retrieval contract's active-knowledge scope - R017 had
+  validated only half the predicate (`valid_until IS NULL` alone) at
+  the two action call sites.
+- **`ConfirmMemory` on a `DISPUTED` Fact clarified**: confirms only the
+  one target assertion; sibling conflicting Facts are untouched and
+  retrieval must keep surfacing them - not a full contradiction
+  resolution, corrected from R017's overstated "resolution path"
+  framing.
+- **CRITICAL: `ForgetMemory` now scrubs pre-existing audit snapshots.**
+  R017 only guaranteed `ForgetMemory`'s *own new* audit row had
+  `previous_snapshot = NULL` - it never accounted for a Fact that had
+  previously been corrected or confirmed, whose `CorrectMemory`/
+  `ConfirmMemory` audit rows carry a *mandatory, non-NULL* payload-
+  bearing snapshot by R017's own rules. Before deleting the target
+  Fact, `ForgetMemory` now runs `UPDATE fact_audit_log SET
+  previous_snapshot = NULL WHERE fact_id = ... AND previous_snapshot IS
+  NOT NULL` - every other column in those older rows (actor,
+  provenance, action_type, timestamps) is left untouched; only the
+  payload-bearing column is scrubbed.
+- **CRITICAL: the inbound `superseded_by_fact_id` foreign key no longer
+  blocks `ForgetMemory`.** R017 froze `facts.superseded_by_fact_id ...
+  REFERENCES facts(id)` with no `ON DELETE` clause (SQLite default:
+  `RESTRICT`) - meaning forgetting any Fact that was ever someone's
+  successor would have been rejected by the database outright, a gap
+  R017's own algorithm never accounted for. `ForgetMemory` now
+  explicitly clears every inbound reference (`superseded_by_fact_id =
+  NULL` on the predecessor, `valid_until`/`epistemic_state` left
+  unchanged) before deleting the target - deliberately never rewiring
+  the predecessor to point at the forgotten Fact's own successor, since
+  that would misrepresent history.
+- **`ForgetMemory`'s Evidence handling is now privacy-first, not
+  conditional.** R017 retained Evidence still linked to another Fact/
+  Relation/Episode - but that Evidence could itself contain the exact
+  forgotten payload (Evidence is where personal excerpts live). All
+  Evidence directly linked to the forgotten Fact is now unconditionally
+  deleted, even if still referenced elsewhere - privacy beats evidence
+  retention; the other knowledge objects survive, just with less
+  supporting evidence.
+- **`Source` gains a `sensitivity` field; "never delete Source" is
+  removed.** R017 claimed Source retention "carries no privacy risk"
+  since it is metadata-only - too strong, since metadata itself
+  (a label, a document path, a conversation reference) can be
+  sensitive on its own. `Source.sensitivity` (same 4-value closed set)
+  is now frozen. `ForgetMemory` now deletes a Source only once it has
+  zero remaining Evidence references; genuinely shared Source metadata
+  survives.
+- **Exact field-length bounds frozen for every bounded Personal
+  Knowledge text/JSON field** (a canonical constant table, e.g.
+  `VALUE_JSON_MAX_LEN = 2000`, `PREDICATE_MAX_LEN = 100`,
+  `EVIDENCE_CONTENT_MAX_LEN = 4000` - 15 constants total), reusing
+  M2's existing `TITLE_MAX_LEN`/`DESCRIPTION_MAX_LEN`/
+  `DOMAIN_TAG_MAX_LEN` tiers where they fit, plus two new intermediate
+  tiers - so the eventual `V7`/Core implementation copies frozen values
+  rather than inventing schema policy mid-implementation, which R017
+  had left an open gap for (`Fact.value_json`'s bound explicitly
+  deferred "to implementation time").
+- **`ForgetMemory`'s final atomic transaction algorithm rewritten** into
+  one exact 13-step order incorporating every correction above (scrub
+  audit snapshots → clear inbound supersession links → delete Evidence
+  links/rows → delete orphaned Source rows → delete the Fact → insert
+  the minimal audit marker) - supersedes R017's original 9-step
+  version in full.
+- **Slice A/B acceptance criteria updated** to prove the corrected
+  invariants (combined Core+DB SELF-uniqueness proof, rollback proving
+  newly-created Entity rows also vanish, all 15 exact length bounds
+  proven, etc.) - nothing else about the recommended implementation
+  order (Slice A then B, §4o) changed.
+
+Full evidence, exact corrected algorithms, and the complete review
+findings:
+`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
-on an existing M2 entity is now built, and (2026-09-18, R017, §4o) the
-Personal Knowledge Layer's v0.1 architecture is now fully frozen at the
-field level. Two real options now exist for the next *implementation*
-slice: **the Personal Knowledge Layer's Slice A+B** (`Entity`+`Source`+
-`Evidence`+`Fact` foundation, then `AddMemory` - R017 §29's
-recommended next slice, ready to implement directly since the freeze
-pass is done) or **`RecurringRule`** (deliberately deferred, still
+on an existing M2 entity is now built, and (2026-09-18, R017 §4o, then
+corrected by R018 §4p) the Personal Knowledge Layer's v0.1 architecture
+is now fully frozen at the field level, with the post-freeze
+consistency review's eleven gaps (two critical) already fixed before
+any code exists. Two real options now exist for the next
+*implementation* slice: **the Personal Knowledge Layer's Slice A+B**
+(`Entity`+`Source`+`Evidence`+`Fact` foundation, then `AddMemory` - R018
+§18/§20's corrected acceptance criteria, ready to implement directly
+since both the freeze pass and its consistency-hardening follow-up are
+done) or **`RecurringRule`** (deliberately deferred, still
 needs its own design/freeze pass before any code - `Task.
 recurring_rule_id` stays `NULL`-only until then, §4j). Personal
 Knowledge is no longer blocked on a freeze pass the way it was before
@@ -1620,13 +1788,19 @@ implemented, `UpdateProject` closing out the last frozen, shovel-ready
 action, (2026-09-18, R015 §4m then R016 §4n) the master-key lifecycle
 and mandatory audit-snapshot safety gaps closed and then verified
 deterministically/corrected for a post-file-creation failure edge case,
-and (2026-09-18, R017 §4o) the Personal Knowledge Layer's v0.1
-architecture now fully frozen at the field level, the recommended next
-step is the **Personal Knowledge Layer's implementation Slice A+B**
+and (2026-09-18, R017 §4o then R018 §4p) the Personal Knowledge Layer's
+v0.1 architecture now fully frozen at the field level, with a dedicated
+post-freeze consistency review's eleven gaps (two critical - an inbound
+FK that would have blocked `ForgetMemory` outright, and pre-existing
+audit snapshots that could have retained forgotten content) already
+found and fixed before any code exists, the recommended next step is
+the **Personal Knowledge Layer's implementation Slice A+B**
 (`Entity`+`Source`+`Evidence`+`Fact` foundation, then `AddMemory` -
-R017 §29) - a real implementation slice can now begin there without
-inventing product rules mid-implementation, since the freeze pass is
-already done. `RecurringRule` remains deliberately deferred (§4j),
+R018 §18/§20's corrected acceptance criteria) - a real implementation
+slice can now begin there without inventing product rules mid-
+implementation, since both the freeze pass and its consistency-
+hardening follow-up are already done. `RecurringRule` remains
+deliberately deferred (§4j),
 still needing its own design/freeze pass before any code. M2's
 storage/security foundation is safe to proceed into implementation - see
 R016 §15 and R017 §29.
@@ -1695,10 +1869,27 @@ R016 §15 and R017 §29.
   normalized link tables; an ambiguously-closed `Source.kind`). All
   identified explicitly and corrected in R017, not silently carried
   forward into an eventual implementation that would have had to guess.
-- **Personal Knowledge Layer is still not implemented in code** — R017
-  freezes the architecture only; `Entity`/`Fact`/`Relation`/`Episode`/
-  `Source`/`Evidence` do not exist as real tables yet. The recommended
-  next implementation slice is R017 §29's Slice A+B (§4o/§9 above).
+- **RESOLVED (2026-09-18, M2 Personal Knowledge Architecture
+  Consistency Hardening, R018 §4p above): a dedicated post-freeze
+  review of R017 found eleven further consistency/privacy gaps before
+  any implementation - two critical.** The SELF-entity invariant only
+  ever guaranteed at-most-one via a DB index, never existence
+  (corrected with a Core-level `ensure_self_entity` bootstrap);
+  `AddMemory` had no path to create a new Entity at all (corrected with
+  a typed `EntityInputRef`); `ForgetMemory` never scrubbed pre-existing
+  `CorrectMemory`/`ConfirmMemory` audit snapshots, which could have
+  retained the exact forgotten text (corrected - now scrubbed before
+  deletion); the `superseded_by_fact_id` foreign key had no `ON DELETE`
+  clause and would have blocked `ForgetMemory` outright on any
+  previously-superseded Fact (corrected - inbound references are now
+  explicitly cleared first). All identified explicitly and corrected in
+  R018, not silently carried forward into an eventual implementation
+  that would have had to discover them the hard way.
+- **Personal Knowledge Layer is still not implemented in code** — R017/
+  R018 freeze the architecture only; `Entity`/`Fact`/`Relation`/
+  `Episode`/`Source`/`Evidence` do not exist as real tables yet. The
+  recommended next implementation slice is R018 §18/§20's corrected
+  Slice A+B (§4p/§9 above).
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -1848,5 +2039,6 @@ summaries - open the file for full reasoning.
 | R015 | M2 Storage and Audit Safety Hardening | `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md` |
 | R016 | M2 Key Lifecycle Determinism and Failure Atomicity Hardening | `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md` |
 | R017 | M2 Personal Knowledge Layer Architecture Freeze | `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md` |
+| R018 | M2 Personal Knowledge Architecture Consistency Hardening | `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md` |
 
-Next report allocated will be **R018**.
+Next report allocated will be **R019**.
