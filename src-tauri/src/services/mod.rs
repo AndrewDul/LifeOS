@@ -19,16 +19,16 @@ mod storage;
 
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
-    AddMilestonePayload, AddTaskPayload, ConfirmationClass, CreateGoalPayload,
-    CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch, LinkGoalsPayload, Provenance,
-    SourceRef, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
-    UpdateProjectPayload, UpdateTaskPayload, ValidationError,
+    AddMilestonePayload, AddTaskPayload, ConfirmationClass, CorrectMemoryPayload,
+    CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch,
+    LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
+    UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
-    Entity, EntityId, EpistemicState, Evidence, EvidenceId, Fact, FactId, FactValue, Goal, GoalId,
-    GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
-    Project, ProjectId, Sensitivity, Source, SourceId, Task, TaskId, TaskStatus,
+    is_active_fact, Entity, EntityId, EpistemicState, Evidence, EvidenceId, Fact, FactId,
+    FactValue, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
+    MilestoneStatus, Project, ProjectId, Sensitivity, Source, SourceId, Task, TaskId, TaskStatus,
 };
 use crate::security;
 use chrono::Utc;
@@ -1985,6 +1985,242 @@ pub(crate) fn add_memory(
 
     ActionOutcome::Success {
         value: fact,
+        confirmation_class: class,
+    }
+}
+
+/// The Personal-Knowledge-specific confirmation overlay (R018 §6): a
+/// Memory action's `ImportantChange` floor (severity 3, `CorrectMemory`)
+/// already dominates `InferredChange` (severity 2) in the generic
+/// `effective_class` ladder, so `blocks_until_confirmed(class)` alone
+/// does NOT force a block for an inferred, unconfirmed proposal the way
+/// it does for `AddMemory`'s lower `ExplicitAdd` floor (where
+/// `InferredChange` dominates instead). This narrow helper restores the
+/// required block WITHOUT changing `ConfirmationClass`, `effective_
+/// class`, or `blocks_until_confirmed` themselves - `class` (returned to
+/// the caller as `confirmation_class` either way) stays `ImportantChange`
+/// regardless; only the blocking DECISION differs from the generic
+/// ladder's own verdict. Confirmed calls (`meta.confirmed`) never block,
+/// regardless of provenance.
+fn memory_action_requires_confirmation(meta: &ActionMeta, class: ConfirmationClass) -> bool {
+    if meta.confirmed {
+        return false;
+    }
+    blocks_until_confirmed(class) || meta.provenance == Provenance::Inferred
+}
+
+/// `CorrectMemory` - the second production Personal Knowledge mutation
+/// (M2 Personal Knowledge Slice C, 2026-09-18). "The retained semantic
+/// knowledge is wrong/outdated; replace it while preserving history" -
+/// never an in-place semantic edit. Creates a brand-new successor `Fact`
+/// inheriting `subject_entity_id`/`predicate` EXACTLY from the
+/// predecessor, and closes the predecessor (`valid_until`/
+/// `superseded_by_fact_id`/`epistemic_state = Stale`/`updated_at`) in
+/// the same atomic transaction.
+///
+/// Execution order (matches the corrected R021 `AddMemory` safety
+/// boundary exactly): (1) pure structural validation
+/// (`actions::validate_correct_memory` - no SQL); (2) `effective_class`
+/// computed against the `ImportantChange` floor; (3)/(4) the
+/// Personal-Knowledge inferred-confirmation overlay
+/// (`memory_action_requires_confirmation`, above) - an inferred,
+/// unconfirmed correction returns `ConfirmationRequired` here, before
+/// the predecessor is ever fetched; (5) only once confirmation is
+/// satisfied does the predecessor get read, its active/inactive state
+/// checked (`domain::is_active_fact`), the value's object Entity (if
+/// any) and Source resolved, and any domain-ref/duplicate-domain-ref
+/// checks run; (6) a `NotFound` (missing predecessor) or
+/// `ValidationFailed` (inactive predecessor, unresolved references)
+/// result short-circuits before any write; (7) the mandatory
+/// `previous_snapshot` of the predecessor's PRE-correction state is
+/// serialized (`serialize_required_snapshot`, never `.ok()`-downgraded)
+/// before (8) the atomic transaction opens.
+///
+/// Successor `epistemic_state` is unconditionally `UserConfirmed` -
+/// there is no v0.1 path to `INFERRED`/`OBSERVED`/`DISPUTED`/`STALE`
+/// through `CorrectMemory` (R018). `provenance` in the audit row is
+/// never rewritten - confirming an inferred correction persists
+/// `USER_CONFIRMED` on the successor while the audit row's own
+/// `provenance` stays `Inferred` (confirmation and provenance are
+/// distinct concepts, matching `AddMemory`'s same guarantee).
+///
+/// The audit row's `fact_id` is the PREDECESSOR's id, not the
+/// successor's - the row records the mutation of the targeted
+/// predecessor and carries that predecessor's `previous_snapshot`,
+/// preserving the frozen future `ForgetMemory` rule that it can scrub
+/// `fact_audit_log.previous_snapshot WHERE fact_id = <target>` before
+/// deleting that exact Fact.
+///
+/// Transaction order: new object `Entity` (if `FactValueInput::
+/// Entity(New(..))`) -> new `Source` (if `SourceRef::New`) -> successor
+/// `Fact` -> new `Evidence` -> successor's `fact_evidence` link ->
+/// predecessor update (`update_fact_as_superseded` - the only path that
+/// can ever touch `valid_until`/`superseded_by_fact_id`/
+/// `epistemic_state`/`updated_at` on an existing Fact) -> one
+/// `fact_audit_log` row for the predecessor. Any failure at any step
+/// rolls back everything, including the predecessor update.
+///
+/// Never writes to `relations`/`episodes`/`relation_evidence`/
+/// `episode_evidence`/`episode_entities`. Never performs contradiction
+/// detection, never searches for or mutates a sibling Fact sharing the
+/// same subject+predicate, never touches an ancestor Fact further back
+/// than the immediate predecessor.
+pub(crate) fn correct_memory(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: CorrectMemoryPayload,
+) -> ActionOutcome<Fact> {
+    let normalized = match crate::actions::validate_correct_memory(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::ImportantChange, meta.provenance);
+    if memory_action_requires_confirmation(&meta, class) {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let predecessor =
+        match storage::personal_knowledge_repo::get_fact(conn, normalized.predecessor_fact_id) {
+            Ok(Some(f)) => f,
+            Ok(None) => return ActionOutcome::NotFound,
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        };
+
+    let mut errors: Vec<ValidationError> = Vec::new();
+    if !is_active_fact(&predecessor) {
+        errors.push(ValidationError::FactNotActive);
+    }
+
+    let object = match &normalized.value {
+        FactValueInput::Entity(entity_ref) => {
+            match resolve_entity_input_ref(conn, entity_ref, now, &mut errors) {
+                Ok(r) => r,
+                Err(e) => return ActionOutcome::StorageError(e),
+            }
+        }
+        FactValueInput::ScalarJson(_) => None,
+    };
+
+    let source = match resolve_source_ref(conn, &normalized.source, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    if !errors.is_empty() {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    let source = source.expect("no reference errors implies source resolved");
+
+    let previous_snapshot = match serialize_required_snapshot(&predecessor) {
+        Ok(s) => s,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    let fact_value = match &normalized.value {
+        FactValueInput::ScalarJson(s) => FactValue::Scalar(s.clone()),
+        FactValueInput::Entity(_) => FactValue::EntityRef(
+            object
+                .as_ref()
+                .expect("FactValueInput::Entity implies object resolved")
+                .id,
+        ),
+    };
+
+    let confidence = match normalized.confidence {
+        FieldPatch::Unchanged => predecessor.confidence,
+        FieldPatch::Set(c) => Some(c),
+        FieldPatch::Clear => None,
+    };
+
+    let successor = Fact {
+        id: FactId::new(),
+        subject_entity_id: predecessor.subject_entity_id,
+        predicate: predecessor.predicate.clone(),
+        value: fact_value,
+        memory_type: normalized.memory_type.unwrap_or(predecessor.memory_type),
+        epistemic_state: EpistemicState::UserConfirmed,
+        confidence,
+        sensitivity: normalized.sensitivity.unwrap_or(predecessor.sensitivity),
+        valid_from: now,
+        valid_until: None,
+        superseded_by_fact_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let evidence = Evidence {
+        id: EvidenceId::new(),
+        source_id: source.id,
+        content: normalized.evidence.content.clone(),
+        locator: normalized.evidence.locator.clone(),
+        sensitivity: normalized.evidence.sensitivity,
+        created_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Some(resolved_object) = &object {
+        if let Some(new_object) = &resolved_object.to_insert {
+            if let Err(e) = storage::personal_knowledge_repo::insert_entity(&tx, new_object) {
+                return ActionOutcome::StorageError(CoreError::from(e));
+            }
+        }
+    }
+    if let Some(new_source) = &source.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_source(&tx, new_source) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact(&tx, &successor) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_evidence(&tx, &evidence) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact_evidence_link(
+        &tx,
+        successor.id,
+        evidence.id,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::update_fact_as_superseded(
+        &tx,
+        predecessor.id,
+        successor.id,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact_audit_log(
+        &tx,
+        predecessor.id,
+        "CorrectMemory",
+        meta.actor,
+        meta.provenance,
+        class,
+        Some(previous_snapshot),
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: successor,
         confirmation_class: class,
     }
 }

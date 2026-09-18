@@ -411,3 +411,37 @@ pub(in crate::services) fn insert_fact_audit_log(
     )?;
     Ok(())
 }
+
+/// `CorrectMemory`'s ONLY predecessor-mutation path (M2 Personal
+/// Knowledge Slice C, 2026-09-18) - deliberately narrow rather than a
+/// generic `update_fact`: its SQL touches exactly the four fields the
+/// frozen `Fact` mutability contract allows (`domain::Fact`'s own doc
+/// comment) - `valid_until`, `superseded_by_fact_id`,
+/// `epistemic_state = 'STALE'` (a literal, not a parameter - this
+/// function has exactly one purpose and it is always this transition),
+/// and `updated_at`. `subject_entity_id`/`predicate`/`value`/
+/// `memory_type`/`confidence`/`sensitivity`/`valid_from`/`created_at`
+/// are structurally impossible to touch through this function's
+/// parameter list - the storage API makes the frozen contract hard to
+/// violate rather than merely documenting it.
+pub(in crate::services) fn update_fact_as_superseded(
+    conn: &Connection,
+    predecessor_fact_id: FactId,
+    successor_fact_id: FactId,
+    correction_timestamp: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE facts SET valid_until = ?2, superseded_by_fact_id = ?3, epistemic_state = 'STALE', updated_at = ?4 WHERE id = ?1",
+        params![
+            predecessor_fact_id.to_string(),
+            correction_timestamp.to_rfc3339(),
+            successor_fact_id.to_string(),
+            correction_timestamp.to_rfc3339(),
+        ],
+    )?;
+    debug_assert_eq!(
+        changed, 1,
+        "update_fact_as_superseded should affect exactly one row - caller must check predecessor existence first"
+    );
+    Ok(())
+}

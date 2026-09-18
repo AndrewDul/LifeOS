@@ -7,9 +7,9 @@
 
 use super::*;
 use crate::actions::{
-    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmationClass, EntityInputRef,
-    FactValueInput, FieldPatch, NewEntityData, NewEvidenceData, NewSourceData, Provenance,
-    SourceRef, ValidationError,
+    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmationClass, CorrectMemoryPayload,
+    EntityInputRef, FactValueInput, FieldPatch, NewEntityData, NewEvidenceData, NewSourceData,
+    Provenance, SourceRef, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
@@ -11631,5 +11631,1138 @@ fn req_am_no_entity_alias_merge_same_canonical_name_creates_two_entities() {
         entity_row_count(&conn),
         3,
         "[req_am_no_alias] FAIL - two New Entities sharing a canonical_name (no domain_ref) must not be merged - SELF + 2 distinct Sam Entities expected"
+    );
+}
+
+// =========================================================================
+// M2 Personal Knowledge Slice C - CorrectMemory (2026-09-18)
+//
+// Evidence for
+// `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`.
+// The second production Personal Knowledge mutation - "the retained
+// semantic knowledge is wrong/outdated; replace it while preserving
+// history", never an in-place semantic edit. Database-dependent
+// behavior only - pure `validate_correct_memory` structural tests live
+// in `actions::tests` instead (same split as `AddMemory`).
+// =========================================================================
+
+/// A minimal, always-valid baseline `CorrectMemoryPayload` targeting a
+/// given predecessor - ScalarJson value, brand-new Source, Evidence
+/// with content only. Every test below overrides only the fields it
+/// cares about via struct-update syntax.
+fn mk_cm_payload(predecessor_fact_id: FactId) -> CorrectMemoryPayload {
+    CorrectMemoryPayload {
+        predecessor_fact_id,
+        value: FactValueInput::ScalarJson("\"tea, not coffee\"".to_string()),
+        memory_type: None,
+        confidence: FieldPatch::Unchanged,
+        sensitivity: None,
+        source: mk_am_source_new(),
+        evidence: NewEvidenceData {
+            content: Some("correction evidence".to_string()),
+            locator: None,
+            sensitivity: Sensitivity::Internal,
+        },
+    }
+}
+
+/// Creates a fresh, active predecessor `Fact` via `add_memory` (Self
+/// subject, ScalarJson value, New Source/Evidence) - the standard
+/// fixture every `CorrectMemory` test starts from.
+fn mk_cm_predecessor(conn: &mut Connection) -> Fact {
+    match add_memory(conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[cm predecessor setup] FAIL - add_memory failed: {other:?}"),
+    }
+}
+
+// --- Confirmation test matrix (R022 §21) --------------------------------
+
+#[test]
+fn req_cm_conf_a_explicit_unconfirmed_executes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::ImportantChange);
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed);
+        }
+        other => panic!("[req_cm_conf_a] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// The Personal-Knowledge inferred-confirmation overlay (R018 §6):
+/// unlike `AddMemory`, `CorrectMemory`'s `ImportantChange` floor is NOT
+/// dominated by `InferredChange` in the generic ladder, so
+/// `services::memory_action_requires_confirmation` is what forces the
+/// block here. Uses a NONEXISTENT `predecessor_fact_id` to prove the
+/// gate precedes the predecessor lookup entirely - the correct outcome
+/// is `ConfirmationRequired`, never `NotFound`.
+#[test]
+fn req_cm_conf_b_inferred_unconfirmed_blocks_before_predecessor_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let nonexistent = FactId::new();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match correct_memory(&mut conn, meta, mk_cm_payload(nonexistent)) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::ImportantChange);
+        }
+        other => panic!(
+            "[req_cm_conf_b] FAIL - expected ConfirmationRequired (gate must precede predecessor lookup), got {other:?}"
+        ),
+    }
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        (1, 0, 0, 0, 0, 0),
+        "[req_cm_conf_b] FAIL - zero writes, only the bootstrap SELF entity should exist"
+    );
+}
+
+#[test]
+fn req_cm_conf_c_inferred_confirmed_executes_and_audit_provenance_remains_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    let successor = match correct_memory(&mut conn, meta, mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_conf_c] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(successor.epistemic_state, EpistemicState::UserConfirmed);
+
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![predecessor.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_cm_conf_c] FAIL - confirming an inferred correction must never silently rewrite provenance to Explicit"
+    );
+}
+
+/// Pure structural validation still precedes the confirmation gate -
+/// mirrors the corrected R021 `AddMemory` safety boundary exactly.
+#[test]
+fn req_cm_conf_d_structurally_invalid_payload_returns_validation_failed_before_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    let payload = CorrectMemoryPayload {
+        value: FactValueInput::ScalarJson("{not valid json".to_string()),
+        ..mk_cm_payload(FactId::new())
+    };
+    match correct_memory(&mut conn, meta, payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::InvalidValueJson));
+        }
+        other => panic!("[req_cm_conf_d] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+}
+
+// --- Active predecessor matrix (R022 §22) -------------------------------
+
+/// Proves the full `is_active_fact` two-part predicate, not merely
+/// `valid_until`: (A) a normal active predecessor is accepted; (B) an
+/// already-corrected (now `Stale`) predecessor is rejected; (C) a raw
+/// fixture with `epistemic_state = STALE` but `valid_until = NULL` is
+/// rejected (the deliberate inconsistent-state case); (D) a raw fixture
+/// with `epistemic_state != STALE` but `valid_until != NULL` is
+/// rejected.
+#[test]
+fn req_cm_active_predecessor_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_active.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let active = mk_cm_predecessor(&mut conn);
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(active.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => {
+            panic!("[req_cm_active] FAIL - A: active predecessor should be accepted, got {other:?}")
+        }
+    }
+
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(active.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive));
+        }
+        other => panic!(
+            "[req_cm_active] FAIL - B: already-corrected predecessor should be rejected, got {other:?}"
+        ),
+    }
+
+    let fixture_c = mk_cm_predecessor(&mut conn);
+    conn.execute(
+        "UPDATE facts SET epistemic_state = 'STALE' WHERE id = ?1",
+        rusqlite::params![fixture_c.id.to_string()],
+    )
+    .unwrap();
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(fixture_c.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive));
+        }
+        other => panic!(
+            "[req_cm_active] FAIL - C: STALE-with-NULL-valid_until predecessor should be rejected, got {other:?}"
+        ),
+    }
+
+    let fixture_d = mk_cm_predecessor(&mut conn);
+    conn.execute(
+        "UPDATE facts SET valid_until = ?2 WHERE id = ?1",
+        rusqlite::params![fixture_d.id.to_string(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(fixture_d.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive));
+        }
+        other => panic!(
+            "[req_cm_active] FAIL - D: valid_until-set predecessor should be rejected, got {other:?}"
+        ),
+    }
+
+    // Zero writes from any rejected attempt (B/C/D) - three predecessor
+    // Facts (active/fixture_c/fixture_d) plus exactly one successor
+    // (from A's success).
+    assert_eq!(am_fact_row_count(&conn), 4);
+}
+
+// --- Subject/predicate immutability (R022 §10) --------------------------
+
+#[test]
+fn req_cm_subject_predicate_inherited_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_inherit_sp.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    let successor = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_inherit_sp] FAIL, got {other:?}"),
+    };
+    assert_eq!(successor.subject_entity_id, predecessor.subject_entity_id);
+    assert_eq!(successor.predicate, predecessor.predicate);
+}
+
+// --- FactValueInput success matrix (R022 §8) ----------------------------
+
+/// Correction successor value supports ScalarJson, Entity(SelfEntity),
+/// Entity(Existing), Entity(New without domain_ref), and Entity(New with
+/// a valid supported domain_ref) - each needs its OWN fresh predecessor,
+/// since a predecessor becomes inactive after being corrected once.
+#[test]
+fn req_cm_success_value_variants_scalar_self_existing_new_domain_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_value_variants.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+
+    let p1 = mk_cm_predecessor(&mut conn);
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(p1.id)) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(
+                value.value,
+                FactValue::Scalar("\"tea, not coffee\"".to_string())
+            );
+        }
+        other => panic!("[req_cm_value] FAIL ScalarJson, got {other:?}"),
+    }
+
+    let p2 = mk_cm_predecessor(&mut conn);
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::SelfEntity),
+            ..mk_cm_payload(p2.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.value, FactValue::EntityRef(self_id));
+        }
+        other => panic!("[req_cm_value] FAIL Entity(SelfEntity), got {other:?}"),
+    }
+
+    let p3 = mk_cm_predecessor(&mut conn);
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::Existing(self_id)),
+            ..mk_cm_payload(p3.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.value, FactValue::EntityRef(self_id));
+        }
+        other => panic!("[req_cm_value] FAIL Entity(Existing), got {other:?}"),
+    }
+
+    let p4 = mk_cm_predecessor(&mut conn);
+    let new_object_id = match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "vehicle".to_string(),
+                canonical_name: "Correction Car".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            })),
+            ..mk_cm_payload(p4.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => match value.value {
+            FactValue::EntityRef(id) => id,
+            other => panic!("[req_cm_value] FAIL - expected EntityRef, got {other:?}"),
+        },
+        other => panic!("[req_cm_value] FAIL Entity(New no domain_ref), got {other:?}"),
+    };
+    assert_ne!(new_object_id, self_id);
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("CM Value Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let p5 = mk_cm_predecessor(&mut conn);
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "goal".to_string(),
+                canonical_name: "CM Value Goal Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: "Goal".to_string(),
+                    domain_ref_id: goal.id.to_string(),
+                }),
+            })),
+            ..mk_cm_payload(p5.id)
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cm_value] FAIL Entity(New with domain_ref), got {other:?}"),
+    }
+}
+
+/// All the ways a correction can be rejected before any write: malformed
+/// JSON, overlong JSON, a missing `Existing` Entity, a nonexistent
+/// authoritative domain object, and a persisted-duplicate domain_ref -
+/// reusing ONE predecessor throughout (every attempt is rejected, so the
+/// predecessor is never consumed) and proving it remains completely
+/// unchanged at the end.
+#[test]
+fn req_cm_rejects_malformed_value_and_missing_references_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_reject.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_before = predecessor.clone();
+    let snapshot_before_first_four = am_full_table_snapshot(&conn);
+
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::ScalarJson("{not valid".to_string()),
+            ..mk_cm_payload(predecessor.id)
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::InvalidValueJson))
+        }
+        other => panic!("[req_cm_reject] FAIL malformed JSON, got {other:?}"),
+    }
+
+    let overlong = format!("\"{}\"", "x".repeat(crate::domain::VALUE_JSON_MAX_LEN));
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::ScalarJson(overlong),
+            ..mk_cm_payload(predecessor.id)
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PersonalKnowledgeFieldTooLong {
+                field: "value_json",
+                ..
+            }
+        ))),
+        other => panic!("[req_cm_reject] FAIL overlong JSON, got {other:?}"),
+    }
+
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::Existing(EntityId::new())),
+            ..mk_cm_payload(predecessor.id)
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedEntityNotFound))
+        }
+        other => panic!("[req_cm_reject] FAIL missing existing entity, got {other:?}"),
+    }
+
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "goal".to_string(),
+                canonical_name: "Bad Goal Ref".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: "Goal".to_string(),
+                    domain_ref_id: EntityId::new().to_string(),
+                }),
+            })),
+            ..mk_cm_payload(predecessor.id)
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedDomainObjectNotFound))
+        }
+        other => panic!("[req_cm_reject] FAIL nonexistent domain object, got {other:?}"),
+    }
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before_first_four,
+        "[req_cm_reject] FAIL - the four rejected attempts above must leave every table unchanged"
+    );
+
+    // Persisted-duplicate domain_ref needs a real, already-persisted
+    // Entity owning the domain_ref first - a legitimate setup write,
+    // snapshotted separately so it is not mistaken for a rejected call's
+    // side effect.
+    let goal2 = match create_goal(&mut conn, ui_explicit(), mk_create_payload("CM Dup Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal2.id.to_string(),
+    };
+    let seed = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Existing Goal Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref.clone()),
+        }),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), seed) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup seed AddMemory failed: {other:?}"),
+    }
+    let snapshot_before_dup = am_full_table_snapshot(&conn);
+
+    match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "goal".to_string(),
+                canonical_name: "Duplicate Goal Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(domain_ref),
+            })),
+            ..mk_cm_payload(predecessor.id)
+        },
+    ) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateDomainReference))
+        }
+        other => panic!("[req_cm_reject] FAIL persisted duplicate domain_ref, got {other:?}"),
+    }
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before_dup,
+        "[req_cm_reject] FAIL - the persisted-duplicate rejection must leave every table unchanged"
+    );
+
+    let predecessor_after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(
+        predecessor_before, predecessor_after,
+        "[req_cm_reject] FAIL - the predecessor must remain byte-for-byte unchanged after every rejected attempt"
+    );
+}
+
+// --- memory_type/sensitivity/confidence inherit-vs-override (R022 §23) -
+
+#[test]
+fn req_cm_memory_type_sensitivity_confidence_inherit_and_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_inherit_override.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let p1_payload = AddMemoryPayload {
+        memory_type: MemoryType::Observation,
+        sensitivity: Sensitivity::Sensitive,
+        confidence: Some(0.4),
+        ..mk_am_payload()
+    };
+    let predecessor1 = match add_memory(&mut conn, ui_explicit(), p1_payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup predecessor1 failed: {other:?}"),
+    };
+    let successor1 = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor1.id))
+    {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_inherit_override] FAIL inherit case, got {other:?}"),
+    };
+    assert_eq!(
+        successor1.memory_type,
+        MemoryType::Observation,
+        "memory_type should inherit when None"
+    );
+    assert_eq!(
+        successor1.sensitivity,
+        Sensitivity::Sensitive,
+        "sensitivity should inherit when None"
+    );
+    assert_eq!(
+        successor1.confidence,
+        Some(0.4),
+        "confidence should inherit under Unchanged"
+    );
+    let predecessor1_after = get_fact(&conn, predecessor1.id).unwrap().unwrap();
+    assert_eq!(predecessor1_after.memory_type, MemoryType::Observation);
+    assert_eq!(predecessor1_after.sensitivity, Sensitivity::Sensitive);
+    assert_eq!(predecessor1_after.confidence, Some(0.4));
+
+    let p2_payload = AddMemoryPayload {
+        memory_type: MemoryType::Observation,
+        sensitivity: Sensitivity::Sensitive,
+        confidence: Some(0.4),
+        ..mk_am_payload()
+    };
+    let predecessor2 = match add_memory(&mut conn, ui_explicit(), p2_payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup predecessor2 failed: {other:?}"),
+    };
+    let override_payload = CorrectMemoryPayload {
+        memory_type: Some(MemoryType::EffectiveSolution),
+        sensitivity: Some(Sensitivity::Public),
+        confidence: FieldPatch::Set(0.9),
+        ..mk_cm_payload(predecessor2.id)
+    };
+    let successor2 = match correct_memory(&mut conn, ui_explicit(), override_payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_inherit_override] FAIL override case, got {other:?}"),
+    };
+    assert_eq!(successor2.memory_type, MemoryType::EffectiveSolution);
+    assert_eq!(successor2.sensitivity, Sensitivity::Public);
+    assert_eq!(successor2.confidence, Some(0.9));
+    let predecessor2_after = get_fact(&conn, predecessor2.id).unwrap().unwrap();
+    assert_eq!(
+        predecessor2_after.memory_type,
+        MemoryType::Observation,
+        "predecessor memory_type never changes even when successor overrides"
+    );
+    assert_eq!(
+        predecessor2_after.sensitivity,
+        Sensitivity::Sensitive,
+        "predecessor sensitivity never changes even when successor overrides"
+    );
+    assert_eq!(
+        predecessor2_after.confidence,
+        Some(0.4),
+        "predecessor confidence never changes even when successor overrides"
+    );
+}
+
+// --- confidence FieldPatch matrix (R022 §23/§35) ------------------------
+
+#[test]
+fn req_cm_confidence_fieldpatch_matrix_unchanged_set_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_confidence_patch.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    fn make_predecessor(conn: &mut Connection) -> Fact {
+        let payload = AddMemoryPayload {
+            confidence: Some(0.4),
+            ..mk_am_payload()
+        };
+        match add_memory(conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup predecessor failed: {other:?}"),
+        }
+    }
+
+    let p_unchanged = make_predecessor(&mut conn);
+    let s_unchanged = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(p_unchanged.id))
+    {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_conf_patch] FAIL Unchanged, got {other:?}"),
+    };
+    assert_eq!(s_unchanged.confidence, Some(0.4));
+    assert_eq!(
+        get_fact(&conn, p_unchanged.id).unwrap().unwrap().confidence,
+        Some(0.4)
+    );
+
+    let p_set = make_predecessor(&mut conn);
+    let s_set = match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            confidence: FieldPatch::Set(0.8),
+            ..mk_cm_payload(p_set.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_conf_patch] FAIL Set, got {other:?}"),
+    };
+    assert_eq!(s_set.confidence, Some(0.8));
+    assert_eq!(
+        get_fact(&conn, p_set.id).unwrap().unwrap().confidence,
+        Some(0.4),
+        "predecessor confidence must remain untouched"
+    );
+
+    let p_clear = make_predecessor(&mut conn);
+    let s_clear = match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            confidence: FieldPatch::Clear,
+            ..mk_cm_payload(p_clear.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_conf_patch] FAIL Clear, got {other:?}"),
+    };
+    assert_eq!(s_clear.confidence, None);
+    assert_eq!(
+        get_fact(&conn, p_clear.id).unwrap().unwrap().confidence,
+        Some(0.4),
+        "predecessor confidence must remain untouched"
+    );
+}
+
+// --- Successor/predecessor full-field proof + no-gap/no-overlap --------
+// (R022 §13-15)
+
+#[test]
+fn req_cm_successor_and_predecessor_full_field_proof_no_gap_no_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_full_field.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let t1: chrono::DateTime<chrono::Utc> = "2026-09-18T10:00:00Z".parse().unwrap();
+    let meta1 = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t1,
+        confirmed: false,
+    };
+    let predecessor = match add_memory(&mut conn, meta1, mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let predecessor_before = predecessor.clone();
+
+    let t2: chrono::DateTime<chrono::Utc> = "2026-09-18T11:30:00Z".parse().unwrap();
+    let meta2 = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t2,
+        confirmed: false,
+    };
+    let successor = match correct_memory(&mut conn, meta2, mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_full_field] FAIL, got {other:?}"),
+    };
+
+    let predecessor_after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+
+    assert_eq!(predecessor_after.id, predecessor_before.id);
+    assert_eq!(
+        predecessor_after.subject_entity_id,
+        predecessor_before.subject_entity_id
+    );
+    assert_eq!(predecessor_after.predicate, predecessor_before.predicate);
+    assert_eq!(predecessor_after.value, predecessor_before.value);
+    assert_eq!(
+        predecessor_after.memory_type,
+        predecessor_before.memory_type
+    );
+    assert_eq!(predecessor_after.confidence, predecessor_before.confidence);
+    assert_eq!(
+        predecessor_after.sensitivity,
+        predecessor_before.sensitivity
+    );
+    assert_eq!(predecessor_after.valid_from, predecessor_before.valid_from);
+    assert_eq!(predecessor_after.created_at, predecessor_before.created_at);
+
+    assert_ne!(
+        predecessor_after.valid_until,
+        predecessor_before.valid_until
+    );
+    assert_ne!(
+        predecessor_after.superseded_by_fact_id,
+        predecessor_before.superseded_by_fact_id
+    );
+    assert_ne!(
+        predecessor_after.epistemic_state,
+        predecessor_before.epistemic_state
+    );
+    assert_ne!(predecessor_after.updated_at, predecessor_before.updated_at);
+
+    assert_eq!(predecessor_after.valid_until, Some(t2));
+    assert_eq!(predecessor_after.superseded_by_fact_id, Some(successor.id));
+    assert_eq!(predecessor_after.epistemic_state, EpistemicState::Stale);
+    assert_eq!(predecessor_after.updated_at, t2);
+
+    assert_eq!(predecessor_after.valid_until, Some(successor.valid_from));
+    assert_eq!(successor.valid_from, t2);
+    assert_eq!(successor.superseded_by_fact_id, None);
+}
+
+// --- Correction chain A -> B -> C (R022 §16/§24) ------------------------
+
+#[test]
+fn req_cm_correction_chain_a_to_b_to_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_chain.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let t0: chrono::DateTime<chrono::Utc> = "2026-09-18T09:00:00Z".parse().unwrap();
+    let meta0 = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t0,
+        confirmed: false,
+    };
+    let a = match add_memory(&mut conn, meta0, mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup A failed: {other:?}"),
+    };
+
+    let t1: chrono::DateTime<chrono::Utc> = "2026-09-18T10:00:00Z".parse().unwrap();
+    let meta1 = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t1,
+        confirmed: false,
+    };
+    let b = match correct_memory(&mut conn, meta1, mk_cm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_chain] FAIL A->B, got {other:?}"),
+    };
+
+    let t2: chrono::DateTime<chrono::Utc> = "2026-09-18T11:00:00Z".parse().unwrap();
+    let meta2 = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t2,
+        confirmed: false,
+    };
+    let c = match correct_memory(&mut conn, meta2, mk_cm_payload(b.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_chain] FAIL B->C, got {other:?}"),
+    };
+
+    let a_final = get_fact(&conn, a.id).unwrap().unwrap();
+    let b_final = get_fact(&conn, b.id).unwrap().unwrap();
+    let c_final = get_fact(&conn, c.id).unwrap().unwrap();
+
+    assert_eq!(a_final.epistemic_state, EpistemicState::Stale);
+    assert_eq!(a_final.valid_until, Some(t1));
+    assert_eq!(a_final.superseded_by_fact_id, Some(b.id));
+
+    assert_eq!(b_final.epistemic_state, EpistemicState::Stale);
+    assert_eq!(b_final.valid_from, t1);
+    assert_eq!(b_final.valid_until, Some(t2));
+    assert_eq!(b_final.superseded_by_fact_id, Some(c.id));
+
+    assert_eq!(c_final.epistemic_state, EpistemicState::UserConfirmed);
+    assert_eq!(c_final.valid_from, t2);
+    assert_eq!(c_final.valid_until, None);
+    assert_eq!(c_final.superseded_by_fact_id, None);
+
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(a.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive))
+        }
+        other => {
+            panic!("[req_cm_chain] FAIL - correcting A again should be rejected, got {other:?}")
+        }
+    }
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(b.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive))
+        }
+        other => {
+            panic!("[req_cm_chain] FAIL - correcting B again should be rejected, got {other:?}")
+        }
+    }
+}
+
+// --- Contradiction is not correction (R022 §25) -------------------------
+
+#[test]
+fn req_cm_sibling_fact_with_same_subject_predicate_remains_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_sibling.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fact1 = match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup fact1 failed: {other:?}"),
+    };
+    let fact2 = match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup fact2 failed: {other:?}"),
+    };
+    assert_eq!(fact1.subject_entity_id, fact2.subject_entity_id);
+    assert_eq!(fact1.predicate, fact2.predicate);
+    assert_ne!(fact1.id, fact2.id);
+    let fact2_before = fact2.clone();
+
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(fact1.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cm_sibling] FAIL, got {other:?}"),
+    }
+
+    let fact2_after = get_fact(&conn, fact2.id).unwrap().unwrap();
+    assert_eq!(
+        fact2_before, fact2_after,
+        "[req_cm_sibling] FAIL - a sibling Fact sharing subject+predicate must remain byte-for-byte unchanged"
+    );
+}
+
+// --- Mandatory previous_snapshot (R022 §17) -----------------------------
+
+#[test]
+fn req_cm_previous_snapshot_mandatory_and_deserializes_exactly_to_pre_correction_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_snapshot.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_pre_correction = predecessor.clone();
+
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cm_snapshot] FAIL, got {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![predecessor.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json = previous_snapshot
+        .expect("[req_cm_snapshot] FAIL - previous_snapshot must be non-NULL for CorrectMemory");
+    let deserialized: Fact =
+        serde_json::from_str(&snapshot_json).expect("snapshot must deserialize as a Fact");
+    assert_eq!(
+        deserialized, predecessor_pre_correction,
+        "[req_cm_snapshot] FAIL - snapshot must deserialize exactly to the predecessor's PRE-correction state"
+    );
+}
+
+// --- Audit fact_id rationale (R022 §18/§27/§28) -------------------------
+
+#[test]
+fn req_cm_audit_fact_id_is_predecessor_id_with_correct_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_audit.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    let successor = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_audit] FAIL, got {other:?}"),
+    };
+
+    let (fact_id, action_type, confirmation_class): (String, String, String) = conn
+        .query_row(
+            "SELECT fact_id, action_type, confirmation_class FROM fact_audit_log WHERE action_type = 'CorrectMemory'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        fact_id,
+        predecessor.id.to_string(),
+        "[req_cm_audit] FAIL - audit fact_id must be the PREDECESSOR id, not the successor's"
+    );
+    assert_ne!(fact_id, successor.id.to_string());
+    assert_eq!(action_type, "CorrectMemory");
+    assert_eq!(confirmation_class, "IMPORTANT_CHANGE");
+}
+
+// --- Full atomic rollback (R022 - central acceptance proof, §30) -------
+
+#[test]
+fn req_cm_rollback_forced_audit_failure_rolls_back_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_rollback1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_before = predecessor.clone();
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    install_fact_audit_failure_trigger(&conn);
+
+    let payload = CorrectMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "place".to_string(),
+            canonical_name: "Rollback CM Object".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..mk_cm_payload(predecessor.id)
+    };
+    match correct_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_cm_rollback1] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_fact_audit_failure_trigger(&conn);
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before,
+        "[req_cm_rollback1] FAIL - every AddMemory/CorrectMemory-mutated table must be exactly as before the failed correction (new object Entity/Source/successor Fact/Evidence/link/audit all absent)"
+    );
+    let predecessor_after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(
+        predecessor_after, predecessor_before,
+        "[req_cm_rollback1] FAIL - the predecessor update must also roll back completely"
+    );
+    assert!(
+        is_active_fact(&predecessor_after),
+        "[req_cm_rollback1] FAIL - predecessor must still be active after rollback"
+    );
+
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_cm_rollback1] FAIL - connection should remain usable after rollback, got {other:?}"
+        ),
+    }
+}
+
+/// An earlier-stage failure (before the predecessor-update/audit steps)
+/// - the same rollback guarantee must hold regardless of which insert in
+/// the sequence fails.
+#[test]
+fn req_cm_rollback_earlier_stage_forced_evidence_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_rollback2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let predecessor_before = predecessor.clone();
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    install_evidence_insert_failure_trigger(&conn);
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_cm_rollback2] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_evidence_insert_failure_trigger(&conn);
+
+    assert_eq!(am_full_table_snapshot(&conn), snapshot_before);
+    let predecessor_after = get_fact(&conn, predecessor.id).unwrap().unwrap();
+    assert_eq!(
+        predecessor_after, predecessor_before,
+        "[req_cm_rollback2] FAIL - predecessor must remain unchanged even when failure happens before its own update step"
+    );
+}
+
+// --- Existing Entity/Source reuse immutability (R022 §32) --------------
+
+#[test]
+fn req_cm_existing_entity_and_source_untouched_on_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_immut.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let setup = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "CM Reuse Person".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        ..mk_am_payload()
+    };
+    let (reusable_entity_id, reusable_source_id) = match add_memory(&mut conn, ui_explicit(), setup)
+    {
+        ActionOutcome::Success { value, .. } => {
+            let source_id_str: String = conn
+                .query_row(
+                    "SELECT e.source_id FROM evidence e
+                     JOIN fact_evidence fe ON fe.evidence_id = e.id
+                     WHERE fe.fact_id = ?1",
+                    rusqlite::params![value.id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (
+                value.subject_entity_id,
+                SourceId::parse(&source_id_str).unwrap(),
+            )
+        }
+        other => panic!("setup failed: {other:?}"),
+    };
+
+    let entity_before = get_entity(&conn, reusable_entity_id).unwrap().unwrap();
+    let source_before = read_source_fields(&conn, reusable_source_id);
+
+    let predecessor = mk_cm_predecessor(&mut conn);
+    let reuse_payload = CorrectMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::Existing(reusable_entity_id)),
+        source: SourceRef::Existing(reusable_source_id),
+        ..mk_cm_payload(predecessor.id)
+    };
+    match correct_memory(&mut conn, ui_explicit(), reuse_payload) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cm_immut] FAIL, got {other:?}"),
+    }
+
+    let entity_after = get_entity(&conn, reusable_entity_id).unwrap().unwrap();
+    let source_after = read_source_fields(&conn, reusable_source_id);
+    assert_eq!(
+        entity_before, entity_after,
+        "[req_cm_immut] FAIL - Existing Entity was mutated on reuse"
+    );
+    assert_eq!(
+        source_before, source_after,
+        "[req_cm_immut] FAIL - Existing Source was mutated on reuse"
+    );
+}
+
+// --- Predecessor Evidence/Source stay linked; successor gets new -------
+// Evidence (R022 §9/§39)
+
+#[test]
+fn req_cm_predecessor_evidence_and_source_remain_linked_successor_gets_new_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_evidence.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    let predecessor_evidence_id: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![predecessor.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let successor = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_evidence] FAIL, got {other:?}"),
+    };
+
+    let predecessor_evidence_id_after: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![predecessor.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        predecessor_evidence_id, predecessor_evidence_id_after,
+        "[req_cm_evidence] FAIL - predecessor's original Evidence link must remain untouched"
+    );
+
+    let successor_evidence_id: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![successor.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(
+        predecessor_evidence_id, successor_evidence_id,
+        "[req_cm_evidence] FAIL - successor must receive a brand-new Evidence row, never share the predecessor's"
+    );
+
+    assert_eq!(am_evidence_row_count(&conn), 2);
+    assert_eq!(am_fact_evidence_row_count(&conn), 2);
+}
+
+// --- Read-side persistence proofs (R022 §40) ----------------------------
+
+#[test]
+fn req_cm_read_side_persisted_state_via_get_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_read_side.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+
+    let successor = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cm_read_side] FAIL, got {other:?}"),
+    };
+
+    let predecessor_read = get_fact(&conn, predecessor.id)
+        .unwrap()
+        .expect("predecessor must still be readable");
+    assert_eq!(predecessor_read.epistemic_state, EpistemicState::Stale);
+    assert!(predecessor_read.valid_until.is_some());
+
+    let successor_read = get_fact(&conn, successor.id)
+        .unwrap()
+        .expect("successor must be readable");
+    assert_eq!(
+        successor_read.epistemic_state,
+        EpistemicState::UserConfirmed
+    );
+    assert!(successor_read.valid_until.is_none());
+    assert_eq!(
+        successor_read, successor,
+        "get_fact-read successor must match the in-memory returned struct exactly"
+    );
+}
+
+// --- No Relation/Episode side effects (R022 §44) ------------------------
+
+#[test]
+fn req_cm_no_relation_episode_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cm_no_side.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let predecessor = mk_cm_predecessor(&mut conn);
+    match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(predecessor.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    assert_eq!(
+        relation_episode_side_effect_counts(&conn),
+        (0, 0, 0, 0, 0),
+        "[req_cm_no_side] FAIL - CorrectMemory must never write to relations/episodes/relation_evidence/episode_evidence/episode_entities"
     );
 }

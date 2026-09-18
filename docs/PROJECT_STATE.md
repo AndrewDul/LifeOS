@@ -173,9 +173,9 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-324 automated tests prove all of this (262 of them covering the
-CRUD/relation M2 entities below plus storage/key-lifecycle hardening; 62
-more covering M2 Personal Knowledge Slices A/B, §4r/§4s - the full
+356 automated tests prove all of this (262 of them covering the
+CRUD/relation M2 entities below plus storage/key-lifecycle hardening; 94
+more covering M2 Personal Knowledge Slices A/B/C, §4r/§4s/§4t - the full
 breakdown by category: 9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
@@ -222,17 +222,33 @@ domain-ref matrix for `Goal`/`Project`/`Milestone`/`Task`, Existing-
 reference not-found and immutability-on-reuse, two independent forced-
 failure atomic-rollback proofs, audit-row correctness including
 provenance-never-rewritten, zero Relation/Episode side effects, and
-explicit no-dedup/no-alias-merge proofs. **The Goal/Project/
-GoalRelation/Milestone/Task action layer is still not wired into the
-running app** - no Tauri command layer exists, so the UI cannot
-create/see real goals, projects, relations, milestones, or tasks yet.
-**The Personal Knowledge Layer now has a real `V7` schema, a `SELF`
-entity bootstrap, narrow `get_entity`/`get_fact` reads (R020), and a
-working `AddMemory` action (R021) - but no `CorrectMemory`/
-`ConfirmMemory`/`ForgetMemory` action exists yet**, and no Tauri
-command layer exists for `AddMemory` either, so no Personal Knowledge
-data can be created through the running app yet, only through direct
-Core calls in tests (Slice C+/UI wiring both still pending).
+explicit no-dedup/no-alias-merge proofs, plus (R021's own post-run
+correctness/verification hardening, same date) 3 more tests correcting
+the confirmation-gate ordering to precede all database-dependent
+resolution and closing action-level bound/audit-timestamp/duplicate-
+domain-ref evidence gaps, plus (R022, 2026-09-18) 29 new M2 Personal
+Knowledge CorrectMemory Slice C tests - the confirmation matrix (4
+scenarios, including the Personal-Knowledge inferred-confirmation
+overlay `AddMemory` did not need), the active/inactive predecessor
+matrix (4 cases proving the full `is_active_fact` predicate), all five
+`FactValueInput` success shapes plus five rejection paths, inherit-vs-
+override for `memory_type`/`sensitivity`/`confidence`, the full
+successor/predecessor field proof with exact no-gap/no-overlap
+timestamps, an A->B->C correction chain, sibling-Fact non-interference,
+mandatory-snapshot exact-deserialization, audit `fact_id`-is-
+predecessor-id, two independent rollback proofs, and zero Relation/
+Episode side effects. **The Goal/Project/GoalRelation/Milestone/Task
+action layer is still not wired into the running app** - no Tauri
+command layer exists, so the UI cannot create/see real goals, projects,
+relations, milestones, or tasks yet. **The Personal Knowledge Layer now
+has a real `V7` schema, a `SELF` entity bootstrap, narrow
+`get_entity`/`get_fact` reads (R020), a working `AddMemory` action
+(R021), and a working `CorrectMemory` action (R022) - but no
+`ConfirmMemory`/`ForgetMemory` action exists yet**, and no Tauri command
+layer exists for either implemented Memory action, so no Personal
+Knowledge data can be created or corrected through the running app yet,
+only through direct Core calls in tests (Slice D+/UI wiring both still
+pending).
 
 Repository contents as of this run:
 
@@ -1981,35 +1997,124 @@ rewritten.
 Full evidence, exact validation ordering, and every test result:
 `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`.
 
+### 4t. M2 Personal Knowledge Slice C — CorrectMemory (2026-09-18, R022)
+
+**The second production Personal Knowledge mutation.** `services::
+correct_memory(conn, meta, CorrectMemoryPayload) -> ActionOutcome<Fact>`
+- "the retained semantic knowledge is wrong/outdated; replace it while
+preserving history", never an in-place semantic edit. One active
+predecessor `Fact` becomes historical (`Stale`); one new successor
+`Fact` becomes active, in one atomic transaction.
+`CorrectMemoryPayload {predecessor_fact_id, value, memory_type,
+confidence: FieldPatch<f32>, sensitivity, source, evidence}` - the
+exact frozen R018 shape; `subject_entity_id`/`predicate` are always
+inherited from the predecessor exactly, never caller-supplied.
+
+- **Type floor `ImportantChange`** - executes immediately for
+  `Explicit` provenance (not blocking, matching the existing generic
+  policy). **Personal-Knowledge inferred-confirmation overlay** (R018
+  §6): unlike `AddMemory`, `effective_class(ImportantChange, Inferred)`
+  stays `ImportantChange` (does not fall out for free from the generic
+  ladder) - a new narrow helper, `memory_action_requires_confirmation`,
+  restores the required block without changing `ConfirmationClass`/
+  `effective_class`/`blocks_until_confirmed` or `AddMemory`'s own gate.
+  Proven directly with a **nonexistent** `predecessor_fact_id`: an
+  inferred, unconfirmed call returns `ConfirmationRequired`, never
+  `NotFound` - the predecessor is never even fetched while unconfirmed.
+- **Canonical `domain::is_active_fact(fact) = valid_until.is_none() &&
+  epistemic_state != Stale`** - checked, not `valid_until` alone; a
+  four-case matrix proves a normal active predecessor accepted, an
+  already-corrected one rejected, and two deliberate inconsistent-state
+  raw fixtures (STALE-with-NULL-valid_until; valid_until-set-but-not-
+  STALE) both rejected. Reusable by a future `ConfirmMemory` (Slice D).
+- **Subject/predicate always inherited exactly** - the payload has no
+  field to change either. `memory_type`/`sensitivity` follow an
+  inherit-when-`None`/override-when-`Some` pattern; `confidence` uses
+  `FieldPatch<f32>` (`Unchanged`/`Set`/`Clear`, bound-checked on `Set`
+  sharing `AddMemory`'s exact confidence-bound logic). The predecessor's
+  own `memory_type`/`confidence`/`sensitivity` never change either way.
+- **Successor `epistemic_state` is unconditionally `USER_CONFIRMED`** -
+  including a confirmed `Inferred` correction, whose audit row still
+  keeps `provenance = Inferred` (confirmation and provenance stay
+  distinct, matching `AddMemory`'s identical guarantee).
+- **A correction chain A->B->C is proven**: each predecessor closes
+  with `valid_until` exactly equal to the successor's `valid_from` (no
+  gap, no overlap), `superseded_by_fact_id` pointing at the real
+  successor; correcting an already-superseded Fact again is rejected.
+  A sibling Fact sharing the same subject+predicate is proven
+  byte-for-byte untouched - no contradiction detection, no sibling
+  search, ever.
+- **Mandatory `previous_snapshot`** (`serialize_required_snapshot`,
+  never `.ok()`-downgraded) is proven to deserialize exactly back to the
+  predecessor's PRE-correction state. **The audit row's `fact_id` is the
+  PREDECESSOR's id, not the successor's** - preserving the frozen future
+  `ForgetMemory` rule that it can scrub `previous_snapshot WHERE fact_id
+  = target` before deleting that Fact.
+- **Full atomic rollback proven twice** (a forced final-audit-insert
+  failure, and a forced earlier evidence-insert failure) - every new
+  row (object Entity/Source/successor Fact/Evidence/link/audit) and the
+  predecessor's own update all roll back together; the predecessor
+  remains active and byte-for-byte unchanged; the connection stays
+  usable afterward.
+- Predecessor's original Evidence/`fact_evidence` link/Source remain
+  completely untouched; the successor always receives a brand-new
+  Evidence row, never shared. Existing Entity/Source reused via
+  `Existing(...)` are never mutated. New repo function:
+  `update_fact_as_superseded` - deliberately the *only* function that
+  can mutate an existing `facts` row, its SQL touching exactly the four
+  frozen-allowed fields; no generic Fact-patch function exists.
+- **No `V7` migration change** - the schema already supported
+  `CorrectMemory` completely; no V8 was created. `Relation`/`Episode`
+  and their join tables proven untouched after a successful correction.
+- **29 new tests** (356 total, up from 327 - all 327 prior tests remain
+  green, unmodified): 8 direct pure-layer tests (`actions::tests`) + 21
+  database-integration tests (`services::tests`) covering the
+  confirmation matrix (4 scenarios), the active/inactive predecessor
+  matrix (4 cases), all five `FactValueInput` success shapes plus five
+  rejection paths, inherit-vs-override for all three patchable fields,
+  the full successor/predecessor field proof with exact no-gap/no-
+  overlap timestamps, the A->B->C correction chain, sibling-Fact
+  non-interference, mandatory-snapshot exact-deserialization, audit
+  `fact_id`-is-predecessor-id, both rollback proofs, Existing-reuse
+  immutability, Evidence/Source non-sharing, read-side persistence via
+  `get_fact`, and zero Relation/Episode side effects.
+- **`ConfirmMemory`/`ForgetMemory` still do NOT exist** - explicitly not
+  started this run, per instruction.
+
+Full evidence, exact execution ordering, and every test result:
+`docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
 on an existing M2 entity is now built. The Personal Knowledge Layer's
 v0.1 architecture was frozen (R017 §4o), hardened through two rounds of
 post-freeze review (R018 §4p/R019 §4q, 17 gaps found and fixed, four
-critical), **Slice A - the full 11-table `V7` foundation, domain types,
-SELF bootstrap, narrow reads, and `secure_delete` storage hardening - is
-implemented** (2026-09-18, R020 §4r; 293/293 after post-run hardening),
-and **Slice B (`AddMemory`) - the first production Personal Knowledge
-mutation - is now implemented and proven** (2026-09-18, R021 §4s;
-324/324 tests passing). The next *implementation* step is **Slice C
-(`CorrectMemory`)** - R021 §25's exact recommendation: the first Memory
-action to target an existing `Fact`, requiring the `ImportantChange`-
-floor Personal-Knowledge-specific confirmation override R018 §6 already
-froze (its generic `effective_class` alone does not force a block for
-`Inferred`, unlike `AddMemory`'s), plus `serialize_required_snapshot`-
-backed `previous_snapshot` population. `RecurringRule` remains a
-separate, still-deferred option, still needing its own design/freeze
-pass before any code - `Task.recurring_rule_id` stays `NULL`-only until
-then, §4j. R017-R019 already resolved the open questions a Personal
-Knowledge vertical slice would otherwise have hit mid-implementation
-(§4c's lesson from the removed terminal-status rule; §4e's/§4g's
-action-set-gap documentation-before-code discipline; §4f's relation-
-integrity rules and §4i's order_index-uniqueness rule both being
-frozen/resolved *before or as part of* coding rather than invented ad
-hoc mid-implementation - the same discipline R017-R019 applied to
-Personal Knowledge, and Slice A/B's implementations needed to invent
-nothing further beyond what §6/§7 above required).
+critical), **Slice A** (2026-09-18, R020 §4r; the full 11-table `V7`
+foundation, domain types, SELF bootstrap, narrow reads, `secure_delete`
+hardening) and **Slice B (`AddMemory`)** (2026-09-18, R021 §4s; the
+first production Personal Knowledge mutation) are implemented and
+proven, and **Slice C (`CorrectMemory`) - the second production
+Personal Knowledge mutation - is now also implemented and proven**
+(2026-09-18, R022 §4t; 356/356 tests passing). The next *implementation*
+step is **Slice D (`ConfirmMemory`)** - R022 §32's exact recommendation:
+a narrower action than `CorrectMemory` (only `epistemic_state` changes
+on an existing active Fact, no successor Fact, no predecessor closure,
+no new Entity/Source/Evidence), reusing `domain::is_active_fact`
+directly for its own active-Fact precondition - which exact
+`epistemic_state` transitions are frozen as valid is the next concrete
+design question, not yet resolved. `RecurringRule` remains a separate,
+still-deferred option, still needing its own design/freeze pass before
+any code - `Task.recurring_rule_id` stays `NULL`-only until then, §4j.
+R017-R019 already resolved the open questions a Personal Knowledge
+vertical slice would otherwise have hit mid-implementation (§4c's
+lesson from the removed terminal-status rule; §4e's/§4g's action-set-gap
+documentation-before-code discipline; §4f's relation-integrity rules and
+§4i's order_index-uniqueness rule both being frozen/resolved *before or
+as part of* coding rather than invented ad hoc mid-implementation - the
+same discipline R017-R019 applied to Personal Knowledge, and Slices
+A/B/C's implementations needed to invent nothing further beyond what
+§6/§7 above and R022 §4/§6 required).
 
 ---
 
@@ -2097,7 +2202,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 324 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 356 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -2197,10 +2302,28 @@ two independent forced-failure triggers) on any mid-transaction
 failure, records a correct audit row with `previous_snapshot` always
 `NULL` and `provenance` never silently rewritten, never touches
 `relations`/`episodes` or their join tables, and never implicitly
-deduplicates Facts or merges Entities by name (31 new tests). **Test
-count rose from 200 to 233 to 250 to 262 to 285 to 293 to 324 across
-these two days' runs** (293→324 this run, +31) - all previously-covered
-behavior remains green.
+deduplicates Facts or merges Entities by name (31 new tests), then (R021
+post-run correctness/verification hardening, same date) that the
+confirmation gate now precedes ALL database-dependent resolution (not
+merely the write) - an inferred/unconfirmed call gates before even a
+nonexistent reference would be looked up - and that all eleven bounded
+`AddMemory` fields, the audit `occurred_at` timestamp, and both
+duplicate-domain-ref layers now each have exact/full-table proof (3 more
+tests), and (as of 2026-09-18, R022, §4t) that `CorrectMemory` - the
+second production Personal Knowledge mutation - correctly gates
+inferred/unconfirmed corrections before the predecessor is even fetched
+(the Personal-Knowledge inferred-confirmation overlay `AddMemory` did
+not need), rejects an inactive predecessor via the full `is_active_fact`
+predicate, inherits `subject_entity_id`/`predicate` exactly, applies
+`memory_type`/`sensitivity`/`confidence` inherit-vs-override correctly,
+persists a mandatory `previous_snapshot` that deserializes exactly to
+the predecessor's pre-correction state, targets its audit row at the
+predecessor's own id, proves a full A->B->C correction chain with exact
+no-gap/no-overlap timestamps, and atomically rolls back every new row
+plus the predecessor's own update on any mid-transaction failure (29 new
+tests). **Test count rose from 200 to 233 to 250 to 262 to 285 to 293 to
+324 to 327 to 356 across these three days' runs** (327→356 this run,
++29) - all previously-covered behavior remains green.
 
 ---
 
@@ -2224,17 +2347,20 @@ honestly-evaluated forensic-storage guarantee), **Slice A (the full
 11-table `V7` foundation, `ensure_self_entity` bootstrap, narrow
 `get_entity`/`get_fact` reads, `secure_delete = ON` storage hardening)
 is implemented and proven (293/293 tests after post-run verification
-hardening), and (2026-09-18, R021 §4s) Slice B (`AddMemory`) - the
-first production Personal Knowledge mutation - is also implemented and
-proven (324/324 tests)**, the recommended next step is **Slice C
-(`CorrectMemory`)** - R021 §25's exact recommendation - the first
-Memory action to target an existing `Fact`, requiring the
-`ImportantChange`-floor Personal-Knowledge-specific confirmation
-override R018 §6 already froze (its generic `effective_class` does not
-force a block for `Inferred` provenance the way `AddMemory`'s does),
-plus `serialize_required_snapshot`-backed `previous_snapshot`
-population. `RecurringRule` remains deliberately deferred (§4j), still
-needing its own design/freeze pass before any code. M2's storage/
+hardening), (2026-09-18, R021 §4s) Slice B (`AddMemory`) - the first
+production Personal Knowledge mutation - is implemented and proven
+(327/327 after R021's own post-run correctness/verification hardening),
+and (2026-09-18, R022 §4t) Slice C (`CorrectMemory`) - the second
+production Personal Knowledge mutation - is also implemented and
+proven (356/356 tests)**, the recommended next step is **Slice D
+(`ConfirmMemory`)** - R022 §32's exact recommendation - a narrower
+action than `CorrectMemory` (only `epistemic_state` changes on an
+existing active Fact, no successor Fact, no predecessor closure, no new
+Entity/Source/Evidence), reusing `domain::is_active_fact` (R022 §6)
+directly for its own active-Fact precondition - which exact
+`epistemic_state` transitions are frozen as valid is the next concrete
+design question. `RecurringRule` remains deliberately deferred (§4j),
+still needing its own design/freeze pass before any code. M2's storage/
 security foundation is safe to proceed into implementation - see R016
 §15 and R019 §23.
 
@@ -2339,14 +2465,18 @@ security foundation is safe to proceed into implementation - see R016
   `Episode` all exist as real tables now (`Relation`/`Episode` schema
   only, no write path).
 - **RESOLVED in part (2026-09-18, M2 Personal Knowledge AddMemory Slice
-  B, R021 §4s above): `AddMemory` - the first production Personal
-  Knowledge mutation - is now real, implemented, and tested (324/324).**
-  **Still not implemented: `CorrectMemory`/`ConfirmMemory`/
-  `ForgetMemory`** - a Fact created by `AddMemory` can never yet be
-  corrected, confirmed from a lower epistemic state, or deleted through
-  the action layer, and no Tauri command layer wires `AddMemory` into
-  the running app yet either. The recommended next implementation slice
-  is Slice C (`CorrectMemory`), R021 §25.
+  B, R021 §4s above, then R021's own post-run correctness/verification
+  hardening): `AddMemory` - the first production Personal Knowledge
+  mutation - is real, implemented, and tested (327/327).**
+- **RESOLVED in part (2026-09-18, M2 Personal Knowledge CorrectMemory
+  Slice C, R022 §4t above): `CorrectMemory` - the second production
+  Personal Knowledge mutation - is now real, implemented, and tested
+  (356/356).** **Still not implemented: `ConfirmMemory`/
+  `ForgetMemory`** - a Fact can never yet be confirmed from a lower
+  epistemic state or deleted through the action layer, and no Tauri
+  command layer wires `AddMemory`/`CorrectMemory` into the running app
+  yet either. The recommended next implementation slice is Slice D
+  (`ConfirmMemory`), R022 §32.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2500,5 +2630,6 @@ summaries - open the file for full reasoning.
 | R019 | M2 Personal Knowledge Privacy and Foundation Finalization | `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md` |
 | R020 | M2 Personal Knowledge Slice A Foundation | `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md` |
 | R021 | M2 Personal Knowledge AddMemory Slice B | `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md` |
+| R022 | M2 Personal Knowledge CorrectMemory Slice C | `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md` |
 
-Next report allocated will be **R022**.
+Next report allocated will be **R023**.

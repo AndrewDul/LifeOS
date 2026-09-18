@@ -971,11 +971,13 @@ pub(crate) enum FactValue {
 /// `epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
 /// `superseded_by_fact_id`/`updated_at` may ever change - via a future
 /// `ConfirmMemory` (epistemic_state only) or as the predecessor
-/// side-effect of a future `CorrectMemory`. `subject_entity_id`,
-/// `predicate`, `value`, `memory_type`, and `created_at` are immutable
-/// for the life of the row. **Neither `ConfirmMemory` nor
-/// `CorrectMemory` is implemented this run** - this struct exists for
-/// Slice A's schema/read-side proof only.
+/// side-effect of `CorrectMemory` (M2 Personal Knowledge Slice C,
+/// 2026-09-18 - `epistemic_state`/`valid_until`/`superseded_by_fact_id`/
+/// `updated_at` only, via `storage::personal_knowledge_repo::
+/// update_fact_as_superseded`, never a generic Fact patch). `ConfirmMemory`
+/// itself is not implemented this run. `subject_entity_id`, `predicate`,
+/// `value`, `memory_type`, and `created_at` are immutable for the life
+/// of the row.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Fact {
     pub id: FactId,
@@ -991,6 +993,21 @@ pub(crate) struct Fact {
     pub superseded_by_fact_id: Option<FactId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Canonical "is this Fact currently active" predicate (M2 Personal
+/// Knowledge Slice C, 2026-09-18) - `CorrectMemory` must reject
+/// correcting an inactive predecessor, and a future `ConfirmMemory`
+/// (Slice D) must reuse this exact definition rather than a duplicated
+/// ad-hoc check. A Fact is active iff it has not been closed
+/// (`valid_until` still `None`) **and** its `epistemic_state` is not
+/// `Stale` - checking `valid_until` alone is insufficient: a `Fact`
+/// could in principle carry `epistemic_state = Stale` while
+/// `valid_until` is still `None` (an inconsistent state a future bug
+/// could produce), and this predicate must reject that too, never
+/// silently treating it as active.
+pub(crate) fn is_active_fact(fact: &Fact) -> bool {
+    fact.valid_until.is_none() && fact.epistemic_state != EpistemicState::Stale
 }
 
 #[cfg(test)]

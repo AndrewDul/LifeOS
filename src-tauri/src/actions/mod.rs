@@ -18,8 +18,8 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    validate_personal_knowledge_text_len, DomainRef, EntityId, EpistemicState, Goal, GoalId,
-    GoalRelationType, LifecycleStatus, MemoryType, Milestone, MilestoneId, MilestoneStatus,
+    validate_personal_knowledge_text_len, DomainRef, EntityId, EpistemicState, FactId, Goal,
+    GoalId, GoalRelationType, LifecycleStatus, MemoryType, Milestone, MilestoneId, MilestoneStatus,
     OrderIndex, Priority, Progress, Project, ProjectId, Sensitivity, SourceId, Task, TaskId,
     TaskStatus, CANONICAL_NAME_MAX_LEN, DESCRIPTION_MAX_LEN, DOMAIN_REF_ID_MAX_LEN,
     DOMAIN_REF_TYPE_MAX_LEN, DOMAIN_TAG_MAX_LEN, ENTITY_TYPE_MAX_LEN, EVIDENCE_CONTENT_MAX_LEN,
@@ -335,6 +335,13 @@ pub(crate) enum ValidationError {
     /// mirrored here so the failure is a typed `ValidationError` with
     /// zero writes, not a raw SQLite constraint failure (R021 §12).
     EvidenceRequiresContentOrLocator,
+    /// `CorrectMemory`'s `predecessor_fact_id` resolves to a real `Fact`
+    /// row, but `domain::is_active_fact` returns `false` for it (already
+    /// closed - `valid_until` set - or already `Stale`) - needs a
+    /// database read, so `services::correct_memory` performs it and
+    /// reports it here (M2 Personal Knowledge Slice C, 2026-09-18).
+    /// `CorrectMemory` never revives a historical Fact.
+    FactNotActive,
 }
 
 #[derive(Debug, Clone)]
@@ -1310,14 +1317,37 @@ fn validate_new_evidence_data(
 /// `[0.0, 1.0]` - `NaN`/`+Infinity`/`-Infinity` are explicitly rejected
 /// even though a naive `c < 0.0 || c > 1.0` range check alone would let
 /// `NaN` slip through (`NaN` compares false to everything) (R021 §11).
+/// Shared bound check reused by both `validate_confidence` (`AddMemory`'s
+/// plain `Option<f32>`) and `validate_confidence_patch` (`CorrectMemory`'s
+/// `FieldPatch<f32>`) - one canonical rule, not two near-identical ones.
+fn confidence_out_of_bounds(c: f32) -> Option<ValidationError> {
+    if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+        Some(ValidationError::ConfidenceOutOfBounds {
+            min: 0.0,
+            max: 1.0,
+            actual: c,
+        })
+    } else {
+        None
+    }
+}
+
 fn validate_confidence(confidence: Option<f32>, errors: &mut Vec<ValidationError>) {
     if let Some(c) = confidence {
-        if !c.is_finite() || !(0.0..=1.0).contains(&c) {
-            errors.push(ValidationError::ConfidenceOutOfBounds {
-                min: 0.0,
-                max: 1.0,
-                actual: c,
-            });
+        if let Some(e) = confidence_out_of_bounds(c) {
+            errors.push(e);
+        }
+    }
+}
+
+/// `CorrectMemory`'s `confidence: FieldPatch<f32>` - `Unchanged`/`Clear`
+/// are always valid (no numeric value to bound-check); `Set(c)` is
+/// bound-checked exactly like `AddMemory`'s `Option<f32>` (M2 Personal
+/// Knowledge Slice C, 2026-09-18).
+fn validate_confidence_patch(patch: &FieldPatch<f32>, errors: &mut Vec<ValidationError>) {
+    if let FieldPatch::Set(c) = patch {
+        if let Some(e) = confidence_out_of_bounds(*c) {
+            errors.push(e);
         }
     }
 }
@@ -1370,6 +1400,103 @@ pub(crate) fn validate_add_memory(
         memory_type: payload.memory_type,
         epistemic_state: payload.epistemic_state,
         confidence: payload.confidence,
+        sensitivity: payload.sensitivity,
+        source: source.expect("validated above"),
+        evidence: evidence.expect("validated above"),
+    })
+}
+
+// --- Personal Knowledge: CorrectMemory (M2 Personal Knowledge Slice C,
+// 2026-09-18) -------------------------------------------------------------
+//
+// "The retained semantic knowledge is wrong/outdated; replace it while
+// preserving history" - never an in-place semantic edit. One active
+// predecessor Fact becomes historical (`Stale`); one new successor Fact
+// becomes active. `subject_entity_id`/`predicate` are inherited from the
+// predecessor EXACTLY - this payload has no way to change either;
+// changing subject or predicate is `AddMemory` for a different
+// assertion, never `CorrectMemory`.
+//
+// Type floor is `ImportantChange` (R018 §6) - unlike `AddMemory`'s
+// `ExplicitAdd` floor, `effective_class(ImportantChange, Inferred)`
+// stays `ImportantChange` (severity 3 already dominates
+// `InferredChange`'s severity 2), so the generic ladder alone does NOT
+// block an inferred, unconfirmed correction. `services::
+// memory_action_requires_confirmation` (services/mod.rs) restores the
+// required block without inventing a new `ConfirmationClass` or
+// changing `effective_class`/`blocks_until_confirmed` themselves.
+
+/// The frozen `CorrectMemory` payload (R018, restated by the Slice C
+/// brief). Deliberately NO `subject`/`predicate`/`epistemic_state`/
+/// `valid_from`/`valid_until`/`superseded_by_fact_id`/successor `FactId`/
+/// `EvidenceId`/`created_at`/`updated_at` - all Core-generated or
+/// inherited from the predecessor, never caller-supplied. Every
+/// successful correction persists `epistemic_state = USER_CONFIRMED` on
+/// the successor unconditionally - there is no v0.1 path where
+/// `CorrectMemory` produces `INFERRED`/`OBSERVED`/`DISPUTED`/`STALE` (a
+/// model wanting to retain a tentative alternative without replacing the
+/// current Fact uses `AddMemory` with `HYPOTHESIS`/`INFERRED` instead).
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectMemoryPayload {
+    pub predecessor_fact_id: FactId,
+    pub value: FactValueInput,
+    pub memory_type: Option<MemoryType>,
+    pub confidence: FieldPatch<f32>,
+    pub sensitivity: Option<Sensitivity>,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// `validate_correct_memory`'s success output - same normalization
+/// convention as `NormalizedAddMemory` (identifier-like fields trimmed,
+/// free text preserved exactly). No `subject`/`predicate` fields exist
+/// here at all - both are inherited from the predecessor, which this
+/// pure layer never reads (needs a database read; `services::
+/// correct_memory` performs it).
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedCorrectMemory {
+    pub predecessor_fact_id: FactId,
+    pub value: FactValueInput,
+    pub memory_type: Option<MemoryType>,
+    pub confidence: FieldPatch<f32>,
+    pub sensitivity: Option<Sensitivity>,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// Pure structural validation for `CorrectMemory` - no database read
+/// (predecessor existence/activeness, object Entity/Source existence,
+/// domain-ref authoritative existence, and persisted-duplicate-domain-
+/// ref all need one; `services::correct_memory` performs them). Reuses
+/// `AddMemory`'s exact structural validators
+/// (`validate_fact_value_input`/`validate_source_ref`/
+/// `validate_new_evidence_data`) rather than duplicating eleven
+/// slightly different ones - only `confidence`'s `FieldPatch<f32>` shape
+/// differs from `AddMemory`'s plain `Option<f32>`, handled by
+/// `validate_confidence_patch` sharing the same bound check. Unlike
+/// `AddMemory`, there is only ever at most ONE `New` Entity candidate
+/// here (the object - there is no subject candidate, since subject is
+/// always inherited), so no same-payload duplicate-domain-ref preflight
+/// is needed or possible at this layer.
+pub(crate) fn validate_correct_memory(
+    payload: &CorrectMemoryPayload,
+) -> Result<NormalizedCorrectMemory, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    let value = validate_fact_value_input(&payload.value, &mut errors);
+    validate_confidence_patch(&payload.confidence, &mut errors);
+    let source = validate_source_ref(&payload.source, &mut errors);
+    let evidence = validate_new_evidence_data(&payload.evidence, &mut errors);
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(NormalizedCorrectMemory {
+        predecessor_fact_id: payload.predecessor_fact_id,
+        value: value.expect("validated above"),
+        memory_type: payload.memory_type,
+        confidence: payload.confidence.clone(),
         sensitivity: payload.sensitivity,
         source: source.expect("validated above"),
         evidence: evidence.expect("validated above"),

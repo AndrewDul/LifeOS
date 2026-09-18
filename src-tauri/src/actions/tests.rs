@@ -1754,3 +1754,173 @@ fn add_memory_normalized_predicate_is_trimmed() {
     let normalized = validate_add_memory(&payload).expect("baseline payload should validate");
     assert_eq!(normalized.predicate, "likes");
 }
+
+// --- CorrectMemory (M2 Personal Knowledge Slice C, 2026-09-18) ---------
+//
+// Pure `validate_correct_memory` unit tests - no database, matching
+// `AddMemory`'s own split. `validate_correct_memory` deliberately reuses
+// `validate_fact_value_input`/`validate_source_ref`/
+// `validate_new_evidence_data` unchanged (already exhaustively proven by
+// the `AddMemory` tests above), so this file does not re-prove every
+// field bound again here - only that `CorrectMemory`'s own distinct
+// pieces (no subject/predicate in the payload at all, `confidence`'s
+// `FieldPatch<f32>` shape) behave correctly. Database-dependent behavior
+// (predecessor existence/activeness, object Entity/Source existence,
+// domain-ref authoritative existence, persisted-duplicate-domain-ref,
+// confirmation-gate wiring through `services::correct_memory`, atomic
+// rollback, audit rows, successor/predecessor field proofs) is covered
+// by `services::tests` instead (R022).
+
+fn base_correct_memory_payload() -> CorrectMemoryPayload {
+    CorrectMemoryPayload {
+        predecessor_fact_id: FactId::new(),
+        value: FactValueInput::ScalarJson("\"tea, not coffee\"".to_string()),
+        memory_type: None,
+        confidence: FieldPatch::Unchanged,
+        sensitivity: None,
+        source: SourceRef::New(NewSourceData {
+            source_type: "conversation".to_string(),
+            label: None,
+            reference: None,
+            sensitivity: Sensitivity::Internal,
+            captured_at: Utc::now(),
+        }),
+        evidence: NewEvidenceData {
+            content: Some("user corrected their earlier statement".to_string()),
+            locator: None,
+            sensitivity: Sensitivity::Internal,
+        },
+    }
+}
+
+#[test]
+fn correct_memory_valid_baseline_payload_is_accepted() {
+    assert!(validate_correct_memory(&base_correct_memory_payload()).is_ok());
+}
+
+#[test]
+fn correct_memory_confidence_fieldpatch_unchanged_and_clear_always_valid() {
+    for patch in [FieldPatch::Unchanged, FieldPatch::Clear] {
+        let payload = CorrectMemoryPayload {
+            confidence: patch,
+            ..base_correct_memory_payload()
+        };
+        assert!(validate_correct_memory(&payload).is_ok());
+    }
+}
+
+#[test]
+fn correct_memory_confidence_fieldpatch_set_accepted_values() {
+    for c in [0.0f32, 1.0f32, 0.75f32] {
+        let payload = CorrectMemoryPayload {
+            confidence: FieldPatch::Set(c),
+            ..base_correct_memory_payload()
+        };
+        assert!(
+            validate_correct_memory(&payload).is_ok(),
+            "Set({c}) should be accepted"
+        );
+    }
+}
+
+#[test]
+fn correct_memory_confidence_fieldpatch_set_rejected_values() {
+    for c in [-0.1f32, 1.1f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let payload = CorrectMemoryPayload {
+            confidence: FieldPatch::Set(c),
+            ..base_correct_memory_payload()
+        };
+        match validate_correct_memory(&payload) {
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ConfidenceOutOfBounds { .. })),
+                "Set({c}) should produce ConfidenceOutOfBounds, got {errors:?}"
+            ),
+            Ok(_) => panic!("Set({c}) should have been rejected"),
+        }
+    }
+}
+
+#[test]
+fn correct_memory_scalar_json_accepted_types_and_rejected_malformed() {
+    for json in ["\"a string\"", "42", "true", "null", "{\"k\":1}", "[1,2,3]"] {
+        let payload = CorrectMemoryPayload {
+            value: FactValueInput::ScalarJson(json.to_string()),
+            ..base_correct_memory_payload()
+        };
+        assert!(validate_correct_memory(&payload).is_ok());
+    }
+
+    let malformed = CorrectMemoryPayload {
+        value: FactValueInput::ScalarJson("{not valid json".to_string()),
+        ..base_correct_memory_payload()
+    };
+    match validate_correct_memory(&malformed) {
+        Err(errors) => assert!(errors.contains(&ValidationError::InvalidValueJson)),
+        Ok(_) => panic!("malformed JSON should have been rejected"),
+    }
+}
+
+#[test]
+fn correct_memory_entity_value_reuses_addmemory_structural_validation() {
+    // Confirmatory, not exhaustive - the full 11-field bounds matrix is
+    // already proven against the SAME shared helper functions by
+    // AddMemory's own tests; this only confirms CorrectMemory's payload
+    // wiring actually reaches them.
+    let payload = CorrectMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "x".repeat(ENTITY_TYPE_MAX_LEN + 1),
+            canonical_name: "Name".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..base_correct_memory_payload()
+    };
+    match validate_correct_memory(&payload) {
+        Err(errors) => assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PersonalKnowledgeFieldTooLong {
+                field: "entity_type",
+                ..
+            }
+        ))),
+        Ok(_) => panic!("overlong entity_type should have been rejected"),
+    }
+
+    let self_value = CorrectMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::SelfEntity),
+        ..base_correct_memory_payload()
+    };
+    assert!(validate_correct_memory(&self_value).is_ok());
+}
+
+#[test]
+fn correct_memory_evidence_requires_content_or_locator() {
+    let payload = CorrectMemoryPayload {
+        evidence: NewEvidenceData {
+            content: None,
+            locator: None,
+            sensitivity: Sensitivity::Internal,
+        },
+        ..base_correct_memory_payload()
+    };
+    match validate_correct_memory(&payload) {
+        Err(errors) => assert!(errors.contains(&ValidationError::EvidenceRequiresContentOrLocator)),
+        Ok(_) => panic!("evidence with neither content nor locator should have been rejected"),
+    }
+}
+
+#[test]
+fn correct_memory_normalized_output_has_no_subject_or_predicate_field() {
+    // Structural proof, not a runtime assertion: CorrectMemoryPayload/
+    // NormalizedCorrectMemory simply have no `subject`/`predicate`
+    // fields to set - inheritance happens entirely in
+    // `services::correct_memory` against the real predecessor, which
+    // this pure layer never reads. This test exists to document that
+    // fact at the type level; if a future edit ever adds such a field
+    // here, it belongs in R022's frozen contract, not silently.
+    let normalized =
+        validate_correct_memory(&base_correct_memory_payload()).expect("baseline should validate");
+    let _: FactId = normalized.predecessor_fact_id;
+}
