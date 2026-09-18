@@ -6747,6 +6747,22 @@ fn req_t50_51_get_tasks_for_project_and_goal_return_only_matching_tasks() {
 // swallow a serialization failure, and that every applicable Update*
 // action's previous_snapshot deserializes back to the exact pre-update
 // entity, not merely a title substring.
+//
+// R016 ADDENDUM (2026-09-18): the `req_kl*` tests in this section can
+// return early as "BLOCKED" (still counted as PASS by Cargo) if the real
+// OS credential store is unavailable - this is NOT, on its own,
+// sufficient proof of the canonical A/B/C/D state machine. That
+// deterministic proof (independent of OS keyring availability) now lives
+// in the "M2 Key Lifecycle Determinism and Failure Atomicity Hardening
+// (R016)" section further below (`req_dkl1`-`req_dkl12`), which also
+// fixes a review finding against this section's original cleanup rule:
+// `bootstrap_db_with_key_lifecycle` used to delete a freshly-created
+// credential on ANY Case-A initialization failure, even one that
+// occurred AFTER a database file had already been written - which could
+// itself manufacture Case C. `req_kl7`/`req_kl8` below still only prove
+// the pre-file-creation failure path; see `req_dkl7` for the
+// post-file-creation proof. See R015 §"Addendum (R016)" and the R016
+// report for full detail.
 // =========================================================================
 
 /// Isolated OS-keyring service identity for every key-lifecycle test
@@ -7228,23 +7244,35 @@ fn scan_dir_for_identifiers(dir: &std::path::Path, offenders: &mut Vec<String>, 
 /// hardening, 2026-09-18) - deliberately errors on every `Serialize`
 /// call, standing in for a hypothetical real domain-struct
 /// serialization failure without distorting any actual production
-/// struct to create one.
+/// struct to create one. The error message embeds an obvious marker
+/// (R016) so `req_snap1` can prove structurally - not by assumption
+/// about `serde_json`'s current wording - that a custom `Serialize`
+/// impl's error text can never reach `CoreError`'s `Display`/`Debug`/
+/// diagnostic through `serialize_required_snapshot`.
 struct AlwaysFailsToSerialize;
+
+const SNAPSHOT_FAILURE_TEST_MARKER: &str = "SECRET_TEST_VALUE_SHOULD_NEVER_ESCAPE";
 
 impl serde::Serialize for AlwaysFailsToSerialize {
     fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        Err(serde::ser::Error::custom(
-            "deliberate test-only serialization failure",
-        ))
+        Err(serde::ser::Error::custom(format!(
+            "deliberate test-only serialization failure containing {SNAPSHOT_FAILURE_TEST_MARKER}"
+        )))
     }
 }
 
 /// Proves `serialize_required_snapshot` surfaces a serialization
 /// failure as a typed `CoreError` (kind `Internal`), never as a
-/// silently-empty/`None` snapshot.
+/// silently-empty/`None` snapshot - AND (R016) proves the underlying
+/// serializer's own error text (which could, for some future custom
+/// `Serialize` impl, contain sensitive content derived from the value
+/// being serialized) never propagates into the returned `CoreError`'s
+/// `Display`, `Debug`, or `diagnostic()` - structurally, via a
+/// deliberate marker string, not merely by inspecting today's
+/// `serde_json` wording.
 #[test]
 fn req_snap1_serialize_required_snapshot_does_not_swallow_serialization_failure() {
     match serialize_required_snapshot(&AlwaysFailsToSerialize) {
@@ -7255,8 +7283,23 @@ fn req_snap1_serialize_required_snapshot_does_not_swallow_serialization_failure(
                 "[req_snap1] FAIL - expected CoreErrorKind::Internal, got {:?}",
                 e.kind()
             );
+            let display_text = format!("{e}");
+            let debug_text = format!("{e:?}");
+            assert!(
+                !display_text.contains(SNAPSHOT_FAILURE_TEST_MARKER),
+                "[req_snap1] FAIL - the deliberate marker leaked into Display: {display_text}"
+            );
+            assert!(
+                !debug_text.contains(SNAPSHOT_FAILURE_TEST_MARKER),
+                "[req_snap1] FAIL - the deliberate marker leaked into Debug: {debug_text}"
+            );
+            assert!(
+                !e.diagnostic().contains(SNAPSHOT_FAILURE_TEST_MARKER),
+                "[req_snap1] FAIL - the deliberate marker leaked into CoreError::diagnostic(): {}",
+                e.diagnostic()
+            );
             println!(
-                "[req_snap1] PASS - serialize_required_snapshot surfaced the failure as a typed CoreError, not a silently-empty snapshot: {e:?}"
+                "[req_snap1] PASS - serialize_required_snapshot surfaced the failure as a typed CoreError (not a silently-empty snapshot), and the underlying serializer's own error text (marker: {SNAPSHOT_FAILURE_TEST_MARKER}) does not appear in Display, Debug, or diagnostic(): {e:?}"
             );
         }
         Ok(s) => panic!(
@@ -7596,4 +7639,663 @@ fn req_kl_bootstrap_regression_first_and_second_bootstrap_share_state_across_reo
     );
 
     let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+// =========================================================================
+// M2 Key Lifecycle Determinism and Failure Atomicity Hardening (R016,
+// 2026-09-18). Evidence for
+// `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`.
+//
+// The `req_kl*` tests above remain a separate, supplementary,
+// environment-dependent smoke/integration suite against the REAL OS
+// keyring (still valuable - they prove `KeyringCredentialStore` genuinely
+// round-trips through Windows Credential Manager) but are NOT, on their
+// own, sufficient proof of the canonical A/B/C/D state machine: a
+// "BLOCKED" early-return when the real keyring is unavailable is still
+// counted as a PASS by Cargo, even though the state-machine logic was
+// never exercised for that run. Every test below instead drives
+// `resolve_master_key_with_store`/`bootstrap_db_with_key_lifecycle_with_store`
+// directly through `InMemoryCredentialStore` - the SAME production
+// state-machine logic `resolve_master_key`/`bootstrap_db_with_key_lifecycle`
+// are thin wrappers around, never a parallel reimplementation - so these
+// tests always run, deterministically, on every machine, regardless of OS
+// credential store availability.
+// =========================================================================
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// Deterministic, in-memory `security::CredentialStore` test double
+/// (R016) - never touches the real OS credential store. Records every
+/// `get`/`set`/`delete` call so tests can assert exactly how many times
+/// each happened (e.g. "no unexpected `set()` on Case B/C/D reuse"), and
+/// can be configured to fail each operation on demand - deterministically
+/// exercising backend-error paths (requirements 10-12) that are
+/// impractical to force against the real OS keyring.
+#[derive(Default)]
+struct InMemoryCredentialStore {
+    data: RefCell<HashMap<(String, String), String>>,
+    get_calls: RefCell<u32>,
+    set_calls: RefCell<u32>,
+    delete_calls: RefCell<u32>,
+    fail_get: RefCell<bool>,
+    fail_set: RefCell<bool>,
+    fail_delete: RefCell<bool>,
+}
+
+impl InMemoryCredentialStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seeds a credential directly, WITHOUT going through `set()` (so
+    /// this does not count toward `set_calls()`) - simulates "a
+    /// credential already exists before this bootstrap call" (Cases
+    /// B/D).
+    fn seeded(service: &str, account: &str, value: &str) -> Self {
+        let store = Self::new();
+        store.data.borrow_mut().insert(
+            (service.to_string(), account.to_string()),
+            value.to_string(),
+        );
+        store
+    }
+
+    fn fail_next_get(&self) {
+        *self.fail_get.borrow_mut() = true;
+    }
+    fn fail_next_set(&self) {
+        *self.fail_set.borrow_mut() = true;
+    }
+    fn fail_next_delete(&self) {
+        *self.fail_delete.borrow_mut() = true;
+    }
+
+    fn set_calls(&self) -> u32 {
+        *self.set_calls.borrow()
+    }
+    fn delete_calls(&self) -> u32 {
+        *self.delete_calls.borrow()
+    }
+
+    fn raw_get(&self, service: &str, account: &str) -> Option<String> {
+        self.data
+            .borrow()
+            .get(&(service.to_string(), account.to_string()))
+            .cloned()
+    }
+}
+
+impl security::CredentialStore for InMemoryCredentialStore {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, security::KeyError> {
+        *self.get_calls.borrow_mut() += 1;
+        if *self.fail_get.borrow() {
+            return Err(security::KeyError::Keyring(
+                "[test] forced GET backend failure".to_string(),
+            ));
+        }
+        Ok(self.raw_get(service, account))
+    }
+
+    fn set(&self, service: &str, account: &str, value: &str) -> Result<(), security::KeyError> {
+        *self.set_calls.borrow_mut() += 1;
+        if *self.fail_set.borrow() {
+            return Err(security::KeyError::Keyring(
+                "[test] forced SET backend failure".to_string(),
+            ));
+        }
+        self.data.borrow_mut().insert(
+            (service.to_string(), account.to_string()),
+            value.to_string(),
+        );
+        Ok(())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<(), security::KeyError> {
+        *self.delete_calls.borrow_mut() += 1;
+        if *self.fail_delete.borrow() {
+            return Err(security::KeyError::Keyring(
+                "[test] forced DELETE backend failure".to_string(),
+            ));
+        }
+        self.data
+            .borrow_mut()
+            .remove(&(service.to_string(), account.to_string()));
+        Ok(())
+    }
+}
+
+const DET_SERVICE: &str = "LifeOS-det-test";
+
+/// Requirement 1 (deterministic): DB absent + key absent -> a fresh key
+/// is generated, stored, AND is exactly the key the initializer used to
+/// create the database (not merely "some key was stored somewhere") -
+/// also checks the generated key's format (64 lowercase hex chars = 256
+/// bits).
+#[test]
+fn req_dkl1_db_absent_key_absent_generates_and_stores_key_and_creates_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl1.db");
+    let store = InMemoryCredentialStore::new();
+    let account = "dkl1";
+
+    let key_seen_by_initializer: RefCell<Option<String>> = RefCell::new(None);
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        |p, key_hex| {
+            *key_seen_by_initializer.borrow_mut() = Some(key_hex.to_string());
+            bootstrap_db_at(p, key_hex)
+        },
+    )
+    .expect("[req_dkl1] FAIL - Case A bootstrap must succeed");
+    drop(conn);
+
+    assert!(path.exists(), "[req_dkl1] FAIL - db file was not created");
+    let stored = store
+        .raw_get(DET_SERVICE, account)
+        .expect("[req_dkl1] FAIL - no key was stored");
+    assert_eq!(
+        stored.len(),
+        64,
+        "[req_dkl1] FAIL - expected a 64-hex-char (256-bit) key, got length {}",
+        stored.len()
+    );
+    assert!(
+        stored.chars().all(|c| c.is_ascii_hexdigit()),
+        "[req_dkl1] FAIL - stored key is not pure hex: {stored}"
+    );
+    assert_eq!(
+        Some(stored.clone()),
+        key_seen_by_initializer.into_inner(),
+        "[req_dkl1] FAIL - the key stored in the credential store is not the exact key the initializer used to create the db"
+    );
+    assert_eq!(
+        store.set_calls(),
+        1,
+        "[req_dkl1] FAIL - expected exactly one set() call for a fresh Case A credential"
+    );
+    println!("[req_dkl1] PASS - db absent + key absent -> a well-formed fresh key was generated, stored, and is exactly the key used to create the db (deterministic, no OS keyring involved)");
+}
+
+/// Requirement 2 (deterministic): DB exists + key exists -> the exact
+/// existing key is reused across repeated bootstraps, and NO additional
+/// `set()` call is ever made once the credential exists.
+#[test]
+fn req_dkl2_db_exists_key_exists_reuses_exact_key_no_extra_set_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl2.db");
+    let store = InMemoryCredentialStore::new();
+    let account = "dkl2";
+
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl2] FAIL - first (Case A) bootstrap must succeed");
+    drop(conn);
+    let first_key = store.raw_get(DET_SERVICE, account).unwrap();
+    assert_eq!(store.set_calls(), 1);
+
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl2] FAIL - second (Case B) bootstrap must succeed");
+    drop(conn);
+    let second_key = store.raw_get(DET_SERVICE, account).unwrap();
+
+    assert_eq!(
+        first_key, second_key,
+        "[req_dkl2] FAIL - key changed on reopen despite db+credential both already existing"
+    );
+    assert_eq!(
+        store.set_calls(),
+        1,
+        "[req_dkl2] FAIL - Case B reuse must never call set() again"
+    );
+    println!("[req_dkl2] PASS - db exists + key exists -> exact same key reused, zero additional set() calls");
+}
+
+/// Requirement 3 (deterministic, CRITICAL): DB exists + key absent ->
+/// typed `MasterKeyMissingForExistingDatabase`, zero key creation
+/// (set_calls stays 0 on the fresh store standing in for "credential now
+/// absent"), db bytes byte-for-byte unchanged.
+#[test]
+fn req_dkl3_db_exists_key_absent_fails_safely_zero_key_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl3.db");
+    let account = "dkl3";
+
+    let creating_store = InMemoryCredentialStore::new();
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &creating_store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl3] FAIL - setup bootstrap must succeed");
+    drop(conn);
+    let db_bytes_before = std::fs::read(&path).unwrap();
+
+    // A brand-new, empty store standing in for "the credential is now
+    // absent" (e.g. after a credential-store reset) - the db file itself
+    // is untouched.
+    let empty_store = InMemoryCredentialStore::new();
+    match bootstrap_db_with_key_lifecycle_with_store(
+        &empty_store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    ) {
+        Err(BootstrapError::MasterKeyMissingForExistingDatabase) => {}
+        other => {
+            panic!("[req_dkl3] FAIL - expected MasterKeyMissingForExistingDatabase, got {other:?}")
+        }
+    }
+    assert_eq!(
+        empty_store.set_calls(),
+        0,
+        "[req_dkl3] FAIL - a replacement key was generated/stored despite Case C"
+    );
+    let db_bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        db_bytes_before, db_bytes_after,
+        "[req_dkl3] FAIL - db bytes changed despite Case C returning before any db access"
+    );
+    println!("[req_dkl3] PASS - db exists + key absent -> typed recovery-required error, zero key creation, db bytes unchanged");
+}
+
+/// Requirement 4 (deterministic): DB absent + key exists -> the
+/// pre-existing key is reused (seeded directly, not via `set()`), and no
+/// `set()` call happens for Case D.
+#[test]
+fn req_dkl4_db_absent_key_exists_reuses_existing_key_no_set_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl4.db");
+    let account = "dkl4";
+    let pre_existing_key = security::generate_key_hex();
+    let store = InMemoryCredentialStore::seeded(DET_SERVICE, account, &pre_existing_key);
+
+    assert!(!path.exists());
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl4] FAIL - Case D bootstrap must succeed");
+    drop(conn);
+
+    assert!(path.exists(), "[req_dkl4] FAIL - db was not created");
+    let key_after = store.raw_get(DET_SERVICE, account).unwrap();
+    assert_eq!(
+        pre_existing_key, key_after,
+        "[req_dkl4] FAIL - the pre-existing credential was replaced instead of reused"
+    );
+    assert_eq!(
+        store.set_calls(),
+        0,
+        "[req_dkl4] FAIL - Case D must never call set() - the credential already existed"
+    );
+    println!("[req_dkl4] PASS - db absent + key exists -> existing key reused to create the new db, zero set() calls");
+}
+
+/// Requirement 5 (deterministic): a credential that is PRESENT but WRONG
+/// for an existing db still fails as a normal storage error - no
+/// replacement key generated.
+#[test]
+fn req_dkl5_wrong_present_key_fails_without_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl5.db");
+    let account = "dkl5";
+
+    let real_store = InMemoryCredentialStore::new();
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &real_store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl5] FAIL - setup bootstrap must succeed");
+    drop(conn);
+
+    let wrong_key = security::generate_key_hex();
+    let wrong_store = InMemoryCredentialStore::seeded(DET_SERVICE, account, &wrong_key);
+    match bootstrap_db_with_key_lifecycle_with_store(
+        &wrong_store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    ) {
+        Err(BootstrapError::Storage(_)) => {}
+        other => panic!(
+            "[req_dkl5] FAIL - expected a Storage error from the wrong-but-present key, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        wrong_store.raw_get(DET_SERVICE, account),
+        Some(wrong_key),
+        "[req_dkl5] FAIL - the present-but-wrong credential was replaced instead of left alone"
+    );
+    assert_eq!(
+        wrong_store.set_calls(),
+        0,
+        "[req_dkl5] FAIL - no set() call should happen when a present-but-wrong key is rejected"
+    );
+    println!("[req_dkl5] PASS - a present-but-wrong key fails normally, with zero replacement-key generation");
+}
+
+/// Requirement 6 (deterministic): initialization failure BEFORE any db
+/// file is created -> the freshly-generated Case A credential is cleaned
+/// up. Forced via the same portable blocker-file technique as `req_kl7`,
+/// now with the in-memory store.
+#[test]
+fn req_dkl6_pre_file_creation_failure_cleans_up_fresh_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker_dkl6");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let path = blocker.join("dkl6.db"); // parent is a FILE - create_dir_all must fail
+    let account = "dkl6";
+    let store = InMemoryCredentialStore::new();
+
+    assert!(!path.exists());
+    match bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    ) {
+        Err(BootstrapError::Io(_)) => {}
+        other => panic!("[req_dkl6] FAIL - expected an Io error, got {other:?}"),
+    }
+    assert!(
+        !path.exists(),
+        "[req_dkl6] setup invariant FAIL - the db path must still not exist"
+    );
+    assert_eq!(
+        store.raw_get(DET_SERVICE, account),
+        None,
+        "[req_dkl6] FAIL - the freshly-created orphan credential was not cleaned up"
+    );
+    assert_eq!(store.delete_calls(), 1);
+    println!("[req_dkl6] PASS - pre-file-creation initialization failure cleans up the freshly-created orphan credential");
+}
+
+/// Requirement 7 (deterministic, THE R016 FIX): initialization failure
+/// AFTER the db file has already been created -> the freshly-generated
+/// Case A credential is RETAINED, not deleted - proving LifeOS can no
+/// longer manufacture "db exists, credential absent" (Case C) as a side
+/// effect of its own cleanup path. Uses a custom initializer closure (not
+/// `bootstrap_db_at`, which cannot be made to fail deterministically
+/// AFTER writing a file) that writes bytes to `path` and then
+/// deliberately returns an error.
+#[test]
+fn req_dkl7_post_file_creation_failure_retains_fresh_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl7.db");
+    let account = "dkl7";
+    let store = InMemoryCredentialStore::new();
+
+    assert!(!path.exists());
+    let result = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        |p, _key_hex| {
+            // Simulates bootstrap_db_at creating/writing the db file
+            // using the fresh key, THEN failing later (e.g. during
+            // verification or migration) - a partially-created but real
+            // file now exists at `p`.
+            std::fs::write(p, b"partially-initialized encrypted db bytes").unwrap();
+            Err(BootstrapError::Io(std::io::Error::other(
+                "[req_dkl7] deliberate forced failure AFTER db file creation",
+            )))
+        },
+    );
+
+    match result {
+        Err(BootstrapError::Io(_)) => {}
+        other => panic!("[req_dkl7] FAIL - expected the forced Io error, got {other:?}"),
+    }
+    assert!(
+        path.exists(),
+        "[req_dkl7] setup invariant FAIL - the db path must now exist"
+    );
+    let stored = store.raw_get(DET_SERVICE, account);
+    assert!(
+        stored.is_some(),
+        "[req_dkl7] FAIL - the freshly-created credential was deleted despite a db file now existing - this would strand the db as Case C on the next launch"
+    );
+    assert_eq!(
+        store.delete_calls(),
+        0,
+        "[req_dkl7] FAIL - delete() must never be called once a db file exists at the target path"
+    );
+
+    // The resulting state must NOT be re-resolved as Case C - a fresh
+    // bootstrap attempt against this same (store, path) must be able to
+    // proceed as Case B (both now present), never fail with
+    // MasterKeyMissingForExistingDatabase merely because of this cleanup
+    // path.
+    let resolved = resolve_master_key_with_store(&store, &path, DET_SERVICE, account)
+        .expect("[req_dkl7] FAIL - re-resolving must not fail");
+    match resolved {
+        ResolvedMasterKey::Reused(k) => assert_eq!(Some(k), stored),
+        ResolvedMasterKey::FreshlyGenerated(_) => panic!(
+            "[req_dkl7] FAIL - a SECOND fresh key was generated - the retained credential was not recognized as already present"
+        ),
+    }
+    println!("[req_dkl7] PASS - post-file-creation initialization failure retains the freshly-created credential; the resulting (db, key) pair correctly re-resolves as Case B, never Case C");
+}
+
+/// Requirement 8 (deterministic): initialization failure with a
+/// PRE-EXISTING credential leaves it completely untouched, regardless of
+/// whether a db file now exists - the cleanup branch never runs at all
+/// for `Reused` credentials (Cases B/D).
+#[test]
+fn req_dkl8_pre_existing_credential_retained_on_init_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker_dkl8");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let path = blocker.join("dkl8.db");
+    let account = "dkl8";
+    let pre_existing_key = security::generate_key_hex();
+    let store = InMemoryCredentialStore::seeded(DET_SERVICE, account, &pre_existing_key);
+
+    match bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    ) {
+        Err(BootstrapError::Io(_)) => {}
+        other => panic!("[req_dkl8] FAIL - expected an Io error, got {other:?}"),
+    }
+    assert_eq!(
+        store.raw_get(DET_SERVICE, account),
+        Some(pre_existing_key),
+        "[req_dkl8] FAIL - the pre-existing credential was deleted or replaced"
+    );
+    assert_eq!(
+        store.delete_calls(),
+        0,
+        "[req_dkl8] FAIL - delete() must never be called for a pre-existing (Reused) credential"
+    );
+    println!("[req_dkl8] PASS - pre-existing credential remains completely untouched after an initialization failure");
+}
+
+/// Requirement 9 (deterministic): repeated successful reopen uses the
+/// exact same master key every time, with no additional set() calls
+/// beyond the first.
+#[test]
+fn req_dkl9_repeated_reopen_uses_same_key_no_extra_set_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl9.db");
+    let account = "dkl9";
+    let store = InMemoryCredentialStore::new();
+
+    let conn = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        bootstrap_db_at,
+    )
+    .expect("[req_dkl9] FAIL - first bootstrap must succeed");
+    drop(conn);
+    let key_first = store.raw_get(DET_SERVICE, account).unwrap();
+
+    for i in 0..3 {
+        let conn = bootstrap_db_with_key_lifecycle_with_store(
+            &store,
+            &path,
+            DET_SERVICE,
+            account,
+            bootstrap_db_at,
+        )
+        .unwrap_or_else(|e| panic!("[req_dkl9] FAIL - reopen #{i} failed: {e:?}"));
+        drop(conn);
+        let key_now = store.raw_get(DET_SERVICE, account).unwrap();
+        assert_eq!(
+            key_first, key_now,
+            "[req_dkl9] FAIL - key changed on reopen #{i}"
+        );
+    }
+    assert_eq!(
+        store.set_calls(),
+        1,
+        "[req_dkl9] FAIL - only the very first Case A bootstrap should ever call set()"
+    );
+    println!("[req_dkl9] PASS - repeated reopen across 3 additional bootstraps all used the exact same key, with exactly one set() call ever");
+}
+
+/// Requirement 10 (deterministic): a credential-backend GET error
+/// propagates as a typed `BootstrapError::Key`, and is never
+/// misinterpreted as "credential absent" - no key is generated/stored as
+/// a result.
+#[test]
+fn req_dkl10_backend_get_error_is_distinct_from_absence_no_key_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl10.db");
+    let account = "dkl10";
+    let store = InMemoryCredentialStore::new();
+    store.fail_next_get();
+
+    match resolve_master_key_with_store(&store, &path, DET_SERVICE, account) {
+        Err(BootstrapError::Key(_)) => {}
+        other => panic!(
+            "[req_dkl10] FAIL - a GET backend error must surface as BootstrapError::Key, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        store.set_calls(),
+        0,
+        "[req_dkl10] FAIL - a GET backend error must never be treated as 'absent', which would trigger key generation"
+    );
+    assert!(
+        !path.exists(),
+        "[req_dkl10] FAIL - no db initialization should have been attempted"
+    );
+    println!("[req_dkl10] PASS - a credential-backend GET error is a distinct, typed failure - never interpreted as 'missing', never triggers key generation");
+}
+
+/// Requirement 11 (deterministic): a credential-backend SET error during
+/// a Case A (first-run) resolution means database initialization never
+/// even starts.
+#[test]
+fn req_dkl11_backend_set_error_on_first_run_prevents_db_initialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dkl11.db");
+    let account = "dkl11";
+    let store = InMemoryCredentialStore::new();
+    store.fail_next_set();
+
+    let initializer_calls = RefCell::new(0u32);
+    let result = bootstrap_db_with_key_lifecycle_with_store(
+        &store,
+        &path,
+        DET_SERVICE,
+        account,
+        |p, key_hex| {
+            *initializer_calls.borrow_mut() += 1;
+            bootstrap_db_at(p, key_hex)
+        },
+    );
+
+    match result {
+        Err(BootstrapError::Key(_)) => {}
+        other => panic!(
+            "[req_dkl11] FAIL - a SET backend error on first run must surface as BootstrapError::Key, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        *initializer_calls.borrow(),
+        0,
+        "[req_dkl11] FAIL - the db initializer must never run if the fresh credential could not be stored"
+    );
+    assert!(
+        !path.exists(),
+        "[req_dkl11] FAIL - no db file should have been created"
+    );
+    println!("[req_dkl11] PASS - a credential-backend SET error on first run prevents db initialization from ever starting");
+}
+
+/// Requirement 12 (deterministic): a credential-backend DELETE error
+/// during the pre-file-creation cleanup path does not mask the original
+/// initialization error - the ORIGINAL error remains what the caller
+/// sees. Documents the resulting state: because deletion itself failed,
+/// the freshly-generated credential is left behind even though no db
+/// file exists (a known, documented, best-effort residual risk - see
+/// `bootstrap_db_with_key_lifecycle_with_store`'s doc comment).
+#[test]
+fn req_dkl12_backend_delete_error_during_cleanup_does_not_mask_original_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker_dkl12");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let path = blocker.join("dkl12.db");
+    let account = "dkl12";
+    let store = InMemoryCredentialStore::new();
+    store.fail_next_delete();
+
+    match bootstrap_db_with_key_lifecycle_with_store(
+        &store, &path, DET_SERVICE, account, bootstrap_db_at,
+    ) {
+        Err(BootstrapError::Io(_)) => {
+            println!("[req_dkl12] PASS - the ORIGINAL Io initialization error was returned, not a delete-cleanup error");
+        }
+        other => panic!(
+            "[req_dkl12] FAIL - expected the original Io error to survive a failed cleanup delete, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        store.delete_calls(),
+        1,
+        "[req_dkl12] FAIL - a cleanup delete attempt should still have been made"
+    );
+    // Documented residual state: deletion failed, so the freshly-created
+    // credential is still present despite no db file existing at path -
+    // a known, best-effort limitation, not silently hidden.
+    assert!(
+        store.raw_get(DET_SERVICE, account).is_some(),
+        "[req_dkl12] FAIL (documentation check) - expected the credential to still be present given the forced delete failure"
+    );
+    assert!(!path.exists());
+    println!("[req_dkl12] PASS - documented residual state after a failed cleanup delete: original init error surfaced unchanged, orphan credential left behind (best-effort cleanup, not silently masked)");
 }

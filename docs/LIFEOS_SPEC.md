@@ -44,6 +44,14 @@ replacement key), and every mandatory audit `previous_snapshot` across
 all five update actions can no longer silently disappear on a
 serialization failure. See `PROJECT_STATE.md` §4m and
 `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`.
+**(2026-09-18, R016)** A follow-up review found R015's orphan-credential
+cleanup could itself strand a freshly-created database without its key
+if initialization failed *after* the database file was already written
+under that key - corrected so the credential is deleted only when no
+database file exists afterward, and proven deterministically
+(independent of OS credential-store availability) via a new
+`CredentialStore` test seam. See `PROJECT_STATE.md` §4n and
+`docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -389,7 +397,12 @@ OS-native key storage.
   four-state DB/key matrix, not a blind "generate if the credential is
   missing" rule - an existing database with a missing credential fails
   safely with a typed recovery-required error rather than silently
-  generating a replacement key. See `PROJECT_STATE.md` §4m for detail.
+  generating a replacement key. **Corrected 2026-09-18** (R016): the
+  orphan-credential cleanup on a failed first run now deletes the
+  freshly-generated credential only if no database file exists
+  afterward - a database file created before a later initialization
+  step failed is never left without its key. See `PROJECT_STATE.md`
+  §4m-§4n for detail.
 - **Driver/migrations**: `rusqlite` 0.37.0 (pinned — `refinery-core`
   0.9.0's `rusqlite` feature caps at `<=0.37`, confirmed via a real
   dependency-resolution failure against the latest 0.40.2) + `refinery`

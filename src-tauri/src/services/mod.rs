@@ -166,6 +166,23 @@ impl ResolvedMasterKey {
     }
 }
 
+/// Deliberately hand-written, NOT `#[derive(Debug)]` (R016) - this type
+/// carries the actual master key in plaintext; a derived `Debug` would
+/// print it verbatim in any `{:?}`/`panic!`/test-assertion-failure
+/// message a caller writes (e.g. a test asserting on a
+/// `Result<ResolvedMasterKey, BootstrapError>`). Only the variant name is
+/// shown; the key itself is never included.
+impl std::fmt::Debug for ResolvedMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolvedMasterKey::Reused(_) => write!(f, "ResolvedMasterKey::Reused(<redacted>)"),
+            ResolvedMasterKey::FreshlyGenerated(_) => {
+                write!(f, "ResolvedMasterKey::FreshlyGenerated(<redacted>)")
+            }
+        }
+    }
+}
+
 /// The canonical master-key/database state machine (M2 storage/audit
 /// safety hardening, 2026-09-18) - see
 /// `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`
@@ -197,14 +214,41 @@ fn resolve_master_key(
     service: &str,
     account: &str,
 ) -> Result<ResolvedMasterKey, BootstrapError> {
+    resolve_master_key_with_store(&security::KeyringCredentialStore, path, service, account)
+}
+
+/// Generic core of `resolve_master_key`, operating over any
+/// `security::CredentialStore` rather than always the real OS keyring
+/// (M2 key lifecycle determinism and failure-atomicity hardening,
+/// 2026-09-18, R016). `resolve_master_key` (above) is a thin wrapper
+/// binding this to `security::KeyringCredentialStore` - the real
+/// production identity path and every deterministic in-memory-store
+/// test share this exact logic, never a parallel reimplementation that
+/// could drift from what production actually does.
+///
+/// A backend `get` failure (`store.get` returning `Err`) propagates
+/// immediately as `BootstrapError::Key` via `?` - it is never silently
+/// treated as "credential absent" (which would risk misclassifying a
+/// transient backend outage as Case A/C and generating an unwarranted
+/// key or unwarranted recovery-required error).
+fn resolve_master_key_with_store<S: security::CredentialStore>(
+    store: &S,
+    path: &std::path::Path,
+    service: &str,
+    account: &str,
+) -> Result<ResolvedMasterKey, BootstrapError> {
     let db_exists = path.exists();
-    let existing_key = security::get_existing_key(service, account).map_err(BootstrapError::Key)?;
+    let existing_key = store.get(service, account).map_err(BootstrapError::Key)?;
 
     match (db_exists, existing_key) {
         (_, Some(key_hex)) => Ok(ResolvedMasterKey::Reused(key_hex)),
-        (false, None) => Ok(ResolvedMasterKey::FreshlyGenerated(
-            security::generate_and_store_key(service, account).map_err(BootstrapError::Key)?,
-        )),
+        (false, None) => {
+            let key_hex = security::generate_key_hex();
+            store
+                .set(service, account, &key_hex)
+                .map_err(BootstrapError::Key)?;
+            Ok(ResolvedMasterKey::FreshlyGenerated(key_hex))
+        }
         (true, None) => Err(BootstrapError::MasterKeyMissingForExistingDatabase),
     }
 }
@@ -229,18 +273,82 @@ fn bootstrap_db_with_key_lifecycle(
     service: &str,
     account: &str,
 ) -> Result<Connection, BootstrapError> {
-    let resolved = resolve_master_key(path, service, account)?;
-    match bootstrap_db_at(path, resolved.key_hex()) {
+    bootstrap_db_with_key_lifecycle_with_store(
+        &security::KeyringCredentialStore,
+        path,
+        service,
+        account,
+        bootstrap_db_at,
+    )
+}
+
+/// Generic core of `bootstrap_db_with_key_lifecycle`, operating over any
+/// `security::CredentialStore` AND any database initializer closure (M2
+/// key lifecycle determinism and failure-atomicity hardening,
+/// 2026-09-18, R016). `initializer` is always `bootstrap_db_at` in every
+/// real caller (`bootstrap_db_with_key_lifecycle` above, and therefore
+/// `bootstrap_production_db`) - only deterministic tests substitute a
+/// different closure, to force a failure AFTER the database file has
+/// already been created, a case `bootstrap_db_at` itself cannot be made
+/// to hit portably/deterministically (it depends on SQLCipher/refinery
+/// internals, not a simple filesystem precondition).
+///
+/// **Corrected cleanup rule (R016, following a review finding against
+/// R015's original version of this function - see
+/// `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`
+/// §3-4):** if this call generated a brand-new credential (Case A) and
+/// `initializer` subsequently fails, the fresh credential is deleted
+/// ONLY IF `path` still does NOT exist afterward.
+///
+/// R015's original rule deleted the fresh credential on ANY
+/// initialization failure, unconditionally. That is only safe if
+/// `initializer` failed *before* creating any database file. If
+/// `initializer` instead (1) creates/encrypts the database file using
+/// the fresh key, then (2) fails later - during key verification or
+/// migration, say - deleting the credential at that point would
+/// self-inflict exactly the state this whole hardening pass exists to
+/// prevent: an existing database file with no matching credential (Case
+/// C), discovered on the very next launch. Once a file may contain bytes
+/// encrypted under that fresh key, losing the key is strictly more
+/// dangerous than retaining the credential - the database file is never
+/// deleted by this cleanup path either way, so keeping the credential
+/// preserves the DB+key pairing and lets a subsequent bootstrap retry
+/// with the same key; deleting it would destroy that pairing
+/// permanently. A pre-existing credential (Cases B/D) is never a cleanup
+/// candidate regardless of this rule, since `resolved` only carries
+/// `FreshlyGenerated` for Case A.
+fn bootstrap_db_with_key_lifecycle_with_store<S, F>(
+    store: &S,
+    path: &std::path::Path,
+    service: &str,
+    account: &str,
+    initializer: F,
+) -> Result<Connection, BootstrapError>
+where
+    S: security::CredentialStore,
+    F: FnOnce(&std::path::Path, &str) -> Result<Connection, BootstrapError>,
+{
+    let resolved = resolve_master_key_with_store(store, path, service, account)?;
+    match initializer(path, resolved.key_hex()) {
         Ok(conn) => Ok(conn),
         Err(init_err) => {
             if let ResolvedMasterKey::FreshlyGenerated(_) = resolved {
-                // Best-effort only, deliberately: a failed deletion here
-                // does not change the fact that database initialization
-                // itself failed, and must never mask that original
-                // error by replacing it with a cleanup error instead -
-                // see this function's doc comment. Never reached for a
-                // pre-existing credential (Cases B/D).
-                let _ = security::delete_key(service, account);
+                if !path.exists() {
+                    // Pre-file-creation failure: no database bytes were
+                    // ever written under this key, so the orphaned
+                    // credential is a safe cleanup target. Best-effort
+                    // only, deliberately: a failed deletion here does
+                    // not change the fact that database initialization
+                    // itself failed, and must never mask that original
+                    // error by replacing it with a cleanup error
+                    // instead.
+                    let _ = store.delete(service, account);
+                }
+                // else: a file now exists at `path` that may contain
+                // bytes encrypted under this freshly-generated key -
+                // deliberately KEEP the credential, see doc comment
+                // above. Never reached for a pre-existing credential
+                // (Cases B/D).
             }
             Err(init_err)
         }
@@ -281,15 +389,31 @@ pub(crate) fn bootstrap_production_db() -> Result<Connection, BootstrapError> {
 /// instead of silently degrading to a `NULL` snapshot. `Create*`
 /// actions are unaffected - they legitimately pass `None` directly
 /// (there is no previous entity to snapshot), never through this
-/// helper. `serde_json::Error`'s own `Display` describes the
-/// serialization failure mode (e.g. "recursion limit exceeded") and
-/// never includes the field values being serialized, so this cannot
-/// leak snapshot content into `CoreError`'s diagnostic.
+/// helper.
+///
+/// **Diagnostic redaction (R016, hardening a review finding against
+/// R015):** the returned `CoreError`'s diagnostic text is a fixed
+/// string - it deliberately does NOT include the underlying
+/// `serde_json::Error`'s own message. R015 had argued this was already
+/// safe because `serde_json`'s *current* built-in errors only describe
+/// the failure mode (e.g. "recursion limit exceeded") and never echo
+/// field values - true today, but an assumption about a dependency's
+/// wording, not a structural guarantee: a future custom `Serialize`
+/// implementation (on some as-yet-unwritten domain type) could return
+/// `serde::ser::Error::custom(...)` with arbitrary text, including
+/// content derived from the value being serialized. Excluding the raw
+/// error text here makes "no personal snapshot content in this
+/// diagnostic" true by construction, not by an assumption about what
+/// serializers currently choose to say. Proven with a deliberately
+/// failing test-only `Serialize` impl whose error message contains an
+/// obvious marker string, asserting the marker never appears in this
+/// error's `Display` or `Debug` output (`req_snap1`,
+/// `services::tests`).
 fn serialize_required_snapshot<T: serde::Serialize>(value: &T) -> Result<String, CoreError> {
-    serde_json::to_string(value).map_err(|e| {
+    serde_json::to_string(value).map_err(|_e| {
         CoreError::new(
             CoreErrorKind::Internal,
-            format!("failed to serialize mandatory audit previous_snapshot: {e}"),
+            "mandatory audit previous_snapshot serialization failed",
         )
     })
 }

@@ -539,3 +539,67 @@ net-new entity family) - neither should be started as a direct
 implementation slice without that planning pass first, per the
 precedent already set by the M2 Project Child Action Freeze report
 before Milestone/Task were built.
+
+---
+
+## Addendum (R016, 2026-09-18) — review findings against this report
+
+**The measured test/build results and code description above are left
+exactly as originally written - nothing in this addendum edits or
+retracts them.** A dedicated follow-up review
+(`docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`)
+found three gaps in this pass's own safety story, all fixed in R016:
+
+**A. Case-A cleanup only proved the pre-file-creation failure path.**
+`bootstrap_db_with_key_lifecycle`'s original rule (§7 above) deleted a
+freshly-generated Case A credential on *any* subsequent database-
+initialization failure, unconditionally. That is only safe if
+initialization failed *before* any database file was created. If
+`bootstrap_db_at` had instead (1) created/encrypted the database file
+using the fresh key, then (2) failed *later* - during key verification
+or migration, say - deleting the credential at that point would have
+self-inflicted exactly the state this whole hardening pass exists to
+prevent: an existing database file with no matching credential (Case
+C), discovered on the very next launch. `req_kl7` (§9 above) only
+forced the pre-file-creation case (a blocker file makes
+`create_dir_all` fail before any database bytes are ever written); it
+did not - and structurally could not, using that technique - prove the
+post-file-creation case. R016 fixes the rule itself (delete the fresh
+credential only if the database path still does not exist afterward)
+and adds `req_dkl7`, which forces failure *after* a file has been
+written, proving the corrected behavior directly.
+
+**B. OS-keyring-dependent tests could return early as BLOCKED while
+Cargo still counted them as passed**, so `req_kl1`-`req_kl10` were not,
+on their own, sufficient deterministic proof of the canonical A/B/C/D
+state machine - only proof that it worked on whatever machine happened
+to run them with a working credential store that run. R016 introduces a
+narrow `security::CredentialStore` trait, a production
+`KeyringCredentialStore` adapter (the real keyring behavior, unchanged),
+and a deterministic in-memory test double, then adds `req_dkl1`-
+`req_dkl12` - the same production state-machine logic
+(`resolve_master_key_with_store`/
+`bootstrap_db_with_key_lifecycle_with_store`), driven through the
+in-memory store so every proof always runs, regardless of OS credential
+store availability. The original `req_kl*` suite is kept as a
+supplementary, environment-dependent smoke/integration test against the
+real OS keyring - still valuable, no longer the primary proof.
+
+**C. Snapshot diagnostic safety relied on properties of the current
+serializer's error text rather than structurally excluding it.** §12/§14
+above concluded `serialize_required_snapshot`'s diagnostic was safe
+because `serde_json::Error`'s *current* built-in error messages never
+echo serialized field values - true, but an assumption about a
+dependency's wording, not a guarantee enforced by the code itself. A
+future custom `Serialize` implementation on some as-yet-unwritten domain
+type could return `serde::ser::Error::custom(...)` with arbitrary text.
+R016 changes the helper to use a fixed diagnostic string, excluding the
+underlying serializer error's text entirely, and strengthens
+`req_snap1` to prove this with a deliberate marker string that must
+never appear in the resulting `CoreError`'s `Display`, `Debug`, or
+`diagnostic()`.
+
+See R016 for the full implementation, corrected cleanup rule, new
+`security::CredentialStore` seam, the complete deterministic test
+matrix, and updated measured results (262 tests total, up from this
+report's 250).

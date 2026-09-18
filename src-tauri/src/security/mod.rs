@@ -57,7 +57,69 @@ fn entry(service: &str, account: &str) -> Result<keyring::Entry, KeyError> {
     keyring::Entry::new(service, account).map_err(|e| KeyError::Keyring(e.to_string()))
 }
 
-fn generate_key_hex() -> String {
+/// Narrow credential-storage seam (M2 key lifecycle determinism and
+/// failure-atomicity hardening, 2026-09-18, R016) - introduced so
+/// `services::resolve_master_key`/`bootstrap_db_with_key_lifecycle`'s
+/// canonical A/B/C/D state machine can be proven deterministically with
+/// an in-memory test double, independent of whether the real OS
+/// credential store (Windows Credential Manager, in this environment)
+/// is actually available. R015's key-lifecycle tests could return early
+/// as "BLOCKED" when the real keyring was unavailable - Cargo still
+/// counted them as passed even though the state-machine logic was never
+/// exercised, which is not sufficient proof for safety-critical
+/// behavior. Production (`KeyringCredentialStore`, below) is unaffected
+/// - `bootstrap_production_db` still resolves through the real OS
+/// keyring; only the state-machine logic itself is now generic over
+/// this trait so a deterministic in-memory store can substitute for it
+/// in tests. Deliberately minimal: three methods, no async, no
+/// batching, no generic error type - not a dependency-injection
+/// framework.
+pub(crate) trait CredentialStore {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, KeyError>;
+    fn set(&self, service: &str, account: &str, value: &str) -> Result<(), KeyError>;
+    fn delete(&self, service: &str, account: &str) -> Result<(), KeyError>;
+}
+
+/// The real, production `CredentialStore` - delegates to the OS-native
+/// keyring exactly as `get_existing_key`/`generate_and_store_key`/
+/// `delete_key` below always have; those free functions now route
+/// through this same adapter (DRY, behavior-preserving) rather than
+/// duplicating the `entry()`/`get_password`/`set_password`/
+/// `delete_credential` calls a second time.
+pub(crate) struct KeyringCredentialStore;
+
+impl CredentialStore for KeyringCredentialStore {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, KeyError> {
+        let e = entry(service, account)?;
+        match e.get_password() {
+            Ok(key_hex) => Ok(Some(key_hex)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(other) => Err(KeyError::Keyring(other.to_string())),
+        }
+    }
+
+    fn set(&self, service: &str, account: &str, value: &str) -> Result<(), KeyError> {
+        let e = entry(service, account)?;
+        e.set_password(value)
+            .map_err(|err| KeyError::Keyring(err.to_string()))
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<(), KeyError> {
+        let e = entry(service, account)?;
+        match e.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(other) => Err(KeyError::Keyring(other.to_string())),
+        }
+    }
+}
+
+/// `pub(crate)` (R016) - `services::resolve_master_key_with_store`
+/// generates the fresh key itself (before calling
+/// `CredentialStore::set`), so it needs this directly rather than only
+/// through `generate_and_store_key` below, which bundles generation and
+/// storage into one call the state machine can no longer use once it is
+/// generic over an arbitrary store.
+pub(crate) fn generate_key_hex() -> String {
     use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -74,12 +136,7 @@ fn generate_key_hex() -> String {
 /// because it always creates on absence and therefore cannot tell its
 /// caller which case it hit.
 pub(crate) fn get_existing_key(service: &str, account: &str) -> Result<Option<String>, KeyError> {
-    let e = entry(service, account)?;
-    match e.get_password() {
-        Ok(key_hex) => Ok(Some(key_hex)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(other) => Err(KeyError::Keyring(other.to_string())),
-    }
+    KeyringCredentialStore.get(service, account)
 }
 
 /// Generates a fresh random 256-bit key and stores it under (`service`,
@@ -94,9 +151,7 @@ pub(crate) fn get_existing_key(service: &str, account: &str) -> Result<Option<St
 /// replacement" situation.
 pub(crate) fn generate_and_store_key(service: &str, account: &str) -> Result<String, KeyError> {
     let key_hex = generate_key_hex();
-    let e = entry(service, account)?;
-    e.set_password(&key_hex)
-        .map_err(|err| KeyError::Keyring(err.to_string()))?;
+    KeyringCredentialStore.set(service, account, &key_hex)?;
     Ok(key_hex)
 }
 
@@ -107,12 +162,9 @@ pub(crate) fn generate_and_store_key(service: &str, account: &str) -> Result<Str
 /// against a credential THAT SAME invocation just created via
 /// `generate_and_store_key` moments earlier, never against one that
 /// might have already existed - never delete a pre-existing credential.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn delete_key(service: &str, account: &str) -> Result<(), KeyError> {
-    let e = entry(service, account)?;
-    match e.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(other) => Err(KeyError::Keyring(other.to_string())),
-    }
+    KeyringCredentialStore.delete(service, account)
 }
 
 /// Retrieves the existing key under (`service`, `account`), or generates

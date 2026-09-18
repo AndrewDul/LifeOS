@@ -5,20 +5,28 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-18 (M2 Storage and Audit Safety Hardening, R015 -
-a dedicated safety-infrastructure pass, **not** a new entity/action.
-Closes two known risks found by direct code inspection: (1) the
-production master-key lifecycle could silently generate a replacement
-key for an existing, now-undecryptable database - replaced with a
-canonical four-state DB/key matrix and a typed
-`MasterKeyMissingForExistingDatabase` recovery-required error, plus
-safe orphan-credential cleanup; (2) every mandatory audit
-`previous_snapshot` used `serde_json::to_string(&existing).ok()`,
-silently able to turn a serialization failure into a missing audit
-record - replaced with a `serialize_required_snapshot` helper that
-returns a typed `CoreError` and guarantees zero mutation on failure,
-applied to all five update actions (`UpdateGoal`/`UpdateProject`/
-`UpdateProgress`/`UpdateMilestone`/`UpdateTask`). See §4m. On top of
+Last updated: 2026-09-18 (M2 Key Lifecycle Determinism and Failure
+Atomicity Hardening, R016 - a focused correctness/verification pass on
+top of R015, **not** a new entity/action. Fixes two review findings
+against R015's own implementation, found by re-inspecting R015's actual
+code rather than trusting its report text: (A) R015's Case-A
+orphan-credential cleanup deleted a freshly-generated credential on ANY
+subsequent database-initialization failure, even one occurring AFTER a
+database file had already been created under that key - which could
+self-inflict "database exists, credential absent" (Case C) as a side
+effect of its own cleanup path; corrected so the credential is deleted
+only if the database path still does not exist afterward. (B) R015's
+key-lifecycle tests ran against the real OS keyring and could return
+early as "BLOCKED" (still counted as PASS by Cargo) - not sufficient
+deterministic proof of the canonical A/B/C/D state machine; a new
+`security::CredentialStore` seam + deterministic in-memory test double
+now proves all four cases, orphan cleanup (both pre- and
+post-file-creation), and three backend-error paths independent of OS
+keyring availability (12 new tests). Also hardened
+`serialize_required_snapshot`'s diagnostic to structurally exclude the
+underlying serializer's raw error text (previously safe only by
+assumption about `serde_json`'s current wording). See §4n. On top of
+2026-09-18's M2 Storage and Audit Safety Hardening (R015, §4m),
 2026-09-17's Goal vertical slice/storage hardening, Goal hardening
 pass, Project vertical slice, Project/storage integrity hardening,
 GoalRelation vertical slice, Project Child Action Freeze pass,
@@ -33,7 +41,7 @@ hardening, and UpdateProject implementation).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
@@ -154,7 +162,7 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-250 automated tests prove all of this (9 storage-spike regression, 17
+262 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
@@ -173,10 +181,16 @@ M2 Storage and Audit Safety Hardening tests - 10 key-lifecycle
 credential cleanup, and a static scan confirming no test touches the
 real production credential identity), 1 production-bootstrap
 regression test, and 6 snapshot-deserialization regression tests
-(`req_snap1`-`req_snap6`, one per mandatory-snapshot update action).
-**Not wired into the running app yet** - no Tauri command layer
-exists, so the UI cannot create/see real goals, projects, relations,
-milestones, or tasks yet.
+(`req_snap1`-`req_snap6`, one per mandatory-snapshot update action),
+plus (R016, 2026-09-18) 12 new deterministic key-lifecycle tests
+(`req_dkl1`-`req_dkl12`, driven through an in-memory
+`security::CredentialStore` test double rather than the real OS
+keyring - proving all four DB/key cases, orphan-credential cleanup
+both before AND after a database file is created, and three
+credential-backend error paths, independent of OS keyring
+availability). **Not wired into the running app yet** - no Tauri
+command layer exists, so the UI cannot create/see real goals,
+projects, relations, milestones, or tasks yet.
 
 Repository contents as of this run:
 
@@ -202,6 +216,7 @@ LiFeOS/
 │                    R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md
 │                    R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md
 │                    R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md
+│                    R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -251,16 +266,25 @@ LiFeOS/
     │   │                            Project, 5 LinkGoals, 17 AddMilestone/
     │   │                            UpdateMilestone, 15 AddTask/UpdateTask, 19 new
     │   │                            UpdateProject)
-    │   ├── security/mod.rs        OS-keyring master-key lifecycle - narrow
-    │   │                          pub(crate) primitives (get_existing_key/
-    │   │                          generate_and_store_key/delete_key, R015) compose into
-    │   │                          services::resolve_master_key's four-state DB/key
-    │   │                          matrix; the old DB-existence-blind
-    │   │                          get_or_create_production_master_key is removed
+    │   ├── security/mod.rs        OS-keyring master-key lifecycle. narrow pub(crate)
+    │   │                          primitives (get_existing_key/generate_and_store_key/
+    │   │                          delete_key, R015) compose into services::
+    │   │                          resolve_master_key's four-state DB/key matrix; the old
+    │   │                          DB-existence-blind get_or_create_production_master_key
+    │   │                          is removed. (R016) new CredentialStore trait +
+    │   │                          KeyringCredentialStore production adapter - the free
+    │   │                          primitives now delegate to it (unchanged behavior);
+    │   │                          generate_key_hex widened to pub(crate)
     │   └── services/
-    │       ├── mod.rs              bootstrap_production_db (R015: now
-    │       │                       bootstrap_db_with_key_lifecycle - resolve_master_key
-    │       │                       + orphan-credential cleanup on init failure),
+    │       ├── mod.rs              bootstrap_production_db -> bootstrap_db_with_key_lifecycle
+    │       │                       (R015) -> (R016) bootstrap_db_with_key_lifecycle_with_store/
+    │       │                       resolve_master_key_with_store, the real generic
+    │       │                       state-machine cores (generic over CredentialStore +,
+    │       │                       for the former, an injectable db initializer); the
+    │       │                       old names are thin wrappers over these; corrected
+    │       │                       cleanup rule (R016) - a freshly-generated Case A
+    │       │                       credential is deleted only if the db path still does
+    │       │                       NOT exist after an init failure, otherwise kept.
     │       │                       create_goal/update_goal, create_project/
     │       │                       update_project/update_progress/get_project,
     │       │                       link_goals/get_goal_relation/
@@ -270,12 +294,13 @@ LiFeOS/
     │       │                       get_task/get_tasks_for_project/get_tasks_for_goal
     │       │                       - all atomic (&mut Connection + rusqlite
     │       │                       transaction); all 5 update_* actions' previous_snapshot
-    │       │                       now via serialize_required_snapshot (R015 - typed
+    │       │                       via serialize_required_snapshot (R015 - typed
     │       │                       CoreError + zero mutation on failure, never a silent
-    │       │                       .ok()) - capability API contract's names, no
-    │       │                       dedicated capability/module yet (LIFEOS_SPEC.md
-    │       │                       §5.6/§10.1)
-    │       ├── tests.rs            147 integration test functions against a real
+    │       │                       .ok(); R016 - diagnostic redacted to a fixed string,
+    │       │                       no longer interpolates the raw serde_json error text)
+    │       │                       - capability API contract's names, no dedicated
+    │       │                       capability/module yet (LIFEOS_SPEC.md §5.6/§10.1)
+    │       ├── tests.rs            159 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
     │       │                       storage integrity, 23 GoalRelation functions covering
     │       │                       26 numbered requirements, 24 Milestone functions
@@ -290,15 +315,21 @@ LiFeOS/
     │       │                       Task parent-validation-hardening functions
     │       │                       (req_tpv_a-f), 14 UpdateProject functions (req_up*)
     │       │                       covering 33 numbered requirements plus an unplanned
-    │       │                       V5-to-V6 migration-compatibility proof, and (R015,
-    │       │                       2026-09-18) 17 new functions: 10 key-lifecycle
+    │       │                       V5-to-V6 migration-compatibility proof, (R015,
+    │       │                       2026-09-18) 17 functions: 10 key-lifecycle
     │       │                       (req_kl1-req_kl10, all four DB/key cases + orphan-
-    │       │                       cleanup + static production-identity scan), 1
+    │       │                       cleanup + static production-identity scan, now kept as
+    │       │                       a supplementary real-OS-keyring smoke suite), 1
     │       │                       production-bootstrap regression test, and 6
     │       │                       snapshot-deserialization regression tests
-    │       │                       (req_snap1-req_snap6) - incl. the progress-
-    │       │                       preservation regression test and the GoalRelation
-    │       │                       non-side-effect proof)
+    │       │                       (req_snap1-req_snap6), and (R016, 2026-09-18) 12 new
+    │       │                       deterministic key-lifecycle functions
+    │       │                       (req_dkl1-req_dkl12, via InMemoryCredentialStore - all
+    │       │                       four DB/key cases, orphan cleanup both pre- AND
+    │       │                       post-file-creation, 3 credential-backend error paths -
+    │       │                       independent of OS keyring availability) - incl. the
+    │       │                       progress-preservation regression test and the
+    │       │                       GoalRelation non-side-effect proof)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
@@ -1152,6 +1183,102 @@ current code (not assumed from any prior report):
 Full evidence, exact code, and every test result:
 `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`.
 
+### 4n. M2 Key Lifecycle Determinism and Failure Atomicity Hardening (2026-09-18, R016, dedicated follow-up run)
+
+A focused correctness/verification pass on top of R015 (§4m) - **not** a
+new domain entity or action, and no product/action semantics changed.
+Fixes two review findings against R015's own implementation (found by
+re-inspecting R015's actual current code, not by trusting its report
+text) plus one narrow diagnostic-safety hardening:
+
+1. **Case-A post-file-creation cleanup risk, fixed.** R015's
+   `bootstrap_db_with_key_lifecycle` deleted a freshly-generated Case A
+   credential on ANY subsequent database-initialization failure,
+   unconditionally. This is only safe if the failure occurred *before*
+   `bootstrap_db_at` created any database file. If instead
+   `storage::open_encrypted` had already created/encrypted the file
+   using the fresh key before a *later* step (`verify_key`/migration)
+   failed, deleting the credential at that point would self-inflict
+   "database exists, credential absent" (Case C) - the exact state R015
+   exists to prevent - as a side effect of its own cleanup path. R015's
+   `req_kl7` test could not have caught this: its blocker-file failure
+   technique structurally guarantees no database file ever exists
+   afterward. **Corrected cleanup rule**, implemented in
+   `bootstrap_db_with_key_lifecycle_with_store`: delete the freshly-
+   generated credential only if the database path still does NOT exist
+   afterward; if a file now exists, KEEP the credential (the database
+   file itself is never deleted by this cleanup path either way, so
+   this preserves the DB+key pairing rather than destroying it).
+   Proven with a new deterministic test (`req_dkl7`) using a custom,
+   injectable database-initializer closure that writes real bytes to
+   the target path before deliberately failing - the one sequence
+   `bootstrap_db_at` cannot be forced into portably - which also
+   confirms the resulting state re-resolves as Case B (safe to reopen),
+   never Case C.
+2. **Key-lifecycle tests made deterministic, independent of OS keyring
+   availability.** R015's `req_kl1`-`req_kl10` ran against the real OS
+   credential store and could return early as "BLOCKED" (still counted
+   as PASS by Cargo) if it was unavailable - not sufficient
+   deterministic proof of the canonical A/B/C/D state machine for
+   safety-critical behavior. A new, narrow `security::CredentialStore`
+   trait (`get`/`set`/`delete`, three methods, no DI framework) now
+   sits behind `resolve_master_key`/`bootstrap_db_with_key_lifecycle` -
+   production routes through a `KeyringCredentialStore` adapter
+   (identical real-keyring behavior, unchanged), while 12 new
+   deterministic tests (`req_dkl1`-`req_dkl12`) drive the exact same
+   state-machine logic (`resolve_master_key_with_store`/
+   `bootstrap_db_with_key_lifecycle_with_store` - never a parallel
+   reimplementation) through an in-memory test double instead,
+   deterministically proving: all four DB/key cases, orphan-credential
+   cleanup (both pre- and post-file-creation, §1 above), a
+   present-but-wrong key, repeated-reopen key stability, and three
+   credential-backend error paths (GET error correctly distinct from
+   "absent" with zero key generation; SET error on first run correctly
+   prevents database initialization from ever starting, proven with a
+   call-counting wrapper; DELETE error during cleanup correctly leaves
+   the ORIGINAL initialization error as what the caller sees, with the
+   resulting best-effort residual state explicitly asserted, not
+   hidden). R015's original `req_kl1`-`req_kl10` are kept as a
+   supplementary, environment-dependent smoke/integration suite against
+   the real OS keyring - still valuable, no longer the primary proof.
+   In this run's environment the real keyring was available, so all 11
+   of those tests (including the bootstrap-regression test) genuinely
+   PASSed, not BLOCKED.
+3. **Snapshot diagnostic hardened from "safe by assumption" to "safe by
+   construction".** R015 had verified `serialize_required_snapshot`'s
+   `CoreError` diagnostic was safe because `serde_json::Error`'s
+   *current* built-in messages never echo serialized field values - true
+   at the time, but an assumption about a dependency's wording, not a
+   structural guarantee; a future custom `Serialize` implementation on
+   some domain type could return arbitrary error text via
+   `serde::ser::Error::custom(...)`. The diagnostic is now a fixed
+   string - the underlying `serde_json::Error`'s own message is
+   discarded entirely rather than interpolated. Proven with a
+   strengthened `req_snap1`: the existing deliberately-failing
+   `AlwaysFailsToSerialize` test type now embeds an obvious marker
+   string in its error text, and the test asserts that marker never
+   appears in the resulting `CoreError`'s `Display`, `Debug`, or
+   `diagnostic()` - structural proof, not an inspection of today's
+   `serde_json` wording.
+4. **12 new tests** (262 total, up from 250; all 250 prior tests remain
+   green, unmodified): `req_dkl1`-`req_dkl12` (deterministic key
+   lifecycle, in-memory credential store), plus the strengthened
+   `req_snap1`. An incidental fix found along the way: `ResolvedMasterKey`
+   needed a `Debug` impl for a new test's `{:?}` formatting - implemented
+   by hand (not derived) so only the variant name prints, never the
+   actual master key, which a derived `Debug` would have exposed in any
+   caller's `{:?}`/panic/assertion-failure message.
+5. **R015's report corrected via a clearly-labelled addendum, not a
+   silent rewrite.** The original report body and its measured
+   250-test/build results are left completely unedited; an addendum
+   section at the end explains all three findings above and points to
+   R016 for the fix.
+6. **No schema migration** - `src-tauri/migrations/` untouched
+   (verified: zero diff). **No `services::storage` visibility change.**
+
+Full evidence, exact code, and every test result:
+`docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
@@ -1236,9 +1363,11 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   20. `feat: implement M2 Task vertical slice`
   21. `fix: validate both Task parent references`
   22. `feat: implement M2 UpdateProject action`
-  23. (this run) `fix: harden M2 key lifecycle and audit snapshots` —
-      see this run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-23 were not
+  23. `fix: harden M2 key lifecycle and audit snapshots`
+  24. (this run) `fix: make M2 key lifecycle failure-safe and
+      deterministic` — see this run's report and chat reply for the
+      exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8-24 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -1254,7 +1383,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 250 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 262 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -1307,9 +1436,21 @@ provably cannot silently disappear on a serialization failure (17 new
 tests: 10 key-lifecycle + 1 bootstrap regression + 6 snapshot-
 deserialization regression) - all passing against temp databases and
 an isolated test credential identity, never the user's real data or
-real credential. **Test count rose from 200 to 233 to 250 across this
-day's runs** (233→250 this run, +17) - all 233 prior tests remain
-green, unmodified.
+real credential, and (as of 2026-09-18, R016, §4n) that the master-key
+orphan-credential cleanup is correct in BOTH failure timings (before
+AND after a database file is created - the post-creation case is the
+one R015 had not actually proven), that this holds true independent of
+whether the real OS credential store is available (12 new deterministic
+tests against an in-memory credential-store test double, exercising the
+exact same production state-machine code), and that a credential-
+backend GET/SET/DELETE error is handled distinctly and safely in each
+case (12 new tests: `req_dkl1`-`req_dkl12`) - plus that the mandatory
+audit-snapshot serialization-failure diagnostic structurally excludes
+the underlying serializer's own error text, proven with a deliberate
+marker string that must never appear in the resulting error's
+Display/Debug (`req_snap1`, strengthened). **Test count rose from 200
+to 233 to 250 to 262 across these two days' runs** (250→262 this run,
++12) - all 250 prior tests remain green, unmodified.
 
 ---
 
@@ -1319,14 +1460,16 @@ See §4l's "Next implementation step" for the exact reasoning (this
 duplicates it so it is visible without scrolling past the M2 detail
 section). With Goal/Project/GoalRelation/Milestone/Task all
 implemented, `UpdateProject` closing out the last frozen, shovel-ready
-action, and (2026-09-18, R015, §4m) the master-key lifecycle and
-mandatory audit-snapshot safety gaps both closed, what remains needs
-its own planning/freeze pass first: **`RecurringRule`** (deliberately
-deferred, §4j) or the **Personal Knowledge Layer** (the next real
-net-new entity family). A direct implementation slice is not
-recommended for either without that planning pass first, the way
-Milestone/Task both got one. M2 is safe to proceed into that next
-planning/freeze decision - see R015 §18.
+action, and (2026-09-18, R015 §4m then R016 §4n) the master-key
+lifecycle and mandatory audit-snapshot safety gaps closed and then
+verified deterministically/corrected for a post-file-creation failure
+edge case, what remains needs its own planning/freeze pass first:
+**`RecurringRule`** (deliberately deferred, §4j) or the **Personal
+Knowledge Layer** (the next real net-new entity family). A direct
+implementation slice is not recommended for either without that
+planning pass first, the way Milestone/Task both got one. M2's
+storage/security foundation is safe to proceed into that next
+planning/freeze decision - see R016 §15.
 
 ---
 
@@ -1392,7 +1535,15 @@ planning/freeze decision - see R015 §18.
   material or serialized personal snapshot content can ever reach that
   `diagnostic` string either** - this caveat about `{:?}` vs. `Display`
   remains the only reason to stay disciplined about it, not a sign
-  something is currently leaking.
+  something is currently leaking. **Hardened further 2026-09-18 (R016
+  §10): `serialize_required_snapshot`'s diagnostic is now a fixed
+  string** - the underlying `serde_json::Error`'s own message is
+  discarded entirely rather than interpolated, so "no personal snapshot
+  content in this diagnostic" is now true by construction, not merely
+  by an assumption about `serde_json`'s current wording (a future custom
+  `Serialize` impl on some domain type could otherwise have returned
+  arbitrary error text). Proven with a deliberate marker string that
+  must never appear in `Display`/`Debug`/`diagnostic()` (`req_snap1`).
 - **RESOLVED (2026-09-18, M2 Storage and Audit Safety Hardening, R015
   §4m above): the production master-key lifecycle could silently
   generate a replacement key for an existing, now-undecryptable
@@ -1411,6 +1562,40 @@ planning/freeze decision - see R015 §18.
   five update actions (`UpdateGoal`/`UpdateProject`/`UpdateProgress`/
   `UpdateMilestone`/`UpdateTask`) - not just the one call site R014 had
   originally flagged for `UpdateProject`.
+- **RESOLVED (2026-09-18, M2 Key Lifecycle Determinism and Failure
+  Atomicity Hardening, R016 §4n above): R015's own orphan-credential
+  cleanup rule could self-inflict "database exists, credential absent"
+  (Case C) if a database-initialization failure occurred AFTER a
+  database file had already been created under a freshly-generated Case
+  A key.** A review of R015's actual code (not its report text) found
+  the cleanup branch deleted the fresh credential on ANY subsequent
+  initialization failure, unconditionally - R015's own `req_kl7` test
+  could not have caught this, since its failure-forcing technique
+  structurally guarantees no database file ever exists afterward.
+  Corrected: the fresh credential is now deleted only if the database
+  path still does NOT exist afterward; if a file now exists, the
+  credential is deliberately KEPT (the database file itself was never
+  deleted by this cleanup path either way). Proven with a new
+  deterministic test (`req_dkl7`) that forces failure AFTER a file is
+  written, confirming both that the credential survives and that the
+  resulting state correctly re-resolves as Case B (safe to reopen),
+  never Case C.
+- **RESOLVED (2026-09-18, M2 Key Lifecycle Determinism and Failure
+  Atomicity Hardening, R016 §4n above): R015's key-lifecycle tests
+  could return early as "BLOCKED" (still counted as PASS by Cargo) if
+  the real OS credential store was unavailable, which was not
+  sufficient deterministic proof of the canonical A/B/C/D master-key
+  state machine.** A new, narrow `security::CredentialStore` trait +
+  in-memory test double now proves all four cases, orphan-credential
+  cleanup (both failure timings), and three credential-backend error
+  paths (GET/SET/DELETE) deterministically, independent of OS keyring
+  availability (12 new tests, `req_dkl1`-`req_dkl12`) - driving the
+  exact same production state-machine logic
+  (`resolve_master_key_with_store`/
+  `bootstrap_db_with_key_lifecycle_with_store`), never a parallel
+  reimplementation. R015's original `req_kl1`-`req_kl10` are kept as a
+  supplementary, environment-dependent smoke/integration suite against
+  the real OS keyring.
 - **`PRAGMA foreign_keys = ON` enforcement depends on every connection
   going through `storage::open_encrypted`** — true today (production
   bootstrap, version-targeted migration tests, and the storage spike all
@@ -1480,5 +1665,6 @@ summaries - open the file for full reasoning.
 | R013 | M2 Task Parent-Validation Hardening | `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` |
 | R014 | M2 UpdateProject Implementation | `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` |
 | R015 | M2 Storage and Audit Safety Hardening | `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md` |
+| R016 | M2 Key Lifecycle Determinism and Failure Atomicity Hardening | `docs/reports/R016_M2_KEY_LIFECYCLE_DETERMINISM_AND_FAILURE_ATOMICITY_HARDENING_2026-09-18.md` |
 
-Next report allocated will be **R016**.
+Next report allocated will be **R017**.
