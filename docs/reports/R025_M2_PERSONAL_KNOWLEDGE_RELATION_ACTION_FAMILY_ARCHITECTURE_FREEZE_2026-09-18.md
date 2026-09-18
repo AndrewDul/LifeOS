@@ -3,8 +3,11 @@
 **Type:** Documentation / architecture only. No production code, schema, or
 tests changed in this run.
 
-**Status:** Architecture CLOSED for design. Implementation is blocked on one
-small, additive V8 migration (see §6/§20).
+**Status:** Architecture CLOSED for v0.1 implementation. Implementation is
+blocked on one small, additive V8 migration — `relation_audit_log` only,
+exactly (see §6/§22, and the post-freeze correction addendum at the end
+of this report, which removed a remaining `relations.updated_at`
+ambiguity found immediately after the original freeze).
 
 ---
 
@@ -208,20 +211,28 @@ Structurally identical to `fact_audit_log`, for the same reason every
 other family's audit table mirrors the same shape: minimal risk,
 maximum consistency, zero new conceptual pattern introduced.
 
-**Recommended, not required:** `ALTER TABLE relations ADD COLUMN
-updated_at TEXT` — for symmetry with Fact/Goal/Project/Task and because
-`CorrectRelation` does mutate the row in place, so a row-level "last
-changed" marker is genuinely useful (not merely cosmetic). Not required
-because `milestones` proves a mutable table can function without it
-(§5). A future implementer may decide either way without reopening this
-freeze.
+**EXCLUDED from v0.1: `relations.updated_at`.** *(Corrected by the
+post-freeze consistency pass below — originally left as "recommended,
+not required," which was itself a contradiction of a CLOSED verdict; see
+the addendum at the end of this report for the full correction.)* No
+row-level "last modified" column is added to `relations` in v0.1.
+`CorrectRelation`'s and `ConfirmRelation`'s mutation timestamps are fully
+represented by `relation_audit_log.occurred_at` — `milestones` already
+proves a mutable M2 table does not need its own `updated_at` to support
+correct in-place updates (§5), and there is no frozen sync/change-feed
+requirement today that consumes a Relation-level modification time. If
+one emerges later, it is a new, explicit decision for that subsystem, not
+something to guess at here.
 
 **Not required:** `superseded_by_relation_id` — see §16.
 
-This V8 is purely additive: no existing table is altered destructively,
-no FK is weakened, V1–V7 are untouched, and (since `relations` currently
-has zero production rows — schema-only, no write path has ever existed)
-there is no real-data migration risk.
+**Final v0.1 V8 scope, in full: `relation_audit_log` — and nothing
+else.** No `ALTER TABLE relations` of any kind.
+
+This V8 is purely additive: no existing table is altered at all, no FK is
+weakened, V1–V7 are untouched, and (since `relations` currently has zero
+production rows — schema-only, no write path has ever existed) there is
+no real-data migration risk.
 
 ## 7. Semantic definition of a Personal Knowledge Relation
 
@@ -567,7 +578,7 @@ broader retrieval/Context Pack design is out of scope for this report.
 |---|---|---|---|
 | Relation row storage (all fields) | Yes | None | No |
 | Relation read struct / `get_relation` | Schema yes; Rust struct/fn not written | Write in future slice | No |
-| `updated_at` on `relations` | No | Optional | Recommended, not required |
+| `updated_at` on `relations` | No | **Deliberately excluded from v0.1** — `relation_audit_log.occurred_at` is the authoritative mutation timestamp | No |
 | Supersession/history pointer | Not needed (see §16) | None | No |
 | `relation_audit_log` | No | Must be created | **Required** |
 | Evidence links (`relation_evidence`) | Yes | None | No |
@@ -577,8 +588,9 @@ broader retrieval/Context Pack design is out of scope for this report.
 | Confirmation state transition | Schema supports | Write in future slice | No |
 | `previous_snapshot` support | Requires `relation_audit_log` | Blocked on same | **Required** |
 
-**Verdict: V8 required, scope limited to `relation_audit_log` (required)
-plus `relations.updated_at` (recommended, optional).**
+**Verdict: V8 required, scope EXACTLY `relation_audit_log` — one new,
+independent table, nothing else. `relations.updated_at` is not part of
+v0.1; no `ALTER TABLE relations` occurs in V8.**
 
 ## 23. Migration-compatibility rules for the future V8
 
@@ -607,13 +619,18 @@ pub(crate) struct Relation {
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    // pub updated_at: DateTime<Utc>,  // only if the recommended V8 column is added
 }
 ```
 
-No fields are assumed to already exist beyond what §2 confirms is in the
-live schema; `updated_at` is shown commented to make explicit that it is
-NOT currently present and depends on the optional V8 decision.
+This is the complete, final v0.1 shape — no `updated_at` field, commented
+or otherwise. No fields are assumed to exist beyond what §2 confirms is
+in the live schema. `relations.updated_at` is not part of v0.1 (see the
+post-freeze correction addendum); mutation timestamps for
+`CorrectRelation`/`ConfirmRelation` live exclusively in
+`relation_audit_log.occurred_at`. If a future need for a row-level
+modification timestamp emerges (e.g. a sync/change-feed subsystem), that
+is a new, explicit decision for that subsystem — not a reopening of this
+freeze.
 
 ## 25. Implementation slicing recommendation
 
@@ -668,7 +685,7 @@ regression.
 | Action family names/shapes | FROZEN NOW (§8/§9) |
 | `CorrectRelation` successor vs in-place | FROZEN NOW — in-place, metadata-only (§16) |
 | `superseded_by_relation_id` need | FROZEN NOW — not needed (§16) |
-| `updated_at` on `relations` | FROZEN NOW — recommended, not required (§5/§6) |
+| `updated_at` on `relations` | FROZEN NOW — deliberately excluded from v0.1; `relation_audit_log.occurred_at` is the authoritative mutation timestamp (§5/§6, corrected in the post-freeze addendum below) |
 | Duplicate-edge policy | FROZEN NOW — no dedup, no UNIQUE constraint (§14) |
 | Self-edge / directionality / symmetry | FROZEN NOW — retain prohibition, no auto-inverse (§20) |
 | Confirmation floors / overlay need | FROZEN NOW (§17) |
@@ -697,10 +714,12 @@ would not be, and is not recommended without concrete evidence of need).
 
 ## 29. Final verdict
 
-**Architecture is CLOSED for design.** Implementation may begin once a
-narrow, additive V8 (`relation_audit_log`, required; `relations.updated_at`,
-optional) is created — that migration is the first step of the
-recommended R026 slice, not a blocker to freezing this architecture.
+**Architecture is CLOSED for v0.1 implementation.** Implementation may
+begin once one narrow, additive V8 — `relation_audit_log`, and exactly
+that, nothing else — is created. That migration is the first step of the
+recommended R026 slice, not an open blocker to this freeze: its scope is
+now fully decided, not left for an implementer to choose. There are zero
+implementation-time schema decisions remaining for R026.
 
 **Next report: R026.**
 
@@ -712,3 +731,85 @@ recommended R026 slice, not a blocker to freezing this architecture.
   No cargo/npm/Tauri build was run, consistent with the brief's
   instruction that none is required when zero production code or schema
   changed.
+
+---
+
+## Post-freeze schema-scope consistency correction (2026-09-18)
+
+A review of R025 immediately after its own commit found a genuine
+internal contradiction: §29 declared the architecture **"CLOSED for
+design,"** while §6/§22 simultaneously left `relations.updated_at` as
+**"recommended, not required... a future implementer may decide either
+way."** Leaving any schema question open for the implementer to decide is
+exactly the kind of implementation-time architectural choice this whole
+freeze exists to prevent — R017–R019 established that discipline for
+Fact before any Fact-action code was written, and R025 was required to
+hold Relation to the same standard. A "closed" freeze cannot contain an
+unresolved "either way."
+
+**Final v0.1 decision: `relations.updated_at` is excluded entirely.** It
+is not part of the V8 migration, not part of the frozen `Relation`
+domain struct, and not part of any future implementation-time choice.
+
+Reasoning:
+1. No Relation action's correctness depends on it — `AddRelation`,
+   `ConfirmRelation`, and `ForgetRelation` never read or need it, and
+   `CorrectRelation`'s in-place metadata mutation is fully described by
+   its mandatory `relation_audit_log.previous_snapshot` write.
+2. `CorrectRelation`'s correction history is authoritative in
+   `relation_audit_log.previous_snapshot` + `relation_audit_log.occurred_at`
+   — nothing is lost by not also stamping the row itself.
+3. `ConfirmRelation`'s confirmation time is likewise fully represented by
+   its own `relation_audit_log.occurred_at` row.
+4. `milestones` (V4) already proves, as a real precedent in this exact
+   codebase, that an M2 table with its own mutable in-place-update
+   lifecycle (`UpdateMilestone`) operates correctly with no row-level
+   `updated_at` at all.
+5. There is no frozen sync/change-feed requirement today that consumes a
+   Relation-level modification timestamp — adding the column now would be
+   purely speculative, which CLAUDE.md's "no speculative scaffolding"
+   principle already forbids.
+6. If a genuine future need for row-level modification time emerges (a
+   sync subsystem, a change-feed), that is a new, explicit design
+   decision for that subsystem when it is actually built — not something
+   to guess at inside this freeze.
+
+**Consequently, the exact, final v0.1 V8 scope is:**
+
+```sql
+CREATE TABLE relation_audit_log (
+    id                  TEXT PRIMARY KEY,
+    relation_id         TEXT NOT NULL,   -- deliberately not an FK
+    action_type         TEXT NOT NULL CHECK (action_type IN
+                           ('AddRelation','CorrectRelation','ConfirmRelation','ForgetRelation')),
+    actor               TEXT NOT NULL CHECK (actor IN ('UI','CloudLLM','NeXa')),
+    provenance          TEXT NOT NULL CHECK (provenance IN ('Explicit','Inferred')),
+    confirmation_class  TEXT NOT NULL,
+    previous_snapshot   TEXT,
+    occurred_at         TEXT NOT NULL
+);
+```
+
+— and nothing else. No `ALTER TABLE relations`. No
+`superseded_by_relation_id` (unchanged from the original freeze, §16 —
+that conclusion was never in question). No generic Personal-Knowledge
+audit-table redesign.
+
+**Unchanged by this correction:** `CorrectRelation` and `ConfirmRelation`
+semantics are exactly as originally frozen in §8/§16/§18 — in-place
+metadata-only correction (`note`/`confidence`/`sensitivity` via
+`FieldPatch`, never identity fields, never `epistemic_state`) and
+in-place epistemic confirmation, respectively. Neither action's payload,
+result type, confirmation floor, or provenance rules changed. This
+correction touches only the row-level `updated_at` question and the
+now-narrower V8 scope it implied.
+
+**Confirmed:** no production code, schema, or tests changed by this
+correction — it is a documentation-only fix to the R025 report and the
+two living docs that summarized it. `V7` is unchanged; no `V8` migration
+file was created. Episode actions and retrieval/Context Pack remain
+entirely unstarted. The next substantial report remains **R026**.
+
+With this correction applied, R025's architecture is now genuinely
+**CLOSED for v0.1 implementation** — no schema question is left for an
+implementer to decide.

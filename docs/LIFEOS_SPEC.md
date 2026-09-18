@@ -119,16 +119,21 @@ and deleting an orphaned Source/Entity only when truly orphaned (SELF
 is never deleted). `Delete` blocks every unconfirmed call regardless of
 provenance, and there is no Undo. All four frozen Memory actions now
 exist; no Tauri command wires any Memory action into the running app
-yet. **(2026-09-18, R025)** The Relation action family
-(`AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`) is
-now frozen for design, documentation only - no code/schema/tests
+yet. **(2026-09-18, R025, then corrected the same day by R025's own
+post-freeze schema-scope consistency addendum)** The Relation action
+family (`AddRelation`/`CorrectRelation`/`ConfirmRelation`/
+`ForgetRelation`) is now CLOSED for v0.1 implementation with zero
+open schema decisions, documentation only - no code/schema/tests
 changed. Current `V7` was found insufficient by one narrow gap: no
 `relation_audit_log` table exists, breaking this codebase's unbroken
-per-family dedicated-audit-table precedent, so a small additive V8 is
-required before implementation. `CorrectRelation` is frozen as an
-in-place metadata-only correction (`note`/`confidence`/`sensitivity`
-only, never `from`/`to`/`relation_type`, which together form Relation's
-identity), so - unlike `CorrectMemory` - no successor-row/
+per-family dedicated-audit-table precedent, so a small additive V8
+(`relation_audit_log` ONLY, no `ALTER TABLE relations`) is required
+before implementation - `relations.updated_at` is deliberately excluded
+from v0.1; `relation_audit_log.occurred_at` is the authoritative
+mutation timestamp. `CorrectRelation` is frozen as an in-place
+metadata-only correction (`note`/`confidence`/`sensitivity` only, never
+`from`/`to`/`relation_type`, which together form Relation's identity),
+so - unlike `CorrectMemory` - no successor-row/
 `superseded_by_relation_id` mechanism is needed. Episode actions and
 retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 §4o-§4v and §10,
@@ -876,8 +881,10 @@ the forensic gap: freed pages are now actively overwritten, but no
 claim beyond that is made. `journal_mode` was measured (R020), not
 forced, at SQLite's own default (`delete`).
 
-**Relation action family frozen for design, 2026-09-18 (R025) — documentation
-only, no code/schema/tests changed.** `Relation`'s v0.1 public action set is
+**Relation action family CLOSED for v0.1 implementation, 2026-09-18 (R025,
+then corrected the same day by R025's own post-freeze schema-scope
+consistency addendum) — documentation only, no code/schema/tests
+changed.** `Relation`'s v0.1 public action set is
 `AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`, deliberately
 not a generic `UpdateRelation`. Relation's identity is the full triple
 `(from_entity_id, relation_type, to_entity_id)` — unlike `Fact`, which has a
@@ -898,9 +905,12 @@ insufficient by exactly one narrow, additive gap: **no `relation_audit_log`
 table exists**, breaking this codebase's unbroken per-family
 dedicated-audit-table precedent (`goal_audit_log`/`project_audit_log`/
 `goal_relation_audit_log`/`milestone_audit_log`/`task_audit_log`/
-`fact_audit_log`) — a small V8 (`relation_audit_log`, required;
-`relations.updated_at`, recommended but not required, since `milestones`
-already proves a mutable table can run its own lifecycle without one) must be
+`fact_audit_log`) — the exact, final V8 scope is **`relation_audit_log`
+ONLY**, with no `ALTER TABLE relations` at all: `relations.updated_at` is
+deliberately **excluded from v0.1** (`milestones` already proves a
+mutable table can run its own lifecycle without one, and
+`relation_audit_log.occurred_at` is the authoritative
+`CorrectRelation`/`ConfirmRelation` mutation timestamp) — this must be
 created before any Relation action is implemented. No `Relation`
 deduplication, no automatic inverse/symmetric edges, and no self-edge
 relaxation (the existing DB `CHECK (from_entity_id <> to_entity_id)` is

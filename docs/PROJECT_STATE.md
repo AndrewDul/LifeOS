@@ -2561,22 +2561,29 @@ proven (375/375 tests), and (2026-09-18, R024 §4v) Slice E
 (`ForgetMemory`) - the fourth production Personal Knowledge mutation
 and the first hard-delete action - is also implemented and proven
 (398/398 tests)**, all four frozen Memory actions now exist, and
-(2026-09-18, R025) the Relation action family's architecture is now
-**frozen for design** - `AddRelation`/`CorrectRelation`/`ConfirmRelation`/
-`ForgetRelation` names, payloads, confirmation floors, provenance rules,
-and privacy/deletion semantics are all fixed, with `CorrectRelation`
-deliberately designed as an in-place metadata-only correction (not a
-Fact-style successor chain), so no `superseded_by_relation_id`-equivalent
-is needed. R025 found current `V7` insufficient by one narrow, additive
-gap - **no `relation_audit_log` table exists**, and every M2 mutating
-action in this codebase writes to its own dedicated audit table with no
-exception - so a small V8 (`relation_audit_log`, required;
-`relations.updated_at`, recommended but not required) must be created
-before any Relation action code is written. No schema/code/tests changed
-in R025 itself - it is documentation only. The recommended next step is
-R026 (Relation foundation + V8 migration + `AddRelation`, combined since
-the foundation this time is small), followed by R027 `CorrectRelation`,
-R028 `ConfirmRelation`, R029 `ForgetRelation`. `RecurringRule`
+(2026-09-18, R025, then corrected the same day by R025's own post-freeze
+schema-scope consistency addendum) the Relation action family's
+architecture is now **CLOSED for v0.1 implementation, with zero
+schema decisions left open** - `AddRelation`/`CorrectRelation`/
+`ConfirmRelation`/`ForgetRelation` names, payloads, confirmation floors,
+provenance rules, and privacy/deletion semantics are all fixed, with
+`CorrectRelation` deliberately designed as an in-place metadata-only
+correction (not a Fact-style successor chain), so no
+`superseded_by_relation_id`-equivalent is needed. R025 found current `V7`
+insufficient by one narrow, additive gap - **no `relation_audit_log`
+table exists**, and every M2 mutating action in this codebase writes to
+its own dedicated audit table with no exception - so a small V8
+(`relation_audit_log` ONLY) must be created before any Relation action
+code is written. `relations.updated_at` is **not part of Relation v0.1**
+(the original freeze had left it "recommended, not required," which
+contradicted a CLOSED verdict; the addendum resolved this by excluding it
+entirely - `CorrectRelation`/`ConfirmRelation` mutation timestamps are
+fully carried by `relation_audit_log.occurred_at`). No schema/code/tests
+changed in R025 or its addendum - both are documentation only. The
+recommended next step is R026 (V8 `relation_audit_log` + Relation domain
+struct/read-side + `AddRelation`, combined since the foundation this time
+is small), followed by R027 `CorrectRelation`, R028 `ConfirmRelation`,
+R029 `ForgetRelation`. `RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2700,28 +2707,36 @@ to proceed into implementation - see R016 §15 and R019 §23.
   running app yet. Episode actions and retrieval/Context Pack remain
   entirely unstarted.
 - **RESOLVED (2026-09-18, M2 Personal Knowledge Relation Action-Family
-  Architecture Freeze, R025 above): the Relation action family
-  (`AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`) is
-  now fully frozen for design - no code, schema, or tests changed.**
+  Architecture Freeze, R025 above, then corrected the same day by R025's
+  own post-freeze schema-scope consistency addendum): the Relation
+  action family (`AddRelation`/`CorrectRelation`/`ConfirmRelation`/
+  `ForgetRelation`) is now CLOSED for v0.1 implementation, with zero
+  schema decisions left open - no code, schema, or tests changed.**
   Current `V7` was found insufficient by exactly one narrow, additive
   gap: no `relation_audit_log` table exists, and this codebase has an
   unbroken six-table precedent (`goal_audit_log`/`project_audit_log`/
   `goal_relation_audit_log`/`milestone_audit_log`/`task_audit_log`/
   `fact_audit_log`) of every M2 write path getting its own dedicated
-  audit table. A small V8 migration (`relation_audit_log`, required;
-  `relations.updated_at`, recommended but not strictly required - a real
-  precedent, `milestones`, already runs a mutable lifecycle without
-  `updated_at`) must be created before any Relation action is
-  implemented. `CorrectRelation` is deliberately designed as an in-place
-  metadata-only correction (`note`/`confidence`/`sensitivity` via
-  `FieldPatch`, never `from`/`to`/`relation_type`), so no
-  `superseded_by_relation_id`-equivalent column is needed - a genuine
-  divergence from `CorrectMemory`'s successor-Fact pattern, justified by
-  Relation's identity being the full `(from, relation_type, to)` triple
-  with no separate correctable "value" the way Fact has. Recommended next
-  implementation slices: R026 (Relation foundation + V8 migration +
-  `AddRelation`, combined), R027 `CorrectRelation`, R028
-  `ConfirmRelation`, R029 `ForgetRelation`.
+  audit table. **The exact, final V8 scope is `relation_audit_log`
+  ONLY** - the original freeze had left `relations.updated_at` as
+  "recommended, not required," which contradicted its own "CLOSED"
+  verdict (an implementation-time schema choice cannot coexist with a
+  closed freeze); the post-freeze addendum resolved this by excluding
+  `relations.updated_at` entirely. It is **not part of Relation v0.1**:
+  `CorrectRelation`/`ConfirmRelation` mutation timestamps are fully
+  carried by `relation_audit_log.occurred_at`, and `milestones` (V4)
+  already proves a mutable M2 table needs no row-level `updated_at` to
+  support correct in-place updates. `CorrectRelation` is deliberately
+  designed as an in-place metadata-only correction
+  (`note`/`confidence`/`sensitivity` via `FieldPatch`, never
+  `from`/`to`/`relation_type`), so no `superseded_by_relation_id`-
+  equivalent column is needed either - a genuine divergence from
+  `CorrectMemory`'s successor-Fact pattern, justified by Relation's
+  identity being the full `(from, relation_type, to)` triple with no
+  separate correctable "value" the way Fact has. Recommended next
+  implementation slices: R026 (V8 `relation_audit_log` + Relation domain
+  struct/read-side + `AddRelation`, combined), R027 `CorrectRelation`,
+  R028 `ConfirmRelation`, R029 `ForgetRelation`.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
