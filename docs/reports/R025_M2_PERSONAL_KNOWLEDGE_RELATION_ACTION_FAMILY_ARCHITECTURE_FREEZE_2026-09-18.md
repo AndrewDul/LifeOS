@@ -283,10 +283,16 @@ fields legitimately need to change."
 - **Why it exists / why public:** the only way to adjust `note`,
   `confidence`, or `sensitivity` on an already-asserted Relation without
   changing what edge it represents.
-- **Mutates:** `note`, `confidence`, `sensitivity` on the SAME row, via
-  `FieldPatch<T>` tri-state patches (reusing the existing pattern).
-  **Does not touch** `from_entity_id`, `to_entity_id`, `relation_type`,
-  or `epistemic_state`.
+- **Mutates:** `note`, `confidence`, `sensitivity` on the SAME row.
+  `note`/`confidence` are nullable fields and use `FieldPatch<T>`
+  tri-state patches (`Unchanged`/`Set`/`Clear`); `sensitivity` is
+  `NOT NULL` in the live V7 schema and therefore uses `Option<Sensitivity>`
+  (`None` = unchanged, `Some(v)` = replace — no `Clear` state exists for a
+  non-nullable field), matching `CorrectMemoryPayload.sensitivity`'s
+  already-established precedent exactly. *(Corrected by the post-freeze
+  patch-shape addendum below — the original freeze incorrectly modeled
+  `sensitivity` with `FieldPatch<Sensitivity>`.)* **Does not touch**
+  `from_entity_id`, `to_entity_id`, `relation_type`, or `epistemic_state`.
 - **Does NOT:** create a successor row, touch identity fields, touch
   epistemic state (that is `ConfirmRelation`'s exclusive job).
 - **Confirmation floor:** `ImportantChange`, with the exact same
@@ -306,6 +312,17 @@ fields legitimately need to change."
 - **History:** preserved only via the audit trail's `previous_snapshot`,
   not via a live successor chain — see §16 for the full reasoning.
 - **Undo:** none.
+- **No-fields-to-correct rule:** a payload where `note == Unchanged`
+  AND `confidence == Unchanged` AND `sensitivity == None` is rejected
+  with the existing, generic `ValidationError::NoFieldsToUpdate` (no new
+  Relation-specific error variant — the generic one already fits, same
+  as `UpdateGoal`/`UpdateProject`/`UpdateMilestone`/`UpdateTask` reuse
+  it). This is a pure structural check (was *any* patch requested?), runs
+  before confirmation/DB reads, and does not attempt database-dependent
+  semantic no-op detection — a caller explicitly supplying
+  `sensitivity = Some(existing.sensitivity)`, or
+  `note = Set(existing_note)`, still counts as a requested update and is
+  not treated as a no-op.
 
 ### ConfirmRelation
 - **Why it exists / why public:** pure epistemic confirmation in place,
@@ -369,7 +386,7 @@ pub(crate) struct CorrectRelationPayload {
     pub relation_id: RelationId,
     pub note: FieldPatch<String>,
     pub confidence: FieldPatch<f32>,
-    pub sensitivity: FieldPatch<Sensitivity>,
+    pub sensitivity: Option<Sensitivity>,
 }
 // -> ActionOutcome<Relation>
 
@@ -667,7 +684,9 @@ reject; open `relation_type` validation; Entity endpoint existence
 Source/Evidence creation and rollback; inferred-confirmation gates
 (zero-write proof); confidence finite-bounds; note bounds; active/
 inactive predicate; `CorrectRelation` in-place metadata correction
-(inherit/override per field via `FieldPatch`); `ConfirmRelation`
+(inherit/override per field: `note`/`confidence` via `FieldPatch`,
+`sensitivity` via `Option<Sensitivity>`; structural
+`NoFieldsToUpdate` rejection when all three are absent); `ConfirmRelation`
 state-transition matrix + no-op rejection; `ForgetRelation` deletion +
 privacy (shared Evidence, orphan/shared Source, orphan/shared Entity
 including SELF-never-deleted, audit-snapshot scrub); rollback proofs for
@@ -797,12 +816,14 @@ audit-table redesign.
 
 **Unchanged by this correction:** `CorrectRelation` and `ConfirmRelation`
 semantics are exactly as originally frozen in §8/§16/§18 — in-place
-metadata-only correction (`note`/`confidence`/`sensitivity` via
-`FieldPatch`, never identity fields, never `epistemic_state`) and
-in-place epistemic confirmation, respectively. Neither action's payload,
-result type, confirmation floor, or provenance rules changed. This
-correction touches only the row-level `updated_at` question and the
-now-narrower V8 scope it implied.
+metadata-only correction (`note`/`confidence` via `FieldPatch`,
+`sensitivity` via `Option<Sensitivity>` — see the separate patch-shape
+correction addendum further below for that specific fix, which was found
+and applied after this one — never identity fields, never
+`epistemic_state`) and in-place epistemic confirmation, respectively.
+Neither action's confirmation floor, result type, nor provenance rules
+changed by this correction. This correction touches only the row-level
+`updated_at` question and the now-narrower V8 scope it implied.
 
 **Confirmed:** no production code, schema, or tests changed by this
 correction — it is a documentation-only fix to the R025 report and the
@@ -813,3 +834,90 @@ entirely unstarted. The next substantial report remains **R026**.
 With this correction applied, R025's architecture is now genuinely
 **CLOSED for v0.1 implementation** — no schema question is left for an
 implementer to decide.
+
+---
+
+## Post-freeze CorrectRelation patch-shape consistency correction (2026-09-18)
+
+A second review of R025, after the V8/`updated_at` correction above, found
+a distinct contract mismatch: the frozen `CorrectRelationPayload` modeled
+`sensitivity` as `FieldPatch<Sensitivity>` — but `relations.sensitivity`
+is `TEXT NOT NULL` in the live V7 schema (§2), with no nullable
+representation whatsoever. `FieldPatch::Clear` on a non-nullable column
+has no legal target (`Clear` writes SQL `NULL`, which the `NOT NULL`
+constraint would reject at the DB layer) — this contradicted LifeOS's
+own already-established, already-implemented patch-shape rule:
+
+- **nullable domain field → `FieldPatch<T>`** (`Unchanged`/`Set`/`Clear`)
+- **non-nullable domain field → `Option<T>`** (`None` = unchanged,
+  `Some(v)` = set — no clear state, because there is nothing to clear to)
+
+This is not a new rule invented for Relation — it is the exact rule
+already governing every prior Update*/Correct* payload in this codebase.
+Confirmed by direct inspection: `CorrectMemoryPayload.sensitivity` (a
+`NOT NULL` field on `facts`, identical in kind to `relations.sensitivity`)
+is `Option<Sensitivity>`, not `FieldPatch<Sensitivity>`; `UpdateProjectPayload.status`,
+`UpdateMilestonePayload.status`, and `UpdateTaskPayload.status` (all
+`NOT NULL` columns) are likewise `Option<T>`, while genuinely nullable
+fields on those same payloads (`UpdateProjectPayload.description`,
+`.priority`, `.goal_id`; `UpdateMilestonePayload.target_date`;
+`UpdateTaskPayload.due_at`, `.project_id`, `.goal_id`) are `FieldPatch<T>`.
+R025's `CorrectRelationPayload.sensitivity` was the one place this run
+broke that established convention.
+
+**Final, corrected `CorrectRelationPayload`:**
+
+```rust
+pub(crate) struct CorrectRelationPayload {
+    pub relation_id: RelationId,
+    pub note: FieldPatch<String>,
+    pub confidence: FieldPatch<f32>,
+    pub sensitivity: Option<Sensitivity>,
+}
+// -> ActionOutcome<Relation>
+```
+
+**Exact patch semantics, per field:**
+
+- `note` (nullable, `FieldPatch<String>`): `Unchanged` → retain;
+  `Set(v)` → replace, bounded by `RELATION_NOTE_MAX_LEN = 4000`, no
+  normalization beyond the already-frozen §12 note policy; `Clear` →
+  `NULL`.
+- `confidence` (nullable, `FieldPatch<f32>`): `Unchanged` → retain;
+  `Set(v)` → `Some(v)`, requiring `v.is_finite() && 0.0 <= v <= 1.0`
+  (unchanged from the original freeze's confidence-bounds rule); `Clear`
+  → `NULL`.
+- `sensitivity` (`NOT NULL`, `Option<Sensitivity>`): `None` → retain;
+  `Some(v)` → replace. **There is no `Clear` state for `sensitivity` —
+  none is legal, since the column can never hold `NULL`.**
+
+**No-fields-to-correct rule, frozen now:** a payload where
+`note == FieldPatch::Unchanged` AND `confidence == FieldPatch::Unchanged`
+AND `sensitivity == None` is rejected, before confirmation or any DB
+read, using the existing generic `ValidationError::NoFieldsToUpdate` —
+no new Relation-specific error variant is introduced, matching how
+`UpdateGoal`/`UpdateProject`/`UpdateMilestone`/`UpdateTask` all already
+reuse the same generic variant. The check is purely structural ("was any
+patch requested?"), not semantic: a caller supplying
+`sensitivity = Some(existing.sensitivity)`, or `note = Set(existing_note)`,
+still counts as a requested update and is never coerced into a no-op —
+Core does not perform database-dependent same-value detection.
+
+**Confirmed:** no schema change — `relations.sensitivity` remains
+`NOT NULL`, no default added, no nullable conversion. The V8 scope
+established by the prior correction is unchanged: `relation_audit_log`
+only, nothing else; this correction does not reopen the `updated_at`
+decision. `CorrectRelation`'s every other frozen property is unchanged:
+same row, `ImportantChange` floor with the PK inferred-blocking overlay,
+active-Relation-required, mandatory `previous_snapshot`, audit
+`occurred_at = meta.requested_at`, Evidence untouched, `from_entity_id`/
+`to_entity_id`/`relation_type` immutable, `epistemic_state` untouched, no
+successor row, no `superseded_by_relation_id`, no `updated_at`. Only the
+`sensitivity` field's patch representation changed. No production code,
+schema, or tests changed by this correction.
+
+With both corrections applied, R025 remains **CLOSED for v0.1
+implementation**: the V8 scope is exact, the Rust domain shape is exact,
+the action names are exact, the payload shapes are exact, the patch
+semantics are exact per-field, and confirmation semantics are exact — no
+implementation-time choice remains for R026.

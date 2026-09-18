@@ -2727,9 +2727,13 @@ to proceed into implementation - see R016 §15 and R019 §23.
   carried by `relation_audit_log.occurred_at`, and `milestones` (V4)
   already proves a mutable M2 table needs no row-level `updated_at` to
   support correct in-place updates. `CorrectRelation` is deliberately
-  designed as an in-place metadata-only correction
-  (`note`/`confidence`/`sensitivity` via `FieldPatch`, never
-  `from`/`to`/`relation_type`), so no `superseded_by_relation_id`-
+  designed as an in-place metadata-only correction (`note`/`confidence`
+  via `FieldPatch`; `sensitivity` via `Option<Sensitivity>`, since
+  `relations.sensitivity` is `NOT NULL` and has no legal `Clear` state -
+  corrected 2026-09-18 by R025's own post-freeze patch-shape addendum
+  after the original freeze incorrectly modeled it as
+  `FieldPatch<Sensitivity>`; never `from`/`to`/`relation_type`), so no
+  `superseded_by_relation_id`-
   equivalent column is needed either - a genuine divergence from
   `CorrectMemory`'s successor-Fact pattern, justified by Relation's
   identity being the full `(from, relation_type, to)` triple with no

@@ -131,10 +131,13 @@ per-family dedicated-audit-table precedent, so a small additive V8
 before implementation - `relations.updated_at` is deliberately excluded
 from v0.1; `relation_audit_log.occurred_at` is the authoritative
 mutation timestamp. `CorrectRelation` is frozen as an in-place
-metadata-only correction (`note`/`confidence`/`sensitivity` only, never
-`from`/`to`/`relation_type`, which together form Relation's identity),
-so - unlike `CorrectMemory` - no successor-row/
-`superseded_by_relation_id` mechanism is needed. Episode actions and
+metadata-only correction of `note`/`confidence` (nullable, `FieldPatch<T>`)
+and `sensitivity` (`NOT NULL`, `Option<Sensitivity>` - corrected
+2026-09-18, the original freeze had incorrectly used `FieldPatch` for
+this non-nullable field) - never `from`/`to`/`relation_type`, which
+together form Relation's identity - so, unlike `CorrectMemory`, no
+successor-row/`superseded_by_relation_id` mechanism is needed. Episode
+actions and
 retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 §4o-§4v and §10,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
@@ -882,15 +885,19 @@ claim beyond that is made. `journal_mode` was measured (R020), not
 forced, at SQLite's own default (`delete`).
 
 **Relation action family CLOSED for v0.1 implementation, 2026-09-18 (R025,
-then corrected the same day by R025's own post-freeze schema-scope
-consistency addendum) — documentation only, no code/schema/tests
-changed.** `Relation`'s v0.1 public action set is
+then corrected the same day by two post-freeze addenda — a schema-scope
+consistency correction and a `CorrectRelation` patch-shape consistency
+correction) — documentation only, no code/schema/tests changed.**
+`Relation`'s v0.1 public action set is
 `AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`, deliberately
 not a generic `UpdateRelation`. Relation's identity is the full triple
 `(from_entity_id, relation_type, to_entity_id)` — unlike `Fact`, which has a
 separately-correctable `value` alongside its `(subject, predicate)` identity —
 so `CorrectRelation` is frozen as a narrow, **in-place** correction of only
-`note`/`confidence`/`sensitivity` (never the identity fields; changing those is
+`note`/`confidence` (nullable, `FieldPatch<T>`) and `sensitivity`
+(`NOT NULL`, `Option<Sensitivity>` — no `Clear` state exists for it,
+matching `CorrectMemoryPayload.sensitivity`'s precedent; never the
+identity fields — changing those is
 `ForgetRelation` + `AddRelation` for a different edge, mirroring how changing a
 Fact's subject/predicate is `AddMemory`, never `CorrectMemory`). Because
 `CorrectRelation` never creates a successor row, no `superseded_by_relation_id`
