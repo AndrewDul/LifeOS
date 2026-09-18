@@ -2560,15 +2560,23 @@ third production Personal Knowledge mutation - is implemented and
 proven (375/375 tests), and (2026-09-18, R024 §4v) Slice E
 (`ForgetMemory`) - the fourth production Personal Knowledge mutation
 and the first hard-delete action - is also implemented and proven
-(398/398 tests)**, all four frozen Memory actions now exist, and the
-recommended next step is **not automatically chosen** - R024 §34
-recommends among three candidates (Relation action-family freeze/
-implementation, Episode action-family freeze/implementation, or
-retrieval/`get_relevant_memory`/Context Pack) without deciding; Relation
-is the most natural next step (reuses the largest fraction of already-
-proven machinery) but explicitly requires its own dedicated freeze pass
-before any code, the same discipline R017-R019 applied to Personal
-Knowledge before any Fact-action code was written. `RecurringRule`
+(398/398 tests)**, all four frozen Memory actions now exist, and
+(2026-09-18, R025) the Relation action family's architecture is now
+**frozen for design** - `AddRelation`/`CorrectRelation`/`ConfirmRelation`/
+`ForgetRelation` names, payloads, confirmation floors, provenance rules,
+and privacy/deletion semantics are all fixed, with `CorrectRelation`
+deliberately designed as an in-place metadata-only correction (not a
+Fact-style successor chain), so no `superseded_by_relation_id`-equivalent
+is needed. R025 found current `V7` insufficient by one narrow, additive
+gap - **no `relation_audit_log` table exists**, and every M2 mutating
+action in this codebase writes to its own dedicated audit table with no
+exception - so a small V8 (`relation_audit_log`, required;
+`relations.updated_at`, recommended but not required) must be created
+before any Relation action code is written. No schema/code/tests changed
+in R025 itself - it is documentation only. The recommended next step is
+R026 (Relation foundation + V8 migration + `AddRelation`, combined since
+the foundation this time is small), followed by R027 `CorrectRelation`,
+R028 `ConfirmRelation`, R029 `ForgetRelation`. `RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2689,9 +2697,31 @@ to proceed into implementation - see R016 §15 and R019 §23.
   Knowledge mutation and the first hard-delete action - is now real,
   implemented, and tested (398/398). All four frozen Memory actions
   now exist.** No Tauri command layer wires any of them into the
-  running app yet. Relation actions, Episode actions, and retrieval/
-  Context Pack all remain entirely unstarted - R024 §34 recommends
-  among them without deciding.
+  running app yet. Episode actions and retrieval/Context Pack remain
+  entirely unstarted.
+- **RESOLVED (2026-09-18, M2 Personal Knowledge Relation Action-Family
+  Architecture Freeze, R025 above): the Relation action family
+  (`AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`) is
+  now fully frozen for design - no code, schema, or tests changed.**
+  Current `V7` was found insufficient by exactly one narrow, additive
+  gap: no `relation_audit_log` table exists, and this codebase has an
+  unbroken six-table precedent (`goal_audit_log`/`project_audit_log`/
+  `goal_relation_audit_log`/`milestone_audit_log`/`task_audit_log`/
+  `fact_audit_log`) of every M2 write path getting its own dedicated
+  audit table. A small V8 migration (`relation_audit_log`, required;
+  `relations.updated_at`, recommended but not strictly required - a real
+  precedent, `milestones`, already runs a mutable lifecycle without
+  `updated_at`) must be created before any Relation action is
+  implemented. `CorrectRelation` is deliberately designed as an in-place
+  metadata-only correction (`note`/`confidence`/`sensitivity` via
+  `FieldPatch`, never `from`/`to`/`relation_type`), so no
+  `superseded_by_relation_id`-equivalent column is needed - a genuine
+  divergence from `CorrectMemory`'s successor-Fact pattern, justified by
+  Relation's identity being the full `(from, relation_type, to)` triple
+  with no separate correctable "value" the way Fact has. Recommended next
+  implementation slices: R026 (Relation foundation + V8 migration +
+  `AddRelation`, combined), R027 `CorrectRelation`, R028
+  `ConfirmRelation`, R029 `ForgetRelation`.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2848,5 +2878,6 @@ summaries - open the file for full reasoning.
 | R022 | M2 Personal Knowledge CorrectMemory Slice C | `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md` |
 | R023 | M2 Personal Knowledge ConfirmMemory Slice D | `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md` |
 | R024 | M2 Personal Knowledge ForgetMemory Slice E | `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md` |
+| R025 | M2 Personal Knowledge Relation Action-Family Architecture Freeze | `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md` |
 
-Next report allocated will be **R025**.
+Next report allocated will be **R026**.

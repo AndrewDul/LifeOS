@@ -118,9 +118,20 @@ linked Evidence even when shared with a retained Fact/Relation/Episode,
 and deleting an orphaned Source/Entity only when truly orphaned (SELF
 is never deleted). `Delete` blocks every unconfirmed call regardless of
 provenance, and there is no Undo. All four frozen Memory actions now
-exist; Relation actions, Episode actions, and retrieval/Context Pack
-all remain entirely unstarted, and no Tauri command wires any Memory
-action into the running app yet. See `PROJECT_STATE.md` §4o-§4v,
+exist; no Tauri command wires any Memory action into the running app
+yet. **(2026-09-18, R025)** The Relation action family
+(`AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`) is
+now frozen for design, documentation only - no code/schema/tests
+changed. Current `V7` was found insufficient by one narrow gap: no
+`relation_audit_log` table exists, breaking this codebase's unbroken
+per-family dedicated-audit-table precedent, so a small additive V8 is
+required before implementation. `CorrectRelation` is frozen as an
+in-place metadata-only correction (`note`/`confidence`/`sensitivity`
+only, never `from`/`to`/`relation_type`, which together form Relation's
+identity), so - unlike `CorrectMemory` - no successor-row/
+`superseded_by_relation_id` mechanism is needed. Episode actions and
+retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
+§4o-§4v and §10,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
@@ -129,7 +140,8 @@ action into the running app yet. See `PROJECT_STATE.md` §4o-§4v,
 `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`,
 `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`,
 and
-`docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`.
+`docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`,
+`docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -863,6 +875,38 @@ on every encrypted connection (R020, correcting R019 §17's misnamed
 the forensic gap: freed pages are now actively overwritten, but no
 claim beyond that is made. `journal_mode` was measured (R020), not
 forced, at SQLite's own default (`delete`).
+
+**Relation action family frozen for design, 2026-09-18 (R025) — documentation
+only, no code/schema/tests changed.** `Relation`'s v0.1 public action set is
+`AddRelation`/`CorrectRelation`/`ConfirmRelation`/`ForgetRelation`, deliberately
+not a generic `UpdateRelation`. Relation's identity is the full triple
+`(from_entity_id, relation_type, to_entity_id)` — unlike `Fact`, which has a
+separately-correctable `value` alongside its `(subject, predicate)` identity —
+so `CorrectRelation` is frozen as a narrow, **in-place** correction of only
+`note`/`confidence`/`sensitivity` (never the identity fields; changing those is
+`ForgetRelation` + `AddRelation` for a different edge, mirroring how changing a
+Fact's subject/predicate is `AddMemory`, never `CorrectMemory`). Because
+`CorrectRelation` never creates a successor row, no `superseded_by_relation_id`
+mechanism is needed — a deliberate divergence from `CorrectMemory`'s
+successor-Fact pattern, not an oversight. `ConfirmRelation` mirrors
+`ConfirmMemory` exactly (`INFERRED`/`OBSERVED`/`DISPUTED` → `USER_CONFIRMED` in
+place, already-confirmed rejected as a no-op). `ForgetRelation` mirrors
+`ForgetMemory`'s full privacy-safe deletion algorithm, including the
+`TransactionBehavior::Immediate` fix R024's hardening pass added — built in
+from the start this time rather than as a follow-up. R025 found current `V7`
+insufficient by exactly one narrow, additive gap: **no `relation_audit_log`
+table exists**, breaking this codebase's unbroken per-family
+dedicated-audit-table precedent (`goal_audit_log`/`project_audit_log`/
+`goal_relation_audit_log`/`milestone_audit_log`/`task_audit_log`/
+`fact_audit_log`) — a small V8 (`relation_audit_log`, required;
+`relations.updated_at`, recommended but not required, since `milestones`
+already proves a mutable table can run its own lifecycle without one) must be
+created before any Relation action is implemented. No `Relation`
+deduplication, no automatic inverse/symmetric edges, and no self-edge
+relaxation (the existing DB `CHECK (from_entity_id <> to_entity_id)` is
+reaffirmed correct). Full reasoning, the ten-plus Relation-vs-Fact boundary
+examples, and the complete gap-analysis table are in
+`docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
