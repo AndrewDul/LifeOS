@@ -507,3 +507,238 @@ pub(in crate::services) fn confirm_fact_epistemic_state(
     }
     Ok(())
 }
+
+// --- ForgetMemory (M2 Personal Knowledge Slice E, 2026-09-18) ----------
+//
+// R019's final 14-step privacy-safe hard-deletion algorithm -
+// `services::forget_memory` orchestrates these narrow, single-purpose
+// functions in the exact frozen order. No generic `delete_entity`/
+// `delete_evidence_link`/`update_fact` exists - each function here does
+// exactly one thing and nothing else, matching `update_fact_as_
+// superseded`/`confirm_fact_epistemic_state`'s established discipline.
+
+/// Step 5 - scrubs every `fact_audit_log.previous_snapshot` for the
+/// target Fact, covering payloads left by `CorrectMemory`/
+/// `ConfirmMemory` (or any future snapshot-bearing action). Touches
+/// ONLY `previous_snapshot`; every other audit column (`id`/`fact_id`/
+/// `action_type`/`actor`/`provenance`/`confirmation_class`/
+/// `occurred_at`) survives untouched - old audit rows become
+/// payload-free structural history, never deleted outright. May affect
+/// 0..N rows (a Fact with no snapshot-bearing prior audit row is a
+/// normal, not an error, case).
+pub(in crate::services) fn scrub_fact_audit_snapshots(
+    conn: &Connection,
+    fact_id: FactId,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE fact_audit_log SET previous_snapshot = NULL WHERE fact_id = ?1 AND previous_snapshot IS NOT NULL",
+        params![fact_id.to_string()],
+    )
+}
+
+/// Step 6 - clears every INBOUND `superseded_by_fact_id` reference
+/// pointing at the target Fact, WITHOUT rewiring the chain (R019 - a
+/// predecessor's own successor pointer becomes `NULL`, never
+/// reassigned to some other Fact further down the chain; that would
+/// falsify history). Touches ONLY `superseded_by_fact_id`/`updated_at`
+/// - `valid_until`/`epistemic_state`/every semantic field on the
+/// affected predecessor(s) survive untouched. May affect 0..N rows
+/// (unlike `update_fact_as_superseded`'s exactly-one guarantee) - a
+/// standalone or terminal Fact being forgotten has none.
+pub(in crate::services) fn clear_inbound_supersession_refs(
+    conn: &Connection,
+    target_fact_id: FactId,
+    timestamp: DateTime<Utc>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE facts SET superseded_by_fact_id = NULL, updated_at = ?2 WHERE superseded_by_fact_id = ?1",
+        params![target_fact_id.to_string(), timestamp.to_rfc3339()],
+    )
+}
+
+/// Step 3 - every `EvidenceId` linked to the target Fact through
+/// `fact_evidence`. Supports the genuine 0..N cases `V7` allows (no DB
+/// `CHECK` enforces "exactly one Evidence per Fact") - a Fact with zero
+/// linked Evidence rows returns an empty `Vec`, not an error.
+pub(in crate::services) fn list_evidence_ids_for_fact(
+    conn: &Connection,
+    fact_id: FactId,
+) -> rusqlite::Result<Vec<EvidenceId>> {
+    let mut stmt = conn.prepare("SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1")?;
+    let mut rows = stmt.query(params![fact_id.to_string()])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id_str: String = row.get(0)?;
+        ids.push(EvidenceId::parse(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?);
+    }
+    Ok(ids)
+}
+
+/// Step 4 - the `SourceId` a single collected `Evidence` row points at
+/// (`caller` deduplicates across every collected `EvidenceId` before
+/// deciding which Sources are candidates for orphan cleanup, since
+/// multiple Evidence rows may legitimately share one Source).
+pub(in crate::services) fn get_source_id_for_evidence(
+    conn: &Connection,
+    evidence_id: EvidenceId,
+) -> rusqlite::Result<Option<SourceId>> {
+    let source_id_str: Option<String> = conn
+        .query_row(
+            "SELECT source_id FROM evidence WHERE id = ?1",
+            params![evidence_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    source_id_str
+        .map(|s| {
+            SourceId::parse(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Steps 7 - deletes every join row referencing one collected
+/// `EvidenceId`, across all three Evidence-referencing join tables
+/// (`fact_evidence`/`relation_evidence`/`episode_evidence`) - even a
+/// link belonging to a DIFFERENT, retained Fact/Relation/Episode.
+/// Privacy of the forgotten Evidence outranks preservation of a shared
+/// join row (R018/R019's Evidence privacy-first rule, §14 of the Slice
+/// E brief) - the retained Fact/Relation/Episode OBJECT survives, it
+/// merely loses that one piece of Evidence support.
+pub(in crate::services) fn delete_evidence_links_for_evidence(
+    conn: &Connection,
+    evidence_id: EvidenceId,
+) -> rusqlite::Result<()> {
+    let id = evidence_id.to_string();
+    conn.execute(
+        "DELETE FROM fact_evidence WHERE evidence_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM relation_evidence WHERE evidence_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM episode_evidence WHERE evidence_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Step 8 - hard-deletes one collected `Evidence` row. Always called,
+/// even when that Evidence was also linked to another Fact/Relation/
+/// Episode (its join rows were already removed by `delete_evidence_
+/// links_for_evidence` first, so this delete is FK-safe against
+/// `fact_evidence`/`relation_evidence`/`episode_evidence`'s `ON DELETE
+/// RESTRICT`).
+pub(in crate::services) fn delete_evidence(
+    conn: &Connection,
+    evidence_id: EvidenceId,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM evidence WHERE id = ?1",
+        params![evidence_id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Step 9 - deletes a collected `Source` if and only if it is now
+/// orphaned (zero surviving `Evidence` rows anywhere reference it) - a
+/// single guarded, atomic statement rather than a separate
+/// check-then-delete (no race, naturally idempotent if ever called
+/// twice for the same id: the second call's `NOT EXISTS` still holds
+/// and simply matches zero rows). A Source still referenced by a
+/// RETAINED Evidence row (shared across Facts) is left byte-for-byte
+/// unchanged - never deleted merely because ITS use by the forgotten
+/// Fact is gone.
+pub(in crate::services) fn delete_source_if_orphan(
+    conn: &Connection,
+    source_id: SourceId,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "DELETE FROM sources WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM evidence WHERE source_id = ?1)",
+        params![source_id.to_string()],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Step 10 - a defensive sweep deleting any remaining `fact_evidence`
+/// row for the target Fact. Normally a no-op in production (step 7
+/// already removed every link reachable through the Evidence ids
+/// collected in step 3), kept anyway as R019's own explicit defense-in-
+/// depth requirement, never removed merely because it is redundant in
+/// the ordinary case.
+pub(in crate::services) fn delete_fact_evidence_links_for_fact(
+    conn: &Connection,
+    fact_id: FactId,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM fact_evidence WHERE fact_id = ?1",
+        params![fact_id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Step 11 - the ONLY hard-delete path for a `facts` row. `changed !=
+/// 1` is a real runtime error in every build profile (matching
+/// `update_fact_as_superseded`/`confirm_fact_epistemic_state`'s
+/// established discipline, never a `debug_assert!`) - the target must
+/// already have been validated to exist by `services::forget_memory`'s
+/// own preflight `get_fact`, so any other outcome here means something
+/// changed unexpectedly between preflight and this statement. The
+/// diagnostic is fixed and carries no Fact content.
+pub(in crate::services) fn delete_fact_forget_target(
+    conn: &Connection,
+    fact_id: FactId,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "DELETE FROM facts WHERE id = ?1",
+        params![fact_id.to_string()],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some("ForgetMemory target Fact delete did not affect exactly one row".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+/// Step 12 - deletes ONE candidate Entity (the target Fact's subject,
+/// or its object if the value was an `EntityRef`) if and only if it is
+/// now orphaned - a single guarded, atomic statement enforcing the
+/// exact frozen retention predicate (R019 §12 of the Slice E brief):
+/// retained if ANY surviving row references it via
+/// `facts.subject_entity_id`/`facts.object_entity_id`/
+/// `relations.from_entity_id`/`relations.to_entity_id`/
+/// `episode_entities.entity_id`; `domain_ref` alone never retains it.
+/// `is_self = 0` is part of the guard itself - this function can NEVER
+/// delete the SELF Entity, structurally, regardless of what
+/// `entity_id` the caller passes. Must only ever be called AFTER the
+/// target Fact itself has been deleted (step 11) - otherwise the
+/// target Fact's own reference would always count as "surviving" and
+/// nothing would ever be considered orphaned. Returns whether a row
+/// was actually deleted.
+pub(in crate::services) fn delete_entity_if_orphan_non_self(
+    conn: &Connection,
+    entity_id: EntityId,
+) -> rusqlite::Result<bool> {
+    let id = entity_id.to_string();
+    let changed = conn.execute(
+        "DELETE FROM entities WHERE id = ?1 AND is_self = 0
+         AND NOT EXISTS (SELECT 1 FROM facts WHERE subject_entity_id = ?1)
+         AND NOT EXISTS (SELECT 1 FROM facts WHERE object_entity_id = ?1)
+         AND NOT EXISTS (SELECT 1 FROM relations WHERE from_entity_id = ?1)
+         AND NOT EXISTS (SELECT 1 FROM relations WHERE to_entity_id = ?1)
+         AND NOT EXISTS (SELECT 1 FROM episode_entities WHERE entity_id = ?1)",
+        params![id],
+    )?;
+    Ok(changed > 0)
+}

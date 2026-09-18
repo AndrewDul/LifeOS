@@ -1564,6 +1564,59 @@ pub(crate) fn validate_confirm_memory(
     })
 }
 
+// --- Personal Knowledge: ForgetMemory (M2 Personal Knowledge Slice E,
+// 2026-09-18) -------------------------------------------------------------
+//
+// "The user wants this one exact Fact removed from LifeOS's canonical
+// Personal Knowledge" - the first, and only, hard-DELETE Memory action.
+// Never soft delete, never a `Stale` transition, never a correction.
+// The target Fact is physically removed from the SQLite model and is
+// not retrievable as a historical Fact afterward (R019's final 14-step
+// privacy-safe algorithm - `services::forget_memory`).
+//
+// Type floor is `ConfirmationClass::Delete` - the highest severity rung
+// (4), always blocking before execution regardless of provenance: even
+// `effective_class(Delete, Explicit)` stays `Delete` (severity 4 is
+// never dominated by either provenance-derived class), so a direct
+// explicit delete request still requires `meta.confirmed == true` -
+// unlike every other Memory action, there is no "the call itself is the
+// confirmation" path here. Uses the exact same generic
+// `effective_class`/`blocks_until_confirmed` gate every other action
+// already uses - no new helper, no change to `ConfirmationClass` or the
+// generic ladder.
+
+/// The frozen `ForgetMemory` payload - a single typed `FactId`, nothing
+/// else. No `reason`/`value`/`Source`/`Evidence`/snapshot input/delete-
+/// mode/cascade option - targets exactly one Fact, never a bulk
+/// "forget everything about X."
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForgetMemoryPayload {
+    pub fact_id: FactId,
+}
+
+/// `validate_forget_memory`'s success output - identical shape to
+/// `ForgetMemoryPayload` (nothing to normalize, same reasoning as
+/// `NormalizedConfirmMemory`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NormalizedForgetMemory {
+    pub fact_id: FactId,
+}
+
+/// Pure structural validation for `ForgetMemory` - deliberately
+/// minimal, same reasoning as `validate_confirm_memory`. Unlike
+/// `ConfirmMemory`, there is no "already in the target state" check
+/// here at all, pure or otherwise: `ForgetMemory` does not care whether
+/// the target Fact is active or historical (R019 - the right to forget
+/// applies to historical knowledge too), so no `domain::is_active_fact`
+/// check exists anywhere in this action's validation path.
+pub(crate) fn validate_forget_memory(
+    payload: &ForgetMemoryPayload,
+) -> Result<NormalizedForgetMemory, Vec<ValidationError>> {
+    Ok(NormalizedForgetMemory {
+        fact_id: payload.fact_id,
+    })
+}
+
 /// `LIFEOS_SPEC.md` §5.4 - never a persisted result, a bare string
 /// error, and a "confirmation required" response all mixed together;
 /// each is its own variant. `services` always writes an audit-log entry

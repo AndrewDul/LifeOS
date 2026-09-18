@@ -173,10 +173,10 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-375 automated tests prove all of this (262 of them covering the
+398 automated tests prove all of this (262 of them covering the
 CRUD/relation M2 entities below plus storage/key-lifecycle hardening;
-113 more covering M2 Personal Knowledge Slices A/B/C/D,
-§4r/§4s/§4t/§4u - the full
+136 more covering M2 Personal Knowledge Slices A/B/C/D/E,
+§4r/§4s/§4t/§4u/§4v - the full
 breakdown by category: 9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
@@ -253,19 +253,28 @@ confirmed no-op rejection, inactive-Fact rejection via the reused
 in-place two-field mutation contract, no Entity/Source/Evidence/
 Relation/Episode side effects, audit-field/snapshot/timestamp
 exactness, a `DISPUTED`-sibling non-interference proof, a forced-audit-
-failure rollback proof, and a direct guarded-update repo-level matrix.
+failure rollback proof, and a direct guarded-update repo-level matrix,
+plus (R024, 2026-09-18) 23 new M2 Personal Knowledge ForgetMemory Slice
+E tests - the first hard-DELETE action's five-scenario confirmation
+matrix (`Delete` blocks every unconfirmed call, `Explicit` included),
+active/historical target eligibility, the exact 14-step transaction
+(audit-snapshot scrubbing, inbound-supersession clearing without
+rewiring, Evidence privacy-first deletion even when shared with a
+retained Fact/Relation/Episode, Source/Entity orphan-vs-shared
+lifecycle, hard Fact deletion), a full supersession-chain matrix, a
+ten-case Entity retention matrix, and two independent rollback proofs.
 **The Goal/Project/GoalRelation/Milestone/Task action layer is still
 not wired into the running app** - no Tauri command layer exists, so
 the UI cannot create/see real goals, projects, relations, milestones,
 or tasks yet. **The Personal Knowledge Layer now has a real `V7`
 schema, a `SELF` entity bootstrap, narrow `get_entity`/`get_fact` reads
-(R020), a working `AddMemory` action (R021), a working `CorrectMemory`
-action (R022), and a working `ConfirmMemory` action (R023) - but no
-`ForgetMemory` action exists yet**, and no Tauri command layer exists
-for any implemented Memory action, so no Personal Knowledge data can be
-created, corrected, or confirmed through the running app yet, only
-through direct Core calls in tests (Slice E+/UI wiring both still
-pending).
+(R020), and all four frozen Memory actions implemented: `AddMemory`
+(R021), `CorrectMemory` (R022), `ConfirmMemory` (R023), and
+`ForgetMemory` (R024)**, and no Tauri command layer exists for any of
+them, so no Personal Knowledge data can be created, corrected,
+confirmed, or forgotten through the running app yet, only through
+direct Core calls in tests (Relation/Episode/retrieval + UI wiring both
+still pending).
 
 Repository contents as of this run:
 
@@ -2177,40 +2186,105 @@ Fact row in place - no successor, no new Entity/Source/Evidence.
 Full evidence, exact execution ordering, and every test result:
 `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`.
 
+### 4v. M2 Personal Knowledge Slice E — ForgetMemory (2026-09-18, R024)
+
+**The fourth production Personal Knowledge mutation, and the first
+HARD-DELETE action.** `services::forget_memory(conn, meta,
+ForgetMemoryPayload) -> ActionOutcome<FactId>` - "the user wants this
+one exact Fact removed from LifeOS's canonical Personal Knowledge,"
+implementing R019's final 14-step privacy-safe algorithm exactly.
+`ForgetMemoryPayload { fact_id: FactId }` - a single field. **Result is
+`ActionOutcome<FactId>`, never `ActionOutcome<Fact>`** - a success
+result never hands back the semantic object just forgotten, proven at
+the type level.
+
+- **Floor `Delete`** (severity 4) - `effective_class(Delete,
+  provenance)` stays `Delete` regardless of provenance, so
+  `blocks_until_confirmed` blocks EVERY unconfirmed call, `Explicit`
+  included - unlike every other Memory action, a direct explicit
+  delete request is not itself sufficient confirmation. **No Undo**:
+  `ActionOutcome<T>` has no Undo concept for any action to opt out of;
+  the new audit marker's `previous_snapshot` is unconditionally `None`.
+- **`domain::is_active_fact` is deliberately never called** - active
+  and historical/`Stale` Facts, at any position in a supersession
+  chain, are all eligible to be forgotten (R019 - the right to forget
+  applies to historical knowledge too).
+- **The exact 14 steps**: validate target exists -> capture/dedupe
+  candidate subject/object Entity ids -> collect linked Evidence ids ->
+  collect their Source ids (deduped) -> scrub every existing
+  `fact_audit_log.previous_snapshot` for this Fact -> clear every
+  inbound `superseded_by_fact_id` reference WITHOUT rewiring the chain
+  -> delete every `fact_evidence`/`relation_evidence`/`episode_evidence`
+  row referencing the collected Evidence (even if shared with another
+  retained Fact/Relation/Episode - privacy-first, R018/R019) -> delete
+  the collected Evidence rows -> delete each collected Source only if
+  now orphaned -> a defensive `fact_evidence` sweep -> hard-delete the
+  target Fact (runtime-enforced exactly-one, never `debug_assert!`) ->
+  delete each candidate Entity only if now orphaned across every
+  referencing table (SELF never deleted, `domain_ref` alone never
+  retains an orphan) -> insert exactly one minimal, payload-free
+  `ForgetMemory` audit marker -> `COMMIT`.
+- **Entity retention predicate** (reused for `ForgetMemory` only, no
+  new global rule): retained if any surviving row references it via
+  `facts.subject_entity_id`/`facts.object_entity_id`/
+  `relations.from_entity_id`/`relations.to_entity_id`/
+  `episode_entities.entity_id` - otherwise deleted (never SELF).
+- **Full atomic rollback proven twice** (a forced final-audit-insert
+  failure against a rich state - inbound predecessor, the target's own
+  payload-bearing `CorrectMemory` snapshot, Evidence, Source, a
+  candidate orphan Entity - and a forced mid-transaction Fact-delete
+  failure after earlier scrub/clear steps already ran) - every prior
+  scrub/clear/delete in the same call rolls back completely.
+- **No `V7` migration change** - the schema already supported
+  `ForgetMemory` completely (the deliberately non-FK `fact_audit_log.
+  fact_id`, R017 §20, is exactly what makes step 13 possible); no V8
+  was created.
+- **23 new tests** (398 total, up from 375 - all 375 prior tests remain
+  green, unmodified): 1 direct pure-layer test (`actions::tests`) + 22
+  database-integration tests (`services::tests`) covering the five-
+  scenario confirmation matrix, active/historical target eligibility,
+  the audit marker's fields and NULL snapshot, hard-delete proof, the
+  full supersession-chain matrix (middle/predecessor/terminal), Evidence
+  privacy-first deletion (including raw Relation/Episode/other-Fact
+  shared-Evidence fixtures and a zero-Evidence fixture), the Source
+  orphan/shared matrix, a ten-case Entity retention matrix, both
+  audit-snapshot-scrub proofs (`ConfirmMemory`- and `CorrectMemory`-
+  sourced) plus a structural-metadata-survives proof, and both rollback
+  proofs.
+- **All four frozen Memory actions (`AddMemory`/`CorrectMemory`/
+  `ConfirmMemory`/`ForgetMemory`) now exist.** Relation actions, Episode
+  actions, and retrieval/Context Pack all remain entirely unstarted,
+  explicitly not started this run.
+
+Full evidence, exact execution ordering, and every test result:
+`docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
 on an existing M2 entity is now built. The Personal Knowledge Layer's
 v0.1 architecture was frozen (R017 §4o), hardened through two rounds of
 post-freeze review (R018 §4p/R019 §4q, 17 gaps found and fixed, four
-critical), **Slice A** (2026-09-18, R020 §4r), **Slice B (`AddMemory`)**
+critical), and **all four frozen Memory actions are now implemented and
+proven**: **Slice A** (2026-09-18, R020 §4r), **Slice B (`AddMemory`)**
 (2026-09-18, R021 §4s), **Slice C (`CorrectMemory`)** (2026-09-18, R022
-§4t), and **Slice D (`ConfirmMemory`) - the third production Personal
-Knowledge mutation - are all implemented and proven** (2026-09-18, R023
-§4u; 375/375 tests passing). The next *implementation* step is **Slice
-E (`ForgetMemory`)** - R023 §30's exact recommendation: qualitatively
-different from Slices B-D since it is the first *deletion* action
-(`ConfirmationClass::Delete`, one severity rung above `ImportantChange`,
-not yet exercised by any Memory action), must implement R019 §10's full
-multi-step deletion algorithm (true deletion of the target Fact,
-orphan-Entity cleanup, and scrubbing `fact_audit_log.previous_snapshot`
-for every audit row targeting the deleted Fact - the exact property the
-non-enforced-FK `fact_id` column was designed to make possible), and
-needs its own careful review of exactly which rows besides the Fact
-itself are safe to delete versus must be preserved - a substantially
-larger design surface deserving its own dedicated read-first pass over
-R019 §8-§11 before any code. `RecurringRule` remains a separate,
-still-deferred option, still needing its own design/freeze pass before
-any code - `Task.recurring_rule_id` stays `NULL`-only until then, §4j.
-R017-R019 already resolved the open questions a Personal Knowledge
-vertical slice would otherwise have hit mid-implementation (§4c's
-lesson from the removed terminal-status rule; §4e's/§4g's action-set-gap
-documentation-before-code discipline; §4f's relation-integrity rules and
-§4i's order_index-uniqueness rule both being frozen/resolved *before or
-as part of* coding rather than invented ad hoc mid-implementation - the
-same discipline R017-R019 applied to Personal Knowledge, and Slices
-A/B/C/D's implementations needed to invent nothing further beyond what
-§6/§7 above and R022/R023's own sections required).
+§4t), **Slice D (`ConfirmMemory`)** (2026-09-18, R023 §4u), and **Slice
+E (`ForgetMemory`) - the first hard-delete action** (2026-09-18, R024
+§4v; 398/398 tests passing). The next *implementation* step is **not
+automatically chosen** - R024 §34 recommends, without deciding, among
+three candidates: the **Relation action-family freeze/implementation**
+(Slice F - `relations` is schema-complete but its action set was never
+frozen), the **Episode action-family freeze/implementation** (Slice G -
+same reasoning), or **retrieval/`get_relevant_memory`/Context Pack**
+(Slice H - depends on real Fact data existing to retrieve, and its own
+privacy-firewall shape was only ever sketched, never frozen to
+field-level precision). Relation is the most natural next step (reuses
+the largest fraction of already-proven machinery), but explicitly
+requires its own dedicated freeze pass before any code - the same
+discipline R017-R019 applied to Personal Knowledge before any Fact-
+action code was written. `RecurringRule` remains a separate, still-
+deferred option, still needing its own design/freeze pass before any
+code - `Task.recurring_rule_id` stays `NULL`-only until then, §4j.
 
 ---
 
@@ -2298,7 +2372,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 375 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 398 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -2437,10 +2511,21 @@ inactive Fact via the reused `is_active_fact` predicate, leaves a
 `DISPUTED` sibling completely untouched (no contradiction resolution),
 mutates exactly `epistemic_state`/`updated_at` (proven via full
 struct comparison), and atomically rolls back on a forced audit
-failure (14 new tests). **Test count rose from 200 to 233 to 250 to 262
-to 285 to 293 to 324 to 327 to 356 to 361 to 375 across these three
-days' runs** (361→375 this run, +14) - all previously-covered behavior
-remains green.
+failure (14 new tests), and (as of 2026-09-18, R024, §4v) that
+`ForgetMemory` - the fourth production Personal Knowledge mutation and
+the first hard-delete action - blocks EVERY unconfirmed call regardless
+of provenance, may target an active OR historical Fact at any position
+in a supersession chain, executes R019's exact 14-step transaction
+(scrubbing every existing audit snapshot for the target, clearing
+inbound supersession references without rewiring the chain, always
+deleting linked Evidence even when shared with a retained Fact/
+Relation/Episode, deleting an orphaned Source/Entity only when truly
+orphaned, hard-deleting the target Fact itself), inserts exactly one
+payload-free audit marker, and atomically rolls back on both a
+final-step and a mid-step forced failure (23 new tests). **Test count
+rose from 200 to 233 to 250 to 262 to 285 to 293 to 324 to 327 to 356 to
+361 to 375 to 398 across these three days' runs** (375→398 this run,
++23) - all previously-covered behavior remains green.
 
 ---
 
@@ -2470,19 +2555,23 @@ production Personal Knowledge mutation - is implemented and proven
 (2026-09-18, R022 §4t) Slice C (`CorrectMemory`) - the second
 production Personal Knowledge mutation - is implemented and proven
 (361/361 after R022's own post-run temporal-integrity/audit
-hardening), and (2026-09-18, R023 §4u) Slice D (`ConfirmMemory`) - the
-third production Personal Knowledge mutation - is also implemented and
-proven (375/375 tests)**, the recommended next step is **Slice E
-(`ForgetMemory`)** - R023 §30's exact recommendation - the first
-*deletion* action (`ConfirmationClass::Delete`, not yet exercised by
-any Memory action), requiring R019 §10's full multi-step deletion
-algorithm including scrubbing `fact_audit_log.previous_snapshot` for
-every audit row targeting the deleted Fact - a substantially larger
-design surface than Slices B-D, deserving its own dedicated read-first
-pass over R019 §8-§11 before any code. `RecurringRule` remains
-deliberately deferred (§4j), still needing its own design/freeze pass
-before any code. M2's storage/security foundation is safe to proceed
-into implementation - see R016 §15 and R019 §23.
+hardening), (2026-09-18, R023 §4u) Slice D (`ConfirmMemory`) - the
+third production Personal Knowledge mutation - is implemented and
+proven (375/375 tests), and (2026-09-18, R024 §4v) Slice E
+(`ForgetMemory`) - the fourth production Personal Knowledge mutation
+and the first hard-delete action - is also implemented and proven
+(398/398 tests)**, all four frozen Memory actions now exist, and the
+recommended next step is **not automatically chosen** - R024 §34
+recommends among three candidates (Relation action-family freeze/
+implementation, Episode action-family freeze/implementation, or
+retrieval/`get_relevant_memory`/Context Pack) without deciding; Relation
+is the most natural next step (reuses the largest fraction of already-
+proven machinery) but explicitly requires its own dedicated freeze pass
+before any code, the same discipline R017-R019 applied to Personal
+Knowledge before any Fact-action code was written. `RecurringRule`
+remains deliberately deferred (§4j), still needing its own design/
+freeze pass before any code. M2's storage/security foundation is safe
+to proceed into implementation - see R016 §15 and R019 §23.
 
 ---
 
@@ -2592,14 +2681,17 @@ into implementation - see R016 §15 and R019 §23.
   Slice C, R022 §4t above, then R022's own post-run temporal-integrity/
   audit hardening): `CorrectMemory` - the second production Personal
   Knowledge mutation - is real, implemented, and tested (361/361).**
-- **RESOLVED in part (2026-09-18, M2 Personal Knowledge ConfirmMemory
-  Slice D, R023 §4u above): `ConfirmMemory` - the third production
-  Personal Knowledge mutation - is now real, implemented, and tested
-  (375/375).** **Still not implemented: `ForgetMemory`** - a Fact can
-  never yet be deleted through the action layer, and no Tauri command
-  layer wires `AddMemory`/`CorrectMemory`/`ConfirmMemory` into the
-  running app yet either. The recommended next implementation slice is
-  Slice E (`ForgetMemory`), R023 §30.
+- **RESOLVED (2026-09-18, M2 Personal Knowledge ConfirmMemory Slice D,
+  R023 §4u above): `ConfirmMemory` - the third production Personal
+  Knowledge mutation - is real, implemented, and tested (375/375).**
+- **RESOLVED (2026-09-18, M2 Personal Knowledge ForgetMemory Slice E,
+  R024 §4v above): `ForgetMemory` - the fourth production Personal
+  Knowledge mutation and the first hard-delete action - is now real,
+  implemented, and tested (398/398). All four frozen Memory actions
+  now exist.** No Tauri command layer wires any of them into the
+  running app yet. Relation actions, Episode actions, and retrieval/
+  Context Pack all remain entirely unstarted - R024 §34 recommends
+  among them without deciding.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2755,5 +2847,6 @@ summaries - open the file for full reasoning.
 | R021 | M2 Personal Knowledge AddMemory Slice B | `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md` |
 | R022 | M2 Personal Knowledge CorrectMemory Slice C | `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md` |
 | R023 | M2 Personal Knowledge ConfirmMemory Slice D | `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md` |
+| R024 | M2 Personal Knowledge ForgetMemory Slice E | `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md` |
 
-Next report allocated will be **R024**.
+Next report allocated will be **R025**.

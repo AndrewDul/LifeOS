@@ -8,8 +8,8 @@
 use super::*;
 use crate::actions::{
     ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmMemoryPayload, ConfirmationClass,
-    CorrectMemoryPayload, EntityInputRef, FactValueInput, FieldPatch, NewEntityData,
-    NewEvidenceData, NewSourceData, Provenance, SourceRef, ValidationError,
+    CorrectMemoryPayload, EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload,
+    NewEntityData, NewEvidenceData, NewSourceData, Provenance, SourceRef, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
@@ -13568,5 +13568,1535 @@ fn req_cfm_repo_confirm_fact_epistemic_state_matrix() {
     assert!(
         result.is_err(),
         "[req_cfm_repo_matrix] FAIL - missing FactId should be rejected, not silently Ok, got {result:?}"
+    );
+}
+
+// =========================================================================
+// M2 Personal Knowledge Slice E - ForgetMemory (2026-09-18)
+//
+// Evidence for
+// `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`.
+// The fourth production Personal Knowledge mutation, and the first
+// hard-DELETE action - R019's final 14-step privacy-safe algorithm.
+// Database-dependent behavior only - the trivial pure `validate_forget_
+// memory` is tested directly in `actions::tests` instead.
+// =========================================================================
+
+fn mk_fm_payload(fact_id: FactId) -> ForgetMemoryPayload {
+    ForgetMemoryPayload { fact_id }
+}
+
+/// `ui_explicit()` with `confirmed = true` - `Delete` blocks EVERY
+/// unconfirmed call, `Explicit` included, so most success-path
+/// `ForgetMemory` tests need this rather than plain `ui_explicit()`.
+fn confirmed_explicit() -> ActionMeta {
+    let mut meta = ui_explicit();
+    meta.confirmed = true;
+    meta
+}
+
+/// Creates a fresh, standalone active Fact via `add_memory` - the
+/// standard fixture most `ForgetMemory` tests start from.
+fn mk_fm_target(conn: &mut Connection) -> Fact {
+    match add_memory(conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[fm target setup] FAIL - add_memory failed: {other:?}"),
+    }
+}
+
+/// Creates a brand-new, non-SELF Entity via a scratch `AddMemory` call
+/// (`Entity(New(..))` as the value) and returns its id - the Fact that
+/// created it is otherwise irrelevant to the caller.
+fn mk_fm_second_entity(conn: &mut Connection) -> EntityId {
+    let payload = AddMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "FM Second Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..mk_am_payload()
+    };
+    match add_memory(conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => match value.value {
+            FactValue::EntityRef(id) => id,
+            other => panic!("[fm second entity setup] FAIL - expected EntityRef, got {other:?}"),
+        },
+        other => panic!("[fm second entity setup] FAIL - add_memory failed: {other:?}"),
+    }
+}
+
+/// Raw fixture - no production write path creates `relations` rows
+/// (R019 §13, unchanged by this slice). `from_entity_id`/`to_entity_id`
+/// must differ (`CHECK (from_entity_id <> to_entity_id)`).
+fn insert_raw_relation(
+    conn: &Connection,
+    from_entity_id: EntityId,
+    to_entity_id: EntityId,
+) -> String {
+    let id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, epistemic_state, sensitivity, valid_from, created_at)
+         VALUES (?1, ?2, ?3, 'test_relation', 'OBSERVED', 'INTERNAL', ?4, ?4)",
+        rusqlite::params![id, from_entity_id.to_string(), to_entity_id.to_string(), now],
+    )
+    .unwrap();
+    id
+}
+
+/// Raw fixture - no production write path creates `episodes` rows
+/// (R019 §13, unchanged by this slice).
+fn insert_raw_episode(conn: &Connection) -> String {
+    let id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO episodes (id, summary, started_at, sensitivity, created_at, updated_at)
+         VALUES (?1, 'test episode', ?2, 'INTERNAL', ?2, ?2)",
+        rusqlite::params![id, now],
+    )
+    .unwrap();
+    id
+}
+
+/// Forces the FINAL `facts` `DELETE` (step 11) to fail, proving the
+/// earlier steps in the same transaction (audit scrub, inbound-
+/// supersession clearing, Evidence/Source deletion) all roll back too.
+/// A test-only trigger, no production failure flag.
+fn install_fact_delete_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_fact_delete_failure
+         BEFORE DELETE ON facts
+         BEGIN
+             SELECT RAISE(FAIL, 'forced fact delete failure');
+         END;",
+    )
+    .expect("failed to install the forced fact-delete-failure trigger");
+}
+
+fn remove_fact_delete_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_fact_delete_failure;")
+        .expect("failed to remove the forced fact-delete-failure trigger");
+}
+
+// --- Confirmation matrix (R024 §27) -------------------------------------
+
+/// `Delete` blocks EVERY unconfirmed call, `Explicit` included - unlike
+/// every other Memory action, there is no "the call itself is the
+/// confirmation" path for a hard delete. A nonexistent `FactId` proves
+/// the target is never fetched before consent.
+#[test]
+fn req_fm_conf_a_explicit_unconfirmed_blocks_before_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    match forget_memory(&mut conn, ui_explicit(), mk_fm_payload(FactId::new())) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::Delete);
+        }
+        other => {
+            panic!("[req_fm_conf_a] FAIL - expected ConfirmationRequired(Delete), got {other:?}")
+        }
+    }
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        (1, 0, 0, 0, 0, 0),
+        "[req_fm_conf_a] FAIL - zero writes, only the bootstrap SELF entity should exist"
+    );
+}
+
+#[test]
+fn req_fm_conf_b_explicit_confirmed_missing_fact_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    match forget_memory(
+        &mut conn,
+        confirmed_explicit(),
+        mk_fm_payload(FactId::new()),
+    ) {
+        ActionOutcome::NotFound => {}
+        other => panic!("[req_fm_conf_b] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn req_fm_conf_c_explicit_confirmed_existing_fact_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_fm_target(&mut conn);
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(
+                value, target.id,
+                "[req_fm_conf_c] FAIL - success value must be only the FactId"
+            );
+            assert_eq!(confirmation_class, ConfirmationClass::Delete);
+        }
+        other => panic!("[req_fm_conf_c] FAIL, got {other:?}"),
+    }
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+}
+
+#[test]
+fn req_fm_conf_d_inferred_unconfirmed_blocks_before_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match forget_memory(&mut conn, meta, mk_fm_payload(FactId::new())) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::Delete);
+        }
+        other => panic!("[req_fm_conf_d] FAIL, got {other:?}"),
+    }
+    assert_eq!(am_full_table_snapshot(&conn), (1, 0, 0, 0, 0, 0));
+}
+
+#[test]
+fn req_fm_conf_e_inferred_confirmed_succeeds_audit_provenance_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_conf_e.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_fm_target(&mut conn);
+
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    match forget_memory(&mut conn, meta, mk_fm_payload(target.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(value, target.id);
+            assert_eq!(confirmation_class, ConfirmationClass::Delete);
+        }
+        other => panic!("[req_fm_conf_e] FAIL, got {other:?}"),
+    }
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ForgetMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_fm_conf_e] FAIL - confirming an inferred proposal must never silently rewrite provenance to Explicit"
+    );
+}
+
+// --- Target eligibility: active AND historical (R024 §6) --------------
+
+#[test]
+fn req_fm_target_eligibility_active_and_historical() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_eligibility.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for state in [
+        EpistemicState::UserConfirmed,
+        EpistemicState::Inferred,
+        EpistemicState::Observed,
+        EpistemicState::Disputed,
+    ] {
+        let payload = AddMemoryPayload {
+            epistemic_state: state,
+            ..mk_am_payload()
+        };
+        let target = match add_memory(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed for {state:?}: {other:?}"),
+        };
+        match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+            ActionOutcome::Success { value, .. } => assert_eq!(value, target.id),
+            other => panic!("[req_fm_eligibility] FAIL for active {state:?}, got {other:?}"),
+        }
+        assert!(get_fact(&conn, target.id).unwrap().is_none());
+    }
+
+    let stale_target = mk_fm_target(&mut conn);
+    conn.execute(
+        "UPDATE facts SET epistemic_state = 'STALE', valid_until = ?2 WHERE id = ?1",
+        rusqlite::params![stale_target.id.to_string(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    match forget_memory(
+        &mut conn,
+        confirmed_explicit(),
+        mk_fm_payload(stale_target.id),
+    ) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, stale_target.id),
+        other => panic!("[req_fm_eligibility] FAIL for STALE/historical, got {other:?}"),
+    }
+    assert!(get_fact(&conn, stale_target.id).unwrap().is_none());
+}
+
+// --- Audit marker fields, no target snapshot (R024 §15/§16) ------------
+
+#[test]
+fn req_fm_audit_marker_fields_and_no_target_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_audit.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_fm_target(&mut conn);
+
+    let requested_at: chrono::DateTime<chrono::Utc> = "2026-09-18T22:00:00Z"
+        .parse()
+        .expect("valid RFC3339 literal");
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Explicit,
+        requested_at,
+        confirmed: true,
+    };
+    match forget_memory(&mut conn, meta, mk_fm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, target.id),
+        other => panic!("[req_fm_audit] FAIL, got {other:?}"),
+    }
+
+    let (
+        fact_id,
+        action_type,
+        actor,
+        provenance,
+        confirmation_class,
+        previous_snapshot,
+        occurred_at,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at
+             FROM fact_audit_log WHERE action_type = 'ForgetMemory'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap();
+
+    assert_eq!(fact_id, target.id.to_string());
+    assert_eq!(action_type, "ForgetMemory");
+    assert_eq!(actor, "CloudLLM");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "DELETE");
+    assert!(
+        previous_snapshot.is_none(),
+        "[req_fm_audit] FAIL - ForgetMemory's own audit marker must never carry a snapshot"
+    );
+    assert_eq!(occurred_at, requested_at.to_rfc3339());
+
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+}
+
+// --- Hard Fact deletion proof (R024 §14) --------------------------------
+
+#[test]
+fn req_fm_hard_delete_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_hard_delete.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_fm_target(&mut conn);
+    let facts_before = am_fact_row_count(&conn);
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_hard_delete] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+    let raw_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM facts WHERE id = ?1",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_count, 0);
+    assert_eq!(am_fact_row_count(&conn), facts_before - 1);
+}
+
+// --- Supersession-chain test matrix (R024 §9/§22) -----------------------
+
+#[test]
+fn req_fm_supersession_chain_forgetting_middle_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_chain_middle.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let a = mk_fm_target(&mut conn);
+    let b = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup A->B failed: {other:?}"),
+    };
+    let c = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(b.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup B->C failed: {other:?}"),
+    };
+
+    let a_before = get_fact(&conn, a.id).unwrap().unwrap();
+    let c_before = get_fact(&conn, c.id).unwrap().unwrap();
+
+    let t_forget: chrono::DateTime<chrono::Utc> = "2026-09-18T11:00:00Z".parse().unwrap();
+    let forget_meta = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at: t_forget,
+        confirmed: true,
+    };
+    match forget_memory(&mut conn, forget_meta, mk_fm_payload(b.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, b.id),
+        other => panic!("[req_fm_chain_middle] FAIL forgetting B, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, b.id).unwrap().is_none(), "B must be gone");
+    let a_after = get_fact(&conn, a.id).unwrap().unwrap();
+    assert_eq!(
+        a_after.superseded_by_fact_id, None,
+        "[req_fm_chain_middle] FAIL - A's superseded_by must be cleared, never rewired to C"
+    );
+    assert_eq!(
+        a_after.valid_until, a_before.valid_until,
+        "A.valid_until must remain unchanged"
+    );
+    assert_eq!(
+        a_after.epistemic_state, a_before.epistemic_state,
+        "A.epistemic_state must remain unchanged"
+    );
+    assert_eq!(
+        a_after.updated_at, t_forget,
+        "A.updated_at must equal the forget call's requested_at"
+    );
+    assert_eq!(a_after.subject_entity_id, a_before.subject_entity_id);
+    assert_eq!(a_after.predicate, a_before.predicate);
+    assert_eq!(a_after.value, a_before.value);
+    assert_eq!(a_after.valid_from, a_before.valid_from);
+    assert_eq!(a_after.created_at, a_before.created_at);
+
+    let c_after = get_fact(&conn, c.id).unwrap().unwrap();
+    assert_eq!(
+        c_after, c_before,
+        "[req_fm_chain_middle] FAIL - C must remain byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn req_fm_forgetting_predecessor_leaves_successor_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_chain_predecessor.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = mk_fm_target(&mut conn);
+    let b = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup A->B failed: {other:?}"),
+    };
+    let b_before = get_fact(&conn, b.id).unwrap().unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, a.id),
+        other => panic!("[req_fm_chain_predecessor] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, a.id).unwrap().is_none());
+    let b_after = get_fact(&conn, b.id).unwrap().unwrap();
+    assert_eq!(
+        b_before, b_after,
+        "[req_fm_chain_predecessor] FAIL - forgetting a predecessor must leave the successor byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn req_fm_forgetting_terminal_fact_clears_immediate_predecessor_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_chain_terminal.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let a = mk_fm_target(&mut conn);
+    let b = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup A->B failed: {other:?}"),
+    };
+    let c = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(b.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup B->C failed: {other:?}"),
+    };
+    let a_before = get_fact(&conn, a.id).unwrap().unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(c.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, c.id),
+        other => panic!("[req_fm_chain_terminal] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, c.id).unwrap().is_none());
+    let b_after = get_fact(&conn, b.id).unwrap().unwrap();
+    assert_eq!(
+        b_after.superseded_by_fact_id, None,
+        "[req_fm_chain_terminal] FAIL - B's superseded_by must be cleared"
+    );
+    assert_eq!(
+        b_after.epistemic_state,
+        EpistemicState::Stale,
+        "B remains STALE"
+    );
+    assert!(b_after.valid_until.is_some(), "B remains closed/historical");
+    let a_after = get_fact(&conn, a.id).unwrap().unwrap();
+    assert_eq!(
+        a_before, a_after,
+        "[req_fm_chain_terminal] FAIL - A (further up the chain) must remain completely unchanged"
+    );
+}
+
+// --- Multi/zero-Evidence support (R024 §10) -----------------------------
+
+#[test]
+fn req_fm_zero_evidence_fixture_forgotten_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_zero_evidence.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_fm_target(&mut conn);
+    conn.execute(
+        "DELETE FROM fact_evidence WHERE fact_id = ?1",
+        rusqlite::params![target.id.to_string()],
+    )
+    .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, target.id),
+        other => panic!("[req_fm_zero_evidence] FAIL, got {other:?}"),
+    }
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+}
+
+// --- Evidence privacy-first deletion (R024 §10, brief §29/§30) ---------
+
+/// Raw fixtures (no production write path exists for `relations`/
+/// `episodes`) proving Evidence privacy-first deletion: an Evidence row
+/// shared with a Relation and an Episode is still always deleted when
+/// its Fact is forgotten, but the Relation/Episode OBJECTS themselves
+/// survive - they merely lose that Evidence's support.
+#[test]
+fn req_fm_relation_episode_shared_evidence_privacy_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_rel_ep_evidence.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+    let second_entity = mk_fm_second_entity(&mut conn);
+
+    let target = mk_fm_target(&mut conn);
+    let evidence_id: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let relation_id = insert_raw_relation(&conn, self_id, second_entity);
+    let episode_id = insert_raw_episode(&conn);
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![relation_id, evidence_id, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, evidence_id, now],
+    )
+    .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, target.id),
+        other => panic!("[req_fm_rel_ep_evidence] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+    let evidence_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE id = ?1",
+            rusqlite::params![evidence_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        evidence_count, 0,
+        "[req_fm_rel_ep_evidence] FAIL - shared Evidence must be deleted (privacy-first)"
+    );
+    for (table, column) in [
+        ("fact_evidence", "evidence_id"),
+        ("relation_evidence", "evidence_id"),
+        ("episode_evidence", "evidence_id"),
+    ] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
+                rusqlite::params![evidence_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "[req_fm_rel_ep_evidence] FAIL - {table} link must be gone"
+        );
+    }
+
+    let relation_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relations WHERE id = ?1",
+            rusqlite::params![relation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        relation_count, 1,
+        "[req_fm_rel_ep_evidence] FAIL - the Relation row itself must survive"
+    );
+    let episode_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM episodes WHERE id = ?1",
+            rusqlite::params![episode_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        episode_count, 1,
+        "[req_fm_rel_ep_evidence] FAIL - the Episode row itself must survive"
+    );
+}
+
+/// A deliberate raw fixture - two Facts (T and retained K) both linking
+/// to the SAME Evidence row (production never creates this shape;
+/// `AddMemory`/`CorrectMemory` always create a fresh Evidence per
+/// Fact). Forgetting T must still delete the shared Evidence - privacy
+/// of the forgotten Evidence outranks preserving it for K, even though
+/// K may now have zero Evidence links as a result. K itself (the Fact)
+/// must survive.
+#[test]
+fn req_fm_other_fact_shared_evidence_deleted_but_other_fact_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_shared_evidence.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let target = mk_fm_target(&mut conn);
+    let evidence_id: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let k = mk_fm_target(&mut conn);
+    // Replace K's own separately-created Evidence link with the SHARED
+    // one, reproducing exactly "K may now have zero Evidence links."
+    conn.execute(
+        "DELETE FROM fact_evidence WHERE fact_id = ?1",
+        rusqlite::params![k.id.to_string()],
+    )
+    .unwrap();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO fact_evidence (fact_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![k.id.to_string(), evidence_id, now],
+    )
+    .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value, target.id),
+        other => panic!("[req_fm_shared_evidence] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+    let evidence_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE id = ?1",
+            rusqlite::params![evidence_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        evidence_count, 0,
+        "[req_fm_shared_evidence] FAIL - the shared Evidence must still be deleted"
+    );
+
+    let k_after = get_fact(&conn, k.id).unwrap();
+    assert!(
+        k_after.is_some(),
+        "[req_fm_shared_evidence] FAIL - the other retained Fact K must survive"
+    );
+    let k_evidence_links: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![k.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        k_evidence_links, 0,
+        "K now has zero Evidence links in this fixture - acceptable, privacy of forgotten Evidence outranks shared-Evidence preservation"
+    );
+}
+
+// --- Source orphan/shared lifecycle (R024 §11, brief §17) --------------
+
+#[test]
+fn req_fm_source_matrix_orphan_and_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_source_matrix.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    // A: unique Source becomes orphan and is deleted.
+    let target_a = mk_fm_target(&mut conn);
+    let source_a: String = conn
+        .query_row(
+            "SELECT e.source_id FROM evidence e JOIN fact_evidence fe ON fe.evidence_id = e.id WHERE fe.fact_id = ?1",
+            rusqlite::params![target_a.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_a.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_source_matrix] FAIL case A, got {other:?}"),
+    }
+    let source_a_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sources WHERE id = ?1",
+            rusqlite::params![source_a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(source_a_count, 0, "case A: orphaned Source must be deleted");
+
+    // B: target's Evidence shares a Source with another retained Fact's Evidence.
+    let target_b = mk_fm_target(&mut conn);
+    let source_b: String = conn
+        .query_row(
+            "SELECT e.source_id FROM evidence e JOIN fact_evidence fe ON fe.evidence_id = e.id WHERE fe.fact_id = ?1",
+            rusqlite::params![target_b.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let source_b_id = SourceId::parse(&source_b).unwrap();
+    let retained_payload = AddMemoryPayload {
+        source: SourceRef::Existing(source_b_id),
+        ..mk_am_payload()
+    };
+    let retained = match add_memory(&mut conn, ui_explicit(), retained_payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup retained Fact failed: {other:?}"),
+    };
+    let retained_evidence_before: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![retained.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_b.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_source_matrix] FAIL case B, got {other:?}"),
+    }
+    let source_b_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sources WHERE id = ?1",
+            rusqlite::params![source_b],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source_b_count, 1,
+        "case B: shared Source must remain byte-for-byte"
+    );
+    assert!(
+        get_fact(&conn, retained.id).unwrap().is_some(),
+        "case B: the retained Fact must survive"
+    );
+    let retained_evidence_after: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![retained.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained_evidence_before, retained_evidence_after,
+        "case B: retained Fact's own Evidence link must remain"
+    );
+
+    // C: target has TWO Evidence rows sharing the SAME orphan Source.
+    let target_c = mk_fm_target(&mut conn);
+    let source_c_id: String = conn
+        .query_row(
+            "SELECT e.source_id FROM evidence e JOIN fact_evidence fe ON fe.evidence_id = e.id WHERE fe.fact_id = ?1",
+            rusqlite::params![target_c.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let extra_evidence_id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO evidence (id, source_id, content, locator, sensitivity, created_at) VALUES (?1, ?2, 'second evidence', NULL, 'INTERNAL', ?3)",
+        rusqlite::params![extra_evidence_id, source_c_id, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO fact_evidence (fact_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![target_c.id.to_string(), extra_evidence_id, now],
+    )
+    .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_c.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_source_matrix] FAIL case C, got {other:?}"),
+    }
+    let source_c_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sources WHERE id = ?1",
+            rusqlite::params![source_c_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source_c_count, 0,
+        "case C: the shared orphan Source must be deleted exactly once, safely"
+    );
+}
+
+// --- Entity orphan/shared lifecycle, self/orphan cases (R024 §12/§13, --
+// brief §20 A-D) -----------------------------------------------------------
+
+#[test]
+fn req_fm_entity_retention_matrix_self_and_orphan_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_entity_matrix_1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+
+    // A: SELF subject only - SELF survives.
+    let target_a = mk_fm_target(&mut conn);
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_a.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_1] FAIL case A, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, self_id).unwrap().is_some(),
+        "case A: SELF must survive"
+    );
+
+    // B: non-SELF subject used only by T - deleted.
+    let target_b = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Case B Subject".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case B failed: {other:?}"),
+    };
+    let subject_b = target_b.subject_entity_id;
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_b.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_1] FAIL case B, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, subject_b).unwrap().is_none(),
+        "case B: orphaned non-SELF subject Entity must be deleted"
+    );
+
+    // C: non-SELF object used only by T - deleted.
+    let target_c = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "place".to_string(),
+                canonical_name: "Case C Object".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            })),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case C failed: {other:?}"),
+    };
+    let object_c = match target_c.value {
+        FactValue::EntityRef(id) => id,
+        other => panic!("expected EntityRef, got {other:?}"),
+    };
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_c.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_1] FAIL case C, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, object_c).unwrap().is_none(),
+        "case C: orphaned non-SELF object Entity must be deleted"
+    );
+
+    // D: raw fixture - the SAME non-SELF Entity is both subject and
+    // object of T, with T as its ONLY reference. No current production
+    // path creates a brand-new Entity as both subject and object of one
+    // Fact in a single call - this proves the service's own
+    // deduplication/orphan-check logic against that shape directly.
+    let entity_d_id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, created_at, updated_at)
+         VALUES (?1, 'person', 'Case D Entity', 0, 'INTERNAL', ?2, ?2)",
+        rusqlite::params![entity_d_id, now],
+    )
+    .unwrap();
+    let fact_d_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO facts (id, subject_entity_id, predicate, value_json, object_entity_id, memory_type, epistemic_state, sensitivity, valid_from, created_at, updated_at)
+         VALUES (?1, ?2, 'self_edge_predicate', NULL, ?2, 'FACT', 'OBSERVED', 'INTERNAL', ?3, ?3, ?3)",
+        rusqlite::params![fact_d_id, entity_d_id, now],
+    )
+    .unwrap();
+    let target_d_id = FactId::parse(&fact_d_id).unwrap();
+    let entity_d = EntityId::parse(&entity_d_id).unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_d_id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_1] FAIL case D, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_d).unwrap().is_none(),
+        "case D: self-edge Entity with T as its only reference must be deleted (deduplicated, no double-delete failure)"
+    );
+}
+
+// --- Entity orphan/shared lifecycle, shared-reference retention cases -
+// (R024 §12/§13, brief §20 E-J) ---------------------------------------------
+
+#[test]
+fn req_fm_entity_retention_matrix_shared_reference_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_entity_matrix_2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+
+    // E: candidate Entity also referenced as another Fact's subject - retained.
+    let target_e = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Case E Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case E failed: {other:?}"),
+    };
+    let entity_e = target_e.subject_entity_id;
+    let sibling_e = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::Existing(entity_e),
+            predicate: "case_e_sibling_predicate".to_string(),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case E sibling failed: {other:?}"),
+    };
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_e.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case E, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_e).unwrap().is_some(),
+        "case E: Entity referenced by another Fact's subject must be retained"
+    );
+    assert!(get_fact(&conn, sibling_e.id).unwrap().is_some());
+
+    // F: candidate Entity also referenced as another Fact's object - retained.
+    let target_f = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "place".to_string(),
+                canonical_name: "Case F Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            })),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case F failed: {other:?}"),
+    };
+    let entity_f = match target_f.value {
+        FactValue::EntityRef(id) => id,
+        other => panic!("expected EntityRef, got {other:?}"),
+    };
+    let _sibling_f = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::Existing(entity_f)),
+            predicate: "case_f_sibling_predicate".to_string(),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case F sibling failed: {other:?}"),
+    };
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_f.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case F, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_f).unwrap().is_some(),
+        "case F: Entity referenced by another Fact's object must be retained"
+    );
+
+    // G/H: candidate Entity referenced by Relation.from / Relation.to - retained.
+    let target_g = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Case G Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case G failed: {other:?}"),
+    };
+    let entity_g = target_g.subject_entity_id;
+    let _relation_g = insert_raw_relation(&conn, entity_g, self_id);
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_g.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case G, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_g).unwrap().is_some(),
+        "case G: Entity referenced by Relation.from must be retained"
+    );
+
+    let target_h = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Case H Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case H failed: {other:?}"),
+    };
+    let entity_h = target_h.subject_entity_id;
+    let _relation_h = insert_raw_relation(&conn, self_id, entity_h);
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_h.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case H, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_h).unwrap().is_some(),
+        "case H: Entity referenced by Relation.to must be retained"
+    );
+
+    // I: candidate Entity referenced by episode_entities - retained.
+    let target_i = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Case I Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case I failed: {other:?}"),
+    };
+    let entity_i = target_i.subject_entity_id;
+    let episode_i = insert_raw_episode(&conn);
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_i, entity_i.to_string(), now],
+    )
+    .unwrap();
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_i.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case I, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_i).unwrap().is_some(),
+        "case I: Entity referenced by episode_entities must be retained"
+    );
+
+    // J: candidate Entity has a domain_ref but zero PK references after
+    // T's deletion - deleted anyway; the authoritative Goal row survives.
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Case J Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let target_j = match add_memory(
+        &mut conn,
+        ui_explicit(),
+        AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "goal".to_string(),
+                canonical_name: "Case J Entity".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: "Goal".to_string(),
+                    domain_ref_id: goal.id.to_string(),
+                }),
+            }),
+            ..mk_am_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case J failed: {other:?}"),
+    };
+    let entity_j = target_j.subject_entity_id;
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target_j.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_entity_matrix_2] FAIL case J, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, entity_j).unwrap().is_none(),
+        "case J: domain_ref alone must NOT retain an otherwise-orphaned Entity"
+    );
+    assert!(
+        get_goal(&conn, goal.id).unwrap().is_some(),
+        "case J: the authoritative Goal row itself must remain completely untouched"
+    );
+}
+
+// --- Audit snapshot scrubbing (R024 §8, brief §22-25) -------------------
+
+#[test]
+fn req_fm_snapshot_scrub_confirmmemory_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_scrub_cfm.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let payload = AddMemoryPayload {
+        epistemic_state: EpistemicState::Inferred,
+        ..mk_am_payload()
+    };
+    let target = match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup AddMemory failed: {other:?}"),
+    };
+    match confirm_memory(
+        &mut conn,
+        ui_explicit(),
+        ConfirmMemoryPayload { fact_id: target.id },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup ConfirmMemory failed: {other:?}"),
+    }
+
+    let snapshot_before: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_before =
+        snapshot_before.expect("ConfirmMemory audit snapshot must be non-NULL before forgetting");
+    let _: Fact = serde_json::from_str(&snapshot_before)
+        .expect("the pre-scrub snapshot must contain serialized semantic Fact data");
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_scrub_cfm] FAIL, got {other:?}"),
+    }
+
+    let confirm_snapshot_after: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        confirm_snapshot_after.is_none(),
+        "[req_fm_scrub_cfm] FAIL - the old ConfirmMemory audit snapshot must be scrubbed to NULL, while the row itself still exists"
+    );
+
+    let forget_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ForgetMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        forget_snapshot.is_none(),
+        "[req_fm_scrub_cfm] FAIL - ForgetMemory's own audit marker must have NULL snapshot"
+    );
+}
+
+#[test]
+fn req_fm_snapshot_scrub_correctmemory_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_scrub_cm.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let a = mk_fm_target(&mut conn);
+    let b = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(a.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup A->B failed: {other:?}"),
+    };
+    let _c = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(b.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup B->C failed: {other:?}"),
+    };
+
+    let snapshot_before: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![b.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        snapshot_before.is_some(),
+        "B's own CorrectMemory audit row (from correcting B->C) must have a non-NULL snapshot before forgetting"
+    );
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(b.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_scrub_cm] FAIL, got {other:?}"),
+    }
+
+    assert!(get_fact(&conn, b.id).unwrap().is_none(), "B must be gone");
+
+    let snapshot_after: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![b.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        snapshot_after.is_none(),
+        "[req_fm_scrub_cm] FAIL - B's own CorrectMemory audit snapshot must be scrubbed to NULL"
+    );
+
+    let forget_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ForgetMemory'",
+            rusqlite::params![b.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(forget_snapshot.is_none());
+}
+
+/// `ForgetMemory` scrubs ONLY `previous_snapshot` - every other audit
+/// column (`id`/`action_type`/`actor`/`provenance`/`confirmation_class`/
+/// `occurred_at`) survives untouched, and the row itself is never
+/// deleted; it becomes payload-free structural history.
+#[test]
+fn req_fm_old_audit_structural_metadata_survives_scrub() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_scrub_metadata.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let payload = AddMemoryPayload {
+        epistemic_state: EpistemicState::Inferred,
+        ..mk_am_payload()
+    };
+    let target = match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    match confirm_memory(
+        &mut conn,
+        ui_explicit(),
+        ConfirmMemoryPayload { fact_id: target.id },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup ConfirmMemory failed: {other:?}"),
+    }
+
+    let before: (String, String, String, String, String, String) = conn
+        .query_row(
+            "SELECT id, action_type, actor, provenance, confirmation_class, occurred_at FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fm_scrub_metadata] FAIL, got {other:?}"),
+    }
+
+    let after: (String, String, String, String, String, String) = conn
+        .query_row(
+            "SELECT id, action_type, actor, provenance, confirmation_class, occurred_at FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        before, after,
+        "[req_fm_scrub_metadata] FAIL - every audit column besides previous_snapshot must survive scrubbing exactly"
+    );
+}
+
+// --- Full atomic rollback (R024 - central acceptance proof, §20) -------
+
+/// MANDATORY central proof: a rich pre-call state - target Fact T
+/// (historical/`Stale`, itself the predecessor of a further correction
+/// so it carries its OWN payload-bearing `CorrectMemory` audit
+/// snapshot), an inbound supersession predecessor P, T's own Evidence/
+/// Source, and a candidate orphan object Entity. Forces the FINAL
+/// `ForgetMemory` audit insert (step 13) to fail and proves every
+/// earlier step (5-12) in the same call rolls back completely.
+#[test]
+fn req_fm_rollback_forced_final_audit_failure_restores_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_rollback1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let p = mk_fm_target(&mut conn);
+    let t = match correct_memory(
+        &mut conn,
+        ui_explicit(),
+        CorrectMemoryPayload {
+            value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+                entity_type: "place".to_string(),
+                canonical_name: "Rollback Orphan Candidate".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            })),
+            ..mk_cm_payload(p.id)
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup P->T failed: {other:?}"),
+    };
+    let orphan_candidate_entity = match t.value {
+        FactValue::EntityRef(id) => id,
+        other => panic!("expected EntityRef, got {other:?}"),
+    };
+    let _u = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(t.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup T->U failed: {other:?}"),
+    };
+
+    let p_before = get_fact(&conn, p.id).unwrap().unwrap();
+    let t_before = get_fact(&conn, t.id).unwrap().unwrap();
+    let t_evidence_id: String = conn
+        .query_row(
+            "SELECT evidence_id FROM fact_evidence WHERE fact_id = ?1",
+            rusqlite::params![t.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let t_source_id: String = conn
+        .query_row(
+            "SELECT source_id FROM evidence WHERE id = ?1",
+            rusqlite::params![t_evidence_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let correct_memory_snapshot_before: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![t.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        correct_memory_snapshot_before.is_some(),
+        "T's own CorrectMemory audit snapshot must be non-NULL before forgetting"
+    );
+    let entity_before = get_entity(&conn, orphan_candidate_entity).unwrap();
+    assert!(entity_before.is_some());
+
+    let snapshot_before = am_full_table_snapshot(&conn);
+    let audit_count_before = am_fact_audit_row_count(&conn);
+
+    install_fact_audit_failure_trigger(&conn);
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(t.id)) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_fm_rollback1] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_fact_audit_failure_trigger(&conn);
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before,
+        "[req_fm_rollback1] FAIL - every table must be exactly as before the failed forget"
+    );
+    assert_eq!(am_fact_audit_row_count(&conn), audit_count_before);
+
+    let t_after = get_fact(&conn, t.id).unwrap();
+    assert_eq!(
+        t_after,
+        Some(t_before),
+        "[req_fm_rollback1] FAIL - target Fact T must still exist, byte-for-byte unchanged"
+    );
+
+    let p_after = get_fact(&conn, p.id).unwrap().unwrap();
+    assert_eq!(
+        p_after, p_before,
+        "[req_fm_rollback1] FAIL - inbound predecessor P's superseded_by must be restored"
+    );
+
+    let evidence_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE id = ?1",
+            rusqlite::params![t_evidence_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        evidence_count, 1,
+        "[req_fm_rollback1] FAIL - T's Evidence must still exist"
+    );
+    let fact_evidence_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_evidence WHERE fact_id = ?1 AND evidence_id = ?2",
+            rusqlite::params![t.id.to_string(), t_evidence_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fact_evidence_count, 1,
+        "[req_fm_rollback1] FAIL - the fact_evidence join row must be restored"
+    );
+    let source_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sources WHERE id = ?1",
+            rusqlite::params![t_source_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source_count, 1,
+        "[req_fm_rollback1] FAIL - T's Source must still exist"
+    );
+
+    let entity_after = get_entity(&conn, orphan_candidate_entity).unwrap();
+    assert_eq!(
+        entity_after, entity_before,
+        "[req_fm_rollback1] FAIL - the candidate orphan Entity must still exist"
+    );
+
+    let correct_memory_snapshot_after: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'CorrectMemory'",
+            rusqlite::params![t.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        correct_memory_snapshot_after, correct_memory_snapshot_before,
+        "[req_fm_rollback1] FAIL - T's CorrectMemory audit snapshot must be restored (scrub rolled back)"
+    );
+
+    let forget_marker_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ForgetMemory'",
+            rusqlite::params![t.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        forget_marker_count, 0,
+        "[req_fm_rollback1] FAIL - no ForgetMemory audit marker must exist"
+    );
+
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_fm_rollback1] FAIL - connection should remain usable after rollback, got {other:?}"
+        ),
+    }
+}
+
+/// A mid-transaction failure (forcing the target `facts` `DELETE`
+/// itself, step 11, to fail) - proves the EARLIER steps in the same
+/// call (audit scrub, inbound-supersession clearing) also roll back,
+/// not only a final-step failure.
+#[test]
+fn req_fm_rollback_mid_step_forced_fact_delete_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_rollback2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let p = mk_fm_target(&mut conn);
+    let t = match correct_memory(&mut conn, ui_explicit(), mk_cm_payload(p.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup P->T failed: {other:?}"),
+    };
+
+    let p_before = get_fact(&conn, p.id).unwrap().unwrap();
+    let t_before = get_fact(&conn, t.id).unwrap().unwrap();
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    install_fact_delete_failure_trigger(&conn);
+    match forget_memory(&mut conn, confirmed_explicit(), mk_fm_payload(t.id)) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_fm_rollback2] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_fact_delete_failure_trigger(&conn);
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before,
+        "[req_fm_rollback2] FAIL - every table must be restored, including the already-performed audit scrub and inbound-supersession clearing that happened before the later DELETE failed"
+    );
+    let p_after = get_fact(&conn, p.id).unwrap().unwrap();
+    assert_eq!(
+        p_after, p_before,
+        "[req_fm_rollback2] FAIL - P's superseded_by_fact_id clearing (an earlier step) must roll back when a later step fails"
+    );
+    let t_after = get_fact(&conn, t.id).unwrap();
+    assert_eq!(
+        t_after,
+        Some(t_before),
+        "[req_fm_rollback2] FAIL - T must still exist"
     );
 }

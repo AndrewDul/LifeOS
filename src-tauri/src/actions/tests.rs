@@ -1943,3 +1943,23 @@ fn confirm_memory_payload_validates_trivially_and_passes_fact_id_through() {
         validate_confirm_memory(&payload).expect("ConfirmMemoryPayload should always validate");
     assert_eq!(normalized.fact_id, fact_id);
 }
+
+// --- ForgetMemory (M2 Personal Knowledge Slice E, 2026-09-18) ----------
+//
+// `ForgetMemoryPayload` carries a single typed `FactId` and nothing
+// else - `validate_forget_memory` is intentionally trivial, same
+// reasoning as `ConfirmMemory`. Unlike every other Memory action there
+// is no active/inactive precondition check anywhere in this action's
+// validation path, pure or otherwise (R019 - the right to forget
+// applies to historical knowledge too). Database-dependent behavior
+// (target existence, the 14-step deletion transaction, audit
+// scrubbing, rollback) is covered by `services::tests` instead.
+
+#[test]
+fn forget_memory_payload_validates_trivially_and_passes_fact_id_through() {
+    let fact_id = FactId::new();
+    let payload = ForgetMemoryPayload { fact_id };
+    let normalized =
+        validate_forget_memory(&payload).expect("ForgetMemoryPayload should always validate");
+    assert_eq!(normalized.fact_id, fact_id);
+}

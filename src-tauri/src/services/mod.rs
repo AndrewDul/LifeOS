@@ -21,8 +21,9 @@ use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
     AddMilestonePayload, AddTaskPayload, ConfirmMemoryPayload, ConfirmationClass,
     CorrectMemoryPayload, CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput,
-    FieldPatch, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
-    UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload, ValidationError,
+    FieldPatch, ForgetMemoryPayload, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload,
+    UpdateMilestonePayload, UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload,
+    ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
@@ -2345,6 +2346,214 @@ pub(crate) fn confirm_memory(
 
     ActionOutcome::Success {
         value: confirmed,
+        confirmation_class: class,
+    }
+}
+
+/// `ForgetMemory` - the fourth production Personal Knowledge mutation,
+/// and the first HARD-DELETE action (M2 Personal Knowledge Slice E,
+/// 2026-09-18). "The user wants this one exact Fact removed from
+/// LifeOS's canonical Personal Knowledge" - never a soft delete, never
+/// a `Stale` transition, never a correction. Implements R019's final
+/// 14-step privacy-safe transaction exactly.
+///
+/// Returns `ActionOutcome<FactId>`, deliberately never `ActionOutcome<
+/// Fact>` - a success result must never hand back the semantic object
+/// that was just forgotten. The returned `FactId` is the frozen
+/// non-semantic residual audit marker, nothing more.
+///
+/// Confirmation floor is `ConfirmationClass::Delete` (severity 4, the
+/// highest rung) - `effective_class(Delete, provenance)` stays `Delete`
+/// regardless of provenance (never dominated by either provenance-
+/// derived class), so `blocks_until_confirmed(Delete) == true` blocks
+/// EVERY unconfirmed call, `Explicit` included - unlike every other
+/// Memory action, a direct explicit delete request is not itself
+/// treated as sufficient confirmation; only `meta.confirmed == true`
+/// executes it. No new confirmation helper - the exact same generic
+/// gate every other action uses.
+///
+/// Execution boundary: (1) pure structural validation (`actions::
+/// validate_forget_memory` - trivial, one `FactId`); (2)/(3) the
+/// confirmation gate - a nonexistent `FactId` still returns
+/// `ConfirmationRequired` while unconfirmed, proving the target is
+/// never fetched before consent; (4) only once confirmed does the
+/// target Fact get read - missing -> `ActionOutcome::NotFound`, zero
+/// writes, no audit marker ever created for a Fact that did not exist.
+/// **`domain::is_active_fact` is deliberately never called here** -
+/// unlike `CorrectMemory`/`ConfirmMemory`, `ForgetMemory` may target an
+/// active OR a historical (`Stale`/closed) Fact, including any position
+/// in a supersession chain - the right to forget applies to historical
+/// knowledge too (R019).
+///
+/// `serialize_required_snapshot` is deliberately NEVER called for the
+/// target - the whole purpose is deletion, so the new `ForgetMemory`
+/// audit marker's `previous_snapshot` is unconditionally `None`, and
+/// every OLDER snapshot-bearing audit row for this exact Fact is
+/// scrubbed (`previous_snapshot` only, every other column preserved as
+/// payload-free structural history) inside the same transaction. There
+/// is no Undo: no undo token, no hidden tombstone, no retained deleted
+/// Evidence, nothing to restore from - `ActionOutcome` itself has no
+/// Undo concept for any action to opt into.
+///
+/// Transaction (R019's exact 14 steps): (5) scrub every existing
+/// `fact_audit_log.previous_snapshot` for this Fact; (6) clear every
+/// INBOUND `superseded_by_fact_id` reference pointing at it, WITHOUT
+/// rewiring the chain (a cleared predecessor's own `valid_until`/
+/// `epistemic_state` are left exactly as they were - this deliberately
+/// creates a privacy-driven hole in the chain, never a falsified
+/// history); (7) delete every `fact_evidence`/`relation_evidence`/
+/// `episode_evidence` row referencing each collected `EvidenceId` -
+/// even one shared with another retained Fact/Relation/Episode
+/// (Evidence privacy-first: R018/R019, the retained OBJECT survives, it
+/// only loses that Evidence's support); (8) hard-delete each collected
+/// Evidence row itself, always; (9) delete each collected Source only
+/// if now orphaned (a Source still used by a retained Evidence row is
+/// never touched); (10) a defensive `fact_evidence` sweep for the
+/// target (normally a no-op, kept anyway per R019); (11) hard-delete
+/// the target Fact itself (runtime-enforced exactly-one, never a
+/// `debug_assert!`); (12) delete each candidate subject/object Entity
+/// only if now orphaned across every referencing table - SELF is never
+/// a candidate for deletion, structurally, via the guarded SQL itself,
+/// and `domain_ref` alone never retains an otherwise-orphaned Entity;
+/// (13) insert exactly one minimal, payload-free `ForgetMemory` audit
+/// marker; (14) `COMMIT`. Any failure rolls back everything, including
+/// every scrub/clear/delete already performed in this same call.
+///
+/// Never rewires a supersession chain, never revives a historical Fact,
+/// never scans or deletes an Entity beyond the target's own subject/
+/// object, never adds a production `Relation`/`Episode` write path.
+/// `secure_delete = ON` (R020) is unchanged and untouched by this
+/// action - `ForgetMemory`'s guarantee is logical/product-level
+/// deletion from the canonical database plus that existing SQLite-level
+/// hardening, never a forensic/physical-media erasure claim, and it
+/// says nothing about copies (backups/sync) LifeOS does not itself
+/// control - no such subsystem exists yet to propagate forgetting to.
+pub(crate) fn forget_memory(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: ForgetMemoryPayload,
+) -> ActionOutcome<FactId> {
+    let normalized = match crate::actions::validate_forget_memory(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::Delete, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let target = match storage::personal_knowledge_repo::get_fact(conn, normalized.fact_id) {
+        Ok(Some(f)) => f,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    // Step 2: candidate subject/object Entity ids, deduplicated (a
+    // self-edge - subject == object - collapses to one candidate).
+    let mut candidate_entity_ids = vec![target.subject_entity_id];
+    if let FactValue::EntityRef(object_id) = &target.value {
+        if !candidate_entity_ids.contains(object_id) {
+            candidate_entity_ids.push(*object_id);
+        }
+    }
+
+    // Step 3: every Evidence id linked to the target.
+    let evidence_ids =
+        match storage::personal_knowledge_repo::list_evidence_ids_for_fact(conn, target.id) {
+            Ok(ids) => ids,
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        };
+
+    // Step 4: the Source id for each collected Evidence row, deduplicated.
+    let mut source_ids: Vec<SourceId> = Vec::new();
+    for evidence_id in &evidence_ids {
+        match storage::personal_knowledge_repo::get_source_id_for_evidence(conn, *evidence_id) {
+            Ok(Some(source_id)) => {
+                if !source_ids.contains(&source_id) {
+                    source_ids.push(source_id);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::personal_knowledge_repo::scrub_fact_audit_snapshots(&tx, target.id) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) =
+        storage::personal_knowledge_repo::clear_inbound_supersession_refs(&tx, target.id, now)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    for evidence_id in &evidence_ids {
+        if let Err(e) =
+            storage::personal_knowledge_repo::delete_evidence_links_for_evidence(&tx, *evidence_id)
+        {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    for evidence_id in &evidence_ids {
+        if let Err(e) = storage::personal_knowledge_repo::delete_evidence(&tx, *evidence_id) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    for source_id in &source_ids {
+        if let Err(e) = storage::personal_knowledge_repo::delete_source_if_orphan(&tx, *source_id) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    if let Err(e) =
+        storage::personal_knowledge_repo::delete_fact_evidence_links_for_fact(&tx, target.id)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = storage::personal_knowledge_repo::delete_fact_forget_target(&tx, target.id) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    for entity_id in &candidate_entity_ids {
+        if let Err(e) =
+            storage::personal_knowledge_repo::delete_entity_if_orphan_non_self(&tx, *entity_id)
+        {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact_audit_log(
+        &tx,
+        target.id,
+        "ForgetMemory",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: target.id,
         confirmation_class: class,
     }
 }

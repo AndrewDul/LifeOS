@@ -102,28 +102,39 @@ Knowledge-specific confirmation overlay
 (`memory_action_requires_confirmation`) since `CorrectMemory`'s
 `ImportantChange` floor does not block an inferred correction the way
 `AddMemory`'s floor does. **(2026-09-18, R023)** Slice D -
-`ConfirmMemory`, the third production Personal Knowledge mutation - is
-now also implemented and tested (375/375 tests): a pure epistemic
-confirmation mutating the SAME Fact row in place (`epistemic_state ->
-UserConfirmed` and `updated_at` only, never a successor), needing no
-confirmation overlay since its `ExplicitAdd` floor is already dominated
-generically the same way `AddMemory`'s is. `ForgetMemory` still does not
-exist (Slice E+), and no Tauri command wires `AddMemory`/
-`CorrectMemory`/`ConfirmMemory` into the running app yet. See
-`PROJECT_STATE.md` §4o-§4u,
+`ConfirmMemory`, the third production Personal Knowledge mutation - was
+implemented and tested (375/375 tests): a pure epistemic confirmation
+mutating the SAME Fact row in place (`epistemic_state -> UserConfirmed`
+and `updated_at` only, never a successor), needing no confirmation
+overlay since its `ExplicitAdd` floor is already dominated generically
+the same way `AddMemory`'s is. **(2026-09-18, R024)** Slice E -
+`ForgetMemory`, the fourth production Personal Knowledge mutation and
+the first hard-DELETE action - is now also implemented and tested
+(398/398 tests): implements R019's final 14-step privacy-safe
+algorithm, physically removing the target Fact from the canonical
+model, scrubbing every existing audit snapshot for it, clearing inbound
+supersession references without rewiring the chain, always deleting
+linked Evidence even when shared with a retained Fact/Relation/Episode,
+and deleting an orphaned Source/Entity only when truly orphaned (SELF
+is never deleted). `Delete` blocks every unconfirmed call regardless of
+provenance, and there is no Undo. All four frozen Memory actions now
+exist; Relation actions, Episode actions, and retrieval/Context Pack
+all remain entirely unstarted, and no Tauri command wires any Memory
+action into the running app yet. See `PROJECT_STATE.md` §4o-§4v,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
 `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`,
 `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`,
+`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`,
 and
-`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`.
+`docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
-Milestone, Task, and now the Personal Knowledge Slices A/B/C/D).
+Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E).
 
 ---
 
@@ -892,21 +903,38 @@ and `updated_at` only, never a successor Fact, never a new Entity/
 Source/Evidence), rejecting an already-`USER_CONFIRMED` Fact as a
 no-op and an inactive Fact via the reused `is_active_fact` predicate,
 never touching a sibling `DISPUTED` Fact sharing the same subject/
-predicate, validated and tested end-to-end (375/375 tests).
-**`ForgetMemory` still does NOT exist**, and no Tauri command wires
-`AddMemory`/`CorrectMemory`/`ConfirmMemory` into the running app yet —
-no Personal Knowledge data can be created, corrected, or confirmed
-through the UI, only through direct Core calls; Slice E
-(`ForgetMemory`) is the recommended next step (R023 §30). See
-`docs/PROJECT_STATE.md` §4o-§4u,
+predicate, validated and tested end-to-end (375/375 tests). **As of
+2026-09-18 (R024), Slice E is also real, implemented code**:
+`ForgetMemory` — the fourth production Personal Knowledge mutation and
+the first hard-DELETE action — implements R019's final 14-step
+privacy-safe algorithm: the target Fact is physically removed (never a
+soft delete, never `Stale`), every existing audit snapshot targeting it
+is scrubbed, inbound supersession references are cleared WITHOUT
+rewiring the chain, every linked Evidence row is deleted even if shared
+with a retained Fact/Relation/Episode (privacy-first), and an orphaned
+Source/Entity is deleted only when truly orphaned — SELF is never
+deleted, `domain_ref` alone never retains an orphan. `Delete` blocks
+every unconfirmed call regardless of provenance (unlike every other
+Memory action), and there is no Undo — the result type is
+`ActionOutcome<FactId>`, never `ActionOutcome<Fact>`, so a success
+result can never hand back the forgotten semantic content. Validated
+and tested end-to-end (398/398 tests). **All four frozen Memory actions
+now exist.** Relation actions, Episode actions, and retrieval/Context
+Pack all remain entirely unstarted, and no Tauri command wires any
+Memory action into the running app yet — no Personal Knowledge data can
+be created, corrected, confirmed, or forgotten through the UI, only
+through direct Core calls; R024 §34 recommends among the three
+remaining candidates without deciding. See `docs/PROJECT_STATE.md`
+§4o-§4v,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
 `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`,
 `docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`,
+`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`,
 and
-`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`
+`docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`
 for full detail.
 
 ### 5.4 Action layer (frozen, M2)
