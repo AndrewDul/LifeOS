@@ -542,5 +542,456 @@ pub(crate) struct Task {
     pub updated_at: DateTime<Utc>,
 }
 
+// =========================================================================
+// Personal Knowledge Layer (M2 Slice A foundation, 2026-09-18) - the
+// six-table minimum frozen by R017 (M2 Personal Knowledge Layer
+// Architecture Freeze), corrected by R018 (M2 Personal Knowledge
+// Architecture Consistency Hardening) and R019 (M2 Personal Knowledge
+// Privacy and Foundation Finalization). This slice (R020) implements
+// ONLY the schema + SELF bootstrap + narrow Entity/Fact reads - no
+// AddMemory/CorrectMemory/ConfirmMemory/ForgetMemory exists yet.
+// `Relation`/`Episode` domain structs are deliberately NOT added here:
+// nothing in Slice A reads them (no `get_relation`/`get_episode`
+// function exists), and their own raw-SQL defense-in-depth tests
+// operate directly against the schema without needing a Rust struct -
+// adding one now would be speculative scaffolding for an action family
+// that remains deferred (R019 §13). `RelationId`/`EpisodeId` typed IDs
+// ARE added below, since the frozen join-table shapes and future
+// `ForgetMemory` orphan-Entity cleanup (R019 §8) already reference them
+// by type.
+// =========================================================================
+
+/// Personal Knowledge field-length bounds, frozen exactly as R018 §15
+/// specified (not re-chosen here) - reusing the existing `TITLE_MAX_LEN`
+/// (200) / `DESCRIPTION_MAX_LEN` (4000) / `DOMAIN_TAG_MAX_LEN` (60)
+/// tiers where R018 mapped a field onto one of them, plus the two new
+/// intermediate tiers (100, 500) R018 introduced.
+pub(crate) const ENTITY_TYPE_MAX_LEN: usize = 60;
+pub(crate) const CANONICAL_NAME_MAX_LEN: usize = 200;
+pub(crate) const DOMAIN_REF_TYPE_MAX_LEN: usize = 60;
+pub(crate) const DOMAIN_REF_ID_MAX_LEN: usize = 200;
+pub(crate) const PREDICATE_MAX_LEN: usize = 100;
+pub(crate) const VALUE_JSON_MAX_LEN: usize = 2000;
+pub(crate) const RELATION_TYPE_MAX_LEN: usize = 100;
+pub(crate) const RELATION_NOTE_MAX_LEN: usize = 4000;
+pub(crate) const EPISODE_TITLE_MAX_LEN: usize = 200;
+pub(crate) const EPISODE_SUMMARY_MAX_LEN: usize = 4000;
+pub(crate) const SOURCE_TYPE_MAX_LEN: usize = 60;
+pub(crate) const SOURCE_LABEL_MAX_LEN: usize = 200;
+pub(crate) const SOURCE_REFERENCE_MAX_LEN: usize = 500;
+pub(crate) const EVIDENCE_CONTENT_MAX_LEN: usize = 4000;
+pub(crate) const EVIDENCE_LOCATOR_MAX_LEN: usize = 200;
+
+/// Generic reusable bound check for a Personal Knowledge free-text
+/// field against its frozen max length (R018 §15) - `Err` carries the
+/// actual character count. Slice A has no action payload yet to attach
+/// a per-field `ValidationError` variant to (no `AddMemory` exists);
+/// this pure length-check is what Slice B's eventual payload validation
+/// will call, so the bound logic itself is proven now rather than
+/// re-derived later (this run's brief §28: "Core validators should
+/// support future Slice B without requiring semantic changes").
+pub(crate) fn validate_personal_knowledge_text_len(
+    value: &str,
+    max_len: usize,
+) -> Result<(), usize> {
+    let actual = value.chars().count();
+    if actual > max_len {
+        Err(actual)
+    } else {
+        Ok(())
+    }
+}
+
+/// Frozen, closed four-value sensitivity classification (R017 §13,
+/// extended to `Source` by R018 §13 and to `Entity` by R019 §3) -
+/// applies to all six Personal Knowledge tables. Independent of
+/// `EpistemicState`/confidence (three separate dimensions, R017 §7) and
+/// structurally independent per-row - never inherited automatically
+/// from a Fact to its Evidence, or from an Entity to a Fact that
+/// references it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Sensitivity {
+    Public,
+    Internal,
+    Sensitive,
+    NeverLeavesDevice,
+}
+
+impl Sensitivity {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Sensitivity::Public => "PUBLIC",
+            Sensitivity::Internal => "INTERNAL",
+            Sensitivity::Sensitive => "SENSITIVE",
+            Sensitivity::NeverLeavesDevice => "NEVER_LEAVES_DEVICE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "PUBLIC" => Some(Sensitivity::Public),
+            "INTERNAL" => Some(Sensitivity::Internal),
+            "SENSITIVE" => Some(Sensitivity::Sensitive),
+            "NEVER_LEAVES_DEVICE" => Some(Sensitivity::NeverLeavesDevice),
+            _ => None,
+        }
+    }
+}
+
+/// Frozen, closed eleven-value memory-type/category set (R017 §6) -
+/// unrenamed, unchanged, no additional variants. See R017 §6 for each
+/// value's precise, non-overlapping definition (e.g. `Fact` vs.
+/// `Observation` vs. `Hypothesis`; `Experience` vs.
+/// `EffectiveSolution`/`IneffectiveSolution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MemoryType {
+    Fact,
+    Preference,
+    Experience,
+    Decision,
+    Observation,
+    Hypothesis,
+    EffectiveSolution,
+    IneffectiveSolution,
+    Skill,
+    Habit,
+    CurrentState,
+}
+
+impl MemoryType {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            MemoryType::Fact => "FACT",
+            MemoryType::Preference => "PREFERENCE",
+            MemoryType::Experience => "EXPERIENCE",
+            MemoryType::Decision => "DECISION",
+            MemoryType::Observation => "OBSERVATION",
+            MemoryType::Hypothesis => "HYPOTHESIS",
+            MemoryType::EffectiveSolution => "EFFECTIVE_SOLUTION",
+            MemoryType::IneffectiveSolution => "INEFFECTIVE_SOLUTION",
+            MemoryType::Skill => "SKILL",
+            MemoryType::Habit => "HABIT",
+            MemoryType::CurrentState => "CURRENT_STATE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "FACT" => Some(MemoryType::Fact),
+            "PREFERENCE" => Some(MemoryType::Preference),
+            "EXPERIENCE" => Some(MemoryType::Experience),
+            "DECISION" => Some(MemoryType::Decision),
+            "OBSERVATION" => Some(MemoryType::Observation),
+            "HYPOTHESIS" => Some(MemoryType::Hypothesis),
+            "EFFECTIVE_SOLUTION" => Some(MemoryType::EffectiveSolution),
+            "INEFFECTIVE_SOLUTION" => Some(MemoryType::IneffectiveSolution),
+            "SKILL" => Some(MemoryType::Skill),
+            "HABIT" => Some(MemoryType::Habit),
+            "CURRENT_STATE" => Some(MemoryType::CurrentState),
+            _ => None,
+        }
+    }
+}
+
+/// Frozen, closed five-value epistemic-state set (R017 §7) - unrenamed,
+/// unchanged, no additional variants. `Inferred` is never equivalent to
+/// `UserConfirmed` and must never silently become it (R017 §7) - only
+/// an explicit future `ConfirmMemory` call can make that transition
+/// (Slice D, not implemented this run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum EpistemicState {
+    UserConfirmed,
+    Observed,
+    Inferred,
+    Disputed,
+    Stale,
+}
+
+impl EpistemicState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            EpistemicState::UserConfirmed => "USER_CONFIRMED",
+            EpistemicState::Observed => "OBSERVED",
+            EpistemicState::Inferred => "INFERRED",
+            EpistemicState::Disputed => "DISPUTED",
+            EpistemicState::Stale => "STALE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "USER_CONFIRMED" => Some(EpistemicState::UserConfirmed),
+            "OBSERVED" => Some(EpistemicState::Observed),
+            "INFERRED" => Some(EpistemicState::Inferred),
+            "DISPUTED" => Some(EpistemicState::Disputed),
+            "STALE" => Some(EpistemicState::Stale),
+            _ => None,
+        }
+    }
+}
+
+/// A stable, globally unique Entity identifier - same UUID v7 design as
+/// every other M2 entity ID (M2 Personal Knowledge Slice A, 2026-09-18).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct EntityId(pub Uuid);
+
+impl EntityId {
+    pub(crate) fn new() -> Self {
+        EntityId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(EntityId)
+    }
+}
+
+impl std::fmt::Display for EntityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique Fact identifier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct FactId(pub Uuid);
+
+impl FactId {
+    pub(crate) fn new() -> Self {
+        FactId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(FactId)
+    }
+}
+
+impl std::fmt::Display for FactId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique Personal Knowledge Relation identifier -
+/// deliberately its own type, never interchangeable with
+/// `GoalRelationId` (a completely different entity on a completely
+/// different, closed-enum-typed table, R017 §8).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct RelationId(pub Uuid);
+
+impl RelationId {
+    pub(crate) fn new() -> Self {
+        RelationId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(RelationId)
+    }
+}
+
+impl std::fmt::Display for RelationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique Episode identifier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct EpisodeId(pub Uuid);
+
+impl EpisodeId {
+    pub(crate) fn new() -> Self {
+        EpisodeId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(EpisodeId)
+    }
+}
+
+impl std::fmt::Display for EpisodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique Source identifier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct SourceId(pub Uuid);
+
+impl SourceId {
+    pub(crate) fn new() -> Self {
+        SourceId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(SourceId)
+    }
+}
+
+impl std::fmt::Display for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A stable, globally unique Evidence identifier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct EvidenceId(pub Uuid);
+
+impl EvidenceId {
+    pub(crate) fn new() -> Self {
+        EvidenceId(Uuid::now_v7())
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(EvidenceId)
+    }
+}
+
+impl std::fmt::Display for EvidenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// An `Entity`'s optional pointer to an existing structured-domain row
+/// (e.g. a `Goal`/`Project`/`Task`/`Milestone`) - deliberately NOT an
+/// enforced FK at the SQL level (R017 §24/R019 §6); both fields are
+/// always present together or both absent (DB `CHECK`,
+/// `V7__create_personal_knowledge.sql`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DomainRef {
+    pub domain_ref_type: String,
+    pub domain_ref_id: String,
+}
+
+/// `Entity` (M2 Personal Knowledge Slice A, 2026-09-18) - a stable node
+/// Personal Knowledge can refer to (the user, another person, a place,
+/// a domain object, a concept). Field set is exactly the frozen R017
+/// §4/R019 §3 definition: `id`, `entity_type` (open vocabulary),
+/// `canonical_name`, `is_self`, `sensitivity`, `domain_ref` (nullable
+/// pair), `created_at`/`updated_at`.
+///
+/// **Mutability**: after creation, only `canonical_name`/`entity_type`/
+/// `domain_ref`/`updated_at` could ever change via a future
+/// `UpdateEntity`-shaped action - **no such action is frozen or
+/// implemented this run** (R017 §4) - entities are otherwise immutable
+/// for v0.1.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Entity {
+    pub id: EntityId,
+    pub entity_type: String,
+    pub canonical_name: String,
+    pub is_self: bool,
+    pub sensitivity: Sensitivity,
+    pub domain_ref: Option<DomainRef>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// `Source` (M2 Personal Knowledge Slice A, 2026-09-18) - provenance
+/// metadata only, answering "where did this knowledge come from?"
+/// (R017 §10). Field set is exactly the frozen R017 §10/R019 §14
+/// definition: `id`, `source_type` (open vocabulary), `label`
+/// (nullable), `reference` (nullable locator/pointer, never raw
+/// content), `sensitivity`, `captured_at` (when the information was
+/// captured/observed, distinct from `created_at`, the row-insert time).
+/// **Deliberately no payload/excerpt field** - `Evidence` is the only
+/// place a personal/sensitive excerpt is allowed to live.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Source {
+    pub id: SourceId,
+    pub source_type: String,
+    pub label: Option<String>,
+    pub reference: Option<String>,
+    pub sensitivity: Sensitivity,
+    pub captured_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `Evidence` (M2 Personal Knowledge Slice A, 2026-09-18) - the
+/// specific supporting payload/snippet/observation for a piece of
+/// knowledge, answering "what specifically supports this?" (R017 §11).
+/// Field set is exactly the frozen R017 §11/R019 §15 definition: `id`,
+/// `source_id`, `content` (nullable), `locator` (nullable, a pointer
+/// *within* the source), `sensitivity`, `created_at`. At least one of
+/// `content`/`locator` is required (DB `CHECK`,
+/// `V7__create_personal_knowledge.sql`) - otherwise indistinguishable
+/// from bare `Source` metadata.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Evidence {
+    pub id: EvidenceId,
+    pub source_id: SourceId,
+    pub content: Option<String>,
+    pub locator: Option<String>,
+    pub sensitivity: Sensitivity,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A `Fact`'s exactly-one semantic object (R017 §5/§7's frozen
+/// one-semantic-object invariant) - a Rust-level sum type mapped down
+/// to the two nullable `(value_json, object_entity_id)` columns at the
+/// storage layer, so "exactly one was provided" is unrepresentable at
+/// the type level rather than a runtime check (R017 §17).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FactValue {
+    /// JSON-encoded scalar or small structured value - data only, never
+    /// executable content (R017 §5).
+    Scalar(String),
+    /// The predicate resolves to another Entity, not a scalar.
+    EntityRef(EntityId),
+}
+
+/// `Fact` (M2 Personal Knowledge Slice A, 2026-09-18) - the central
+/// Personal-Knowledge assertion, a structured subject-predicate-object
+/// triple (R017 §5, corrected from R003's opaque `content` blob).
+/// Field set is exactly the frozen R017 §5 definition: `id`,
+/// `subject_entity_id` (NOT NULL), `predicate` (open vocabulary),
+/// `value` (`FactValue`, exactly one semantic object), `memory_type`
+/// (11 frozen values), `epistemic_state` (5 frozen values),
+/// `confidence` (nullable, 0.0-1.0), `sensitivity`, `valid_from`,
+/// `valid_until` (nullable = active), `superseded_by_fact_id`
+/// (nullable), `created_at`/`updated_at`. **No `source_id` field** -
+/// provenance flows exclusively through the future `fact_evidence` link
+/// table to `Evidence.source_id` to `Source` (R017 §5 item 4).
+///
+/// **Mutability contract (R017 §5)**: after creation, only
+/// `epistemic_state`/`confidence`/`sensitivity`/`valid_until`/
+/// `superseded_by_fact_id`/`updated_at` may ever change - via a future
+/// `ConfirmMemory` (epistemic_state only) or as the predecessor
+/// side-effect of a future `CorrectMemory`. `subject_entity_id`,
+/// `predicate`, `value`, `memory_type`, and `created_at` are immutable
+/// for the life of the row. **Neither `ConfirmMemory` nor
+/// `CorrectMemory` is implemented this run** - this struct exists for
+/// Slice A's schema/read-side proof only.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Fact {
+    pub id: FactId,
+    pub subject_entity_id: EntityId,
+    pub predicate: String,
+    pub value: FactValue,
+    pub memory_type: MemoryType,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub superseded_by_fact_id: Option<FactId>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests;

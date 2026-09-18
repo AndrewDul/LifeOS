@@ -10,7 +10,10 @@ use crate::actions::{
     ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
-use crate::domain::{GoalRelationType, LifecycleStatus, MilestoneStatus, TaskStatus};
+use crate::domain::{
+    DomainRef, EpistemicState, Evidence, EvidenceId, FactValue, GoalRelationType, LifecycleStatus,
+    MemoryType, MilestoneStatus, Source, SourceId, TaskStatus,
+};
 use std::fs;
 use std::io::Read;
 
@@ -8319,4 +8322,1268 @@ fn req_dkl12_backend_delete_error_during_cleanup_does_not_mask_original_error() 
     );
     assert!(!path.exists());
     println!("[req_dkl12] PASS - documented residual state after a failed cleanup delete: original init error surfaced unchanged, orphan credential left behind (best-effort cleanup, not silently masked)");
+}
+
+// =========================================================================
+// M2 Personal Knowledge Slice A Foundation (R020, 2026-09-18) - the V7
+// eleven-table schema, `ensure_self_entity` bootstrap, narrow
+// `get_entity`/`get_fact` reads, and `secure_delete = ON` storage
+// hardening. Evidence for
+// `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
+//
+// NO AddMemory/CorrectMemory/ConfirmMemory/ForgetMemory exists yet
+// (Slice B+) - every test below either proves schema/DB-level
+// integrity via deliberate raw SQL (the same "attempt the illegal
+// thing, capture the real rejection" style already established
+// throughout M2), or exercises `ensure_self_entity`/`get_entity`/
+// `get_fact` through test-fixture inserts
+// (`storage::personal_knowledge_repo::insert_*`, `#[cfg(test)]`-only),
+// never a production Memory action.
+// =========================================================================
+
+fn mk_pk_entity(entity_type: &str, canonical_name: &str, sensitivity: Sensitivity) -> Entity {
+    let now = Utc::now();
+    Entity {
+        id: EntityId::new(),
+        entity_type: entity_type.to_string(),
+        canonical_name: canonical_name.to_string(),
+        is_self: false,
+        sensitivity,
+        domain_ref: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn mk_pk_source(source_type: &str, sensitivity: Sensitivity) -> Source {
+    let now = Utc::now();
+    Source {
+        id: SourceId::new(),
+        source_type: source_type.to_string(),
+        label: None,
+        reference: None,
+        sensitivity,
+        captured_at: now,
+        created_at: now,
+    }
+}
+
+fn mk_pk_evidence(
+    source_id: SourceId,
+    content: Option<&str>,
+    sensitivity: Sensitivity,
+) -> Evidence {
+    Evidence {
+        id: EvidenceId::new(),
+        source_id,
+        content: content.map(|s| s.to_string()),
+        locator: if content.is_none() {
+            Some("test-locator".to_string())
+        } else {
+            None
+        },
+        sensitivity,
+        created_at: Utc::now(),
+    }
+}
+
+fn mk_pk_fact(
+    subject_entity_id: EntityId,
+    predicate: &str,
+    value: FactValue,
+    memory_type: MemoryType,
+    epistemic_state: EpistemicState,
+    sensitivity: Sensitivity,
+) -> Fact {
+    let now = Utc::now();
+    Fact {
+        id: FactId::new(),
+        subject_entity_id,
+        predicate: predicate.to_string(),
+        value,
+        memory_type,
+        epistemic_state,
+        confidence: None,
+        sensitivity,
+        valid_from: now,
+        valid_until: None,
+        superseded_by_fact_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+// --- Secure delete (R019 §17, corrected R020 §1; implemented R020 §17-19) --
+
+/// Requirement 1: a freshly-opened encrypted connection has
+/// `secure_delete` actively ON.
+#[test]
+fn req_sd1_secure_delete_on_for_fresh_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "sd1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let value: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        value, 1,
+        "[req_sd1] FAIL - secure_delete was not ON on a fresh connection"
+    );
+    println!("[req_sd1] PASS - secure_delete = ON on a fresh encrypted connection");
+}
+
+/// Requirement 2: `secure_delete` is applied again on every connection,
+/// not merely assumed to persist in the database file across a
+/// close+reopen.
+#[test]
+fn req_sd2_secure_delete_on_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "sd2.db");
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        drop(conn);
+    }
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let value: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        value, 1,
+        "[req_sd2] FAIL - secure_delete was not ON after reopen"
+    );
+    println!("[req_sd2] PASS - secure_delete = ON after close+reopen, proving it is actively applied per-connection, not merely assumed persistent");
+}
+
+/// Requirement 3: wrong-key rejection behavior is unchanged by the
+/// `secure_delete` hardening.
+#[test]
+fn req_sd3_wrong_key_behavior_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "sd3.db");
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        drop(conn);
+    }
+    let wrong_key = generate_test_key_hex();
+    let conn = storage::open_encrypted(&path, &wrong_key).unwrap();
+    let result = storage::verify_key(&conn);
+    assert!(
+        result.is_err(),
+        "[req_sd3] FAIL - a wrong key should still fail verify_key after the secure_delete change"
+    );
+    println!("[req_sd3] PASS - wrong-key rejection is unchanged by the secure_delete hardening");
+}
+
+/// Requirement 4: encryption-at-rest is unchanged by the
+/// `secure_delete` hardening (no plaintext SQLite header).
+#[test]
+fn req_sd4_encryption_at_rest_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "sd4.db");
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        drop(conn);
+    }
+    let mut raw = Vec::new();
+    fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut raw)
+        .unwrap();
+    assert!(
+        !raw.windows(6).any(|w| w == b"SQLite"),
+        "[req_sd4] FAIL - file starts with the plaintext SQLite header"
+    );
+    println!("[req_sd4] PASS - encryption-at-rest unchanged by the secure_delete hardening");
+}
+
+/// Requirement 5: `foreign_keys` and `secure_delete` are both ON
+/// simultaneously on the same connection.
+#[test]
+fn req_sd5_foreign_keys_on_simultaneously_with_secure_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "sd5.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let fk: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
+    let sd: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk, 1, "[req_sd5] FAIL - foreign_keys not ON");
+    assert_eq!(sd, 1, "[req_sd5] FAIL - secure_delete not ON");
+    println!("[req_sd5] PASS - foreign_keys and secure_delete are both ON simultaneously");
+}
+
+// --- Journal mode (R019 §17, observation only) --------------------------
+
+/// Observation only (R019 §17/R020 §20) - this test does NOT assert or
+/// force a specific mode; it records the actually-measured value for
+/// R020's report. No `journal_mode` PRAGMA is set anywhere in this
+/// codebase, so this reflects SQLite's/SQLCipher's own compiled
+/// default for this exact `rusqlite`+`bundled-sqlcipher` 0.37.0 build.
+#[test]
+fn req_jm1_measure_current_journal_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "jm1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    println!("[req_jm1] MEASURED - PRAGMA journal_mode = {mode}");
+}
+
+// --- SELF bootstrap (R019 §3, corrected/implemented R020 §21-23) --------
+
+/// Requirement A: a fresh bootstrap creates exactly one SELF entity.
+#[test]
+fn req_self1_fresh_bootstrap_creates_exactly_one_self() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "self1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM entities WHERE is_self = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "[req_self1] FAIL - expected exactly one SELF entity after fresh bootstrap"
+    );
+    println!("[req_self1] PASS - fresh bootstrap creates exactly one SELF entity");
+}
+
+/// Requirements B-E: the SELF id survives a close+reopen unchanged.
+#[test]
+fn req_self2_self_id_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "self2.db");
+    let first_id;
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        first_id = ensure_self_entity(&conn).unwrap().id;
+    }
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let self_entity = ensure_self_entity(&conn).unwrap();
+        assert_eq!(
+            self_entity.id, first_id,
+            "[req_self2] FAIL - SELF id changed across close+reopen"
+        );
+    }
+    println!("[req_self2] PASS - SELF entity id survives close and reopen unchanged");
+}
+
+/// Requirement F: `ensure_self_entity` is idempotent across 3+ repeated
+/// calls - same id, still exactly one row.
+#[test]
+fn req_self3_ensure_self_entity_idempotent_repeated_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "self3.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let first = ensure_self_entity(&conn).unwrap();
+    for i in 0..3 {
+        let again = ensure_self_entity(&conn).unwrap();
+        assert_eq!(
+            again.id, first.id,
+            "[req_self3] FAIL - repeated call #{i} returned a different SELF id"
+        );
+    }
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM entities WHERE is_self = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "[req_self3] FAIL - repeated ensure_self_entity calls created more than one SELF row"
+    );
+    println!("[req_self3] PASS - ensure_self_entity is idempotent across repeated calls, still exactly one row");
+}
+
+/// Requirement G: a raw second `is_self = 1` insert is rejected by the
+/// real DB partial unique index.
+#[test]
+fn req_self4_raw_duplicate_self_insert_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "self4.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now().to_rfc3339();
+    let result = conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'person', 'DUPLICATE_SELF', 1, 'INTERNAL', NULL, NULL, ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now],
+    );
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "[req_self4] FAIL - expected a constraint-violation error, got {err:?}"
+            );
+            println!("[req_self4] PASS - a second raw is_self=1 insert is rejected by the real DB unique index: {err:?}");
+        }
+        other => panic!("[req_self4] FAIL - expected a constraint-violation error, got {other:?}"),
+    }
+}
+
+/// Requirement H: the canonical SELF row matches the frozen shape
+/// exactly.
+#[test]
+fn req_self5_canonical_self_row_exact_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "self5.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_entity = ensure_self_entity(&conn).unwrap();
+    assert_eq!(self_entity.entity_type, "person");
+    assert_eq!(self_entity.canonical_name, "SELF");
+    assert!(self_entity.is_self);
+    assert_eq!(self_entity.sensitivity, Sensitivity::Internal);
+    assert!(self_entity.domain_ref.is_none());
+    println!("[req_self5] PASS - canonical SELF row matches the frozen shape exactly: entity_type=person, canonical_name=SELF, is_self=true, sensitivity=INTERNAL, domain_ref=None");
+}
+
+// --- Migration tests (R020 §30) ------------------------------------------
+
+/// A fresh V1-through-V7 migration succeeds; all eleven Personal
+/// Knowledge tables exist.
+#[test]
+fn req_mig1_fresh_v1_through_v7_migration_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    for table in [
+        "entities",
+        "sources",
+        "evidence",
+        "facts",
+        "relations",
+        "episodes",
+        "fact_evidence",
+        "relation_evidence",
+        "episode_evidence",
+        "episode_entities",
+        "fact_audit_log",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "[req_mig1] FAIL - table {table} does not exist after fresh migration"
+        );
+    }
+    println!(
+        "[req_mig1] PASS - fresh V1-V7 migration succeeds, all 11 Personal Knowledge tables exist"
+    );
+}
+
+/// A populated V6 database (real Goal/Project/Milestone/Task/
+/// GoalRelation rows - the actual shape of an existing user's database
+/// before this run) upgrades to V7 non-destructively: old data
+/// unchanged, Personal Knowledge tables exist, SELF entity created by
+/// the upgrade bootstrap.
+#[test]
+fn req_mig2_populated_v6_database_upgrades_non_destructively_to_v7() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "mig2.db");
+
+    let goal_id;
+    let project_id;
+    let milestone_id;
+    let task_id;
+    let relation_id;
+    {
+        let mut conn = bootstrap_db_at_version(&path, &key, 6).unwrap();
+        let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Pre-V7 goal")) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = goal.id;
+        let project = match create_project(
+            &mut conn,
+            ui_explicit(),
+            mk_create_project_payload("Pre-V7 project", Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        project_id = project.id;
+        let milestone = match add_milestone(
+            &mut conn,
+            ui_explicit(),
+            mk_add_milestone_payload(project_id, "Pre-V7 milestone", 0),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        milestone_id = milestone.id;
+        let task = match add_task(
+            &mut conn,
+            ui_explicit(),
+            mk_add_task_payload("Pre-V7 task", None, Some(project_id), Some(goal_id)),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        task_id = task.id;
+        let goal2 = match create_goal(
+            &mut conn,
+            ui_explicit(),
+            mk_create_payload("Pre-V7 second goal"),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        let relation = match link_goals(
+            &mut conn,
+            ui_explicit(),
+            mk_link_payload(goal_id, goal2.id, GoalRelationType::Supports),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        relation_id = relation.id;
+    }
+
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        assert!(
+            get_goal(&conn, goal_id).unwrap().is_some(),
+            "[req_mig2] FAIL - pre-V7 Goal lost"
+        );
+        assert!(
+            get_project(&conn, project_id).unwrap().is_some(),
+            "[req_mig2] FAIL - pre-V7 Project lost"
+        );
+        assert!(
+            get_milestone(&conn, milestone_id).unwrap().is_some(),
+            "[req_mig2] FAIL - pre-V7 Milestone lost"
+        );
+        assert!(
+            get_task(&conn, task_id).unwrap().is_some(),
+            "[req_mig2] FAIL - pre-V7 Task lost"
+        );
+        assert!(
+            get_goal_relation(&conn, relation_id).unwrap().is_some(),
+            "[req_mig2] FAIL - pre-V7 GoalRelation lost"
+        );
+
+        let self_count: i64 = conn
+            .query_row("SELECT count(*) FROM entities WHERE is_self = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            self_count, 1,
+            "[req_mig2] FAIL - SELF entity not created during the V6->V7 upgrade bootstrap"
+        );
+        println!("[req_mig2] PASS - populated V6 database upgrades to V7 non-destructively: all pre-existing Goal/Project/Milestone/Task/GoalRelation data survives, Personal Knowledge tables exist, SELF entity created");
+    }
+}
+
+// --- Raw DB defense test matrix (R020 §31) -------------------------------
+
+/// Entity: invalid sensitivity, half-populated domain_ref pair,
+/// duplicate non-NULL domain_ref pair (duplicate SELF is covered
+/// separately by `req_self4`).
+#[test]
+fn req_pk_entity_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkentity.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    // invalid sensitivity
+    let result = conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'person', 'Bad Sensitivity', 0, 'NOT_A_REAL_LEVEL', NULL, NULL, ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_entity] FAIL - invalid sensitivity should be rejected"
+    );
+
+    // half-populated domain_ref pair (type set, id NULL)
+    let result = conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'project', 'Half Domain Ref', 0, 'INTERNAL', 'Project', NULL, ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_entity] FAIL - half-populated domain_ref pair should be rejected"
+    );
+
+    // duplicate non-NULL domain_ref pair
+    let shared_domain_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'project', 'First Pointer', 0, 'INTERNAL', 'Project', ?2, ?3, ?3)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), shared_domain_id, now],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'project', 'Second Pointer', 0, 'INTERNAL', 'Project', ?2, ?3, ?3)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), shared_domain_id, now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_entity] FAIL - duplicate (domain_ref_type, domain_ref_id) should be rejected"
+    );
+
+    println!("[req_pk_entity] PASS - invalid sensitivity, half-populated domain_ref, and duplicate domain_ref are all rejected by real DB constraints");
+}
+
+/// Source: invalid sensitivity.
+#[test]
+fn req_pk_source_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pksource.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    let result = conn.execute(
+        "INSERT INTO sources (id, source_type, label, reference, sensitivity, captured_at, created_at)
+         VALUES (?1, 'USER_INPUT', NULL, NULL, 'NOT_A_REAL_LEVEL', ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_source] FAIL - invalid sensitivity should be rejected"
+    );
+    println!("[req_pk_source] PASS - invalid sensitivity rejected by the real DB CHECK constraint");
+}
+
+/// Evidence: invalid sensitivity, nonexistent source FK, content NULL
+/// + locator NULL together.
+#[test]
+fn req_pk_evidence_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkevidence.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let source = mk_pk_source("USER_INPUT", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    let result = conn.execute(
+        "INSERT INTO evidence (id, source_id, content, locator, sensitivity, created_at)
+         VALUES (?1, ?2, 'some content', NULL, 'NOT_A_REAL_LEVEL', ?3)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), source.id.to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_evidence] FAIL - invalid sensitivity should be rejected"
+    );
+
+    let fake_source_id = SourceId::new().to_string();
+    let result = conn.execute(
+        "INSERT INTO evidence (id, source_id, content, locator, sensitivity, created_at)
+         VALUES (?1, ?2, 'some content', NULL, 'INTERNAL', ?3)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), fake_source_id, now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_evidence] FAIL - nonexistent source_id FK should be rejected"
+    );
+
+    let result = conn.execute(
+        "INSERT INTO evidence (id, source_id, content, locator, sensitivity, created_at)
+         VALUES (?1, ?2, NULL, NULL, 'INTERNAL', ?3)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), source.id.to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_evidence] FAIL - content NULL + locator NULL together should be rejected"
+    );
+
+    println!("[req_pk_evidence] PASS - invalid sensitivity, nonexistent source FK, and content+locator both NULL are all rejected");
+}
+
+/// Fact: nonexistent subject/object FKs, neither/both semantic object,
+/// invalid memory_type/epistemic_state/sensitivity, confidence out of
+/// bounds, self-supersession, nonexistent superseded-fact FK.
+#[test]
+fn req_pk_fact_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkfact.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let subject = mk_pk_entity("person", "Fact Defense Subject", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    let base_insert = |id: String,
+                       subject_id: String,
+                       predicate: &str,
+                       value_json: Option<&str>,
+                       object_entity_id: Option<String>,
+                       memory_type: &str,
+                       epistemic_state: &str,
+                       confidence: Option<f64>,
+                       sensitivity: &str,
+                       superseded_by: Option<String>| {
+        conn.execute(
+            "INSERT INTO facts (id, subject_entity_id, predicate, value_json, object_entity_id, memory_type, epistemic_state, confidence, sensitivity, valid_from, valid_until, superseded_by_fact_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?10, ?10)",
+            rusqlite::params![id, subject_id, predicate, value_json, object_entity_id, memory_type, epistemic_state, confidence, sensitivity, now, superseded_by],
+        )
+    };
+
+    // nonexistent subject FK
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        EntityId::new().to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - nonexistent subject_entity_id should be rejected"
+    );
+
+    // nonexistent object entity FK
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        None,
+        Some(EntityId::new().to_string()),
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - nonexistent object_entity_id should be rejected"
+    );
+
+    // neither value_json nor object_entity_id
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        None,
+        None,
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - neither value_json nor object_entity_id should be rejected"
+    );
+
+    // both value_json and object_entity_id
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        Some(subject.id.to_string()),
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - both value_json and object_entity_id should be rejected"
+    );
+
+    // invalid memory_type
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "NOT_A_REAL_TYPE",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - invalid memory_type should be rejected"
+    );
+
+    // invalid epistemic_state
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "NOT_A_REAL_STATE",
+        None,
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - invalid epistemic_state should be rejected"
+    );
+
+    // invalid sensitivity
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        None,
+        "NOT_A_REAL_LEVEL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - invalid sensitivity should be rejected"
+    );
+
+    // confidence < 0
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        Some(-0.1),
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - confidence < 0 should be rejected"
+    );
+
+    // confidence > 1
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        Some(1.1),
+        "INTERNAL",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - confidence > 1 should be rejected"
+    );
+
+    // self supersession
+    let self_superseding_id = uuid::Uuid::now_v7().to_string();
+    let result = base_insert(
+        self_superseding_id.clone(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        Some(self_superseding_id),
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - a fact superseding itself should be rejected"
+    );
+
+    // nonexistent superseded-fact FK
+    let result = base_insert(
+        uuid::Uuid::now_v7().to_string(),
+        subject.id.to_string(),
+        "p",
+        Some("1"),
+        None,
+        "FACT",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+        Some(FactId::new().to_string()),
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_fact] FAIL - a nonexistent superseded_by_fact_id should be rejected"
+    );
+
+    println!("[req_pk_fact] PASS - all 11 Fact defense-in-depth checks rejected as expected");
+}
+
+/// Relation: nonexistent from/to Entity FKs, invalid epistemic_state,
+/// invalid sensitivity, confidence bounds, self-edge rejected, and a
+/// `relation_type` genuinely outside GoalRelation's 11 closed values is
+/// still accepted - proving the vocabulary is genuinely open.
+#[test]
+fn req_pk_relation_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrelation.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let from = mk_pk_entity("person", "Relation From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("person", "Relation To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    let insert = |id: String,
+                  from_id: String,
+                  to_id: String,
+                  relation_type: &str,
+                  epistemic_state: &str,
+                  confidence: Option<f64>,
+                  sensitivity: &str| {
+        conn.execute(
+            "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, ?8)",
+            rusqlite::params![id, from_id, to_id, relation_type, epistemic_state, confidence, sensitivity, now],
+        )
+    };
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        EntityId::new().to_string(),
+        to.id.to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - nonexistent from_entity_id should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        EntityId::new().to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - nonexistent to_entity_id should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        to.id.to_string(),
+        "CUSTOM_TYPE",
+        "NOT_A_REAL_STATE",
+        None,
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - invalid epistemic_state should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        to.id.to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        None,
+        "NOT_A_REAL_LEVEL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - invalid sensitivity should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        to.id.to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        Some(-0.1),
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - confidence < 0 should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        to.id.to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        Some(1.1),
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - confidence > 1 should be rejected"
+    );
+
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        from.id.to_string(),
+        "CUSTOM_TYPE",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_relation] FAIL - a self-edge (from == to) should be rejected"
+    );
+
+    // Genuinely open vocabulary: a relation_type far outside
+    // GoalRelation's 11 closed values must still be ACCEPTED.
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        from.id.to_string(),
+        to.id.to_string(),
+        "THIS_IS_NOT_A_GOALRELATION_VALUE_AT_ALL",
+        "OBSERVED",
+        None,
+        "INTERNAL",
+    );
+    assert!(
+        result.is_ok(),
+        "[req_pk_relation] FAIL - a relation_type outside GoalRelation's 11 values must be ACCEPTED (the vocabulary is genuinely open): {result:?}"
+    );
+
+    println!("[req_pk_relation] PASS - all 6 Relation defense-in-depth rejections hold, and a relation_type outside GoalRelation's 11 closed values is genuinely accepted");
+}
+
+/// Episode: invalid sensitivity, `ended_at < started_at` rejected.
+#[test]
+fn req_pk_episode_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkepisode.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now();
+    let earlier = (now - chrono::Duration::hours(1)).to_rfc3339();
+    let now_str = now.to_rfc3339();
+
+    let result = conn.execute(
+        "INSERT INTO episodes (id, title, summary, started_at, ended_at, sensitivity, created_at, updated_at)
+         VALUES (?1, NULL, 'summary', ?2, NULL, 'NOT_A_REAL_LEVEL', ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_episode] FAIL - invalid sensitivity should be rejected"
+    );
+
+    // ended_at (earlier) < started_at (now) - rejected.
+    let result = conn.execute(
+        "INSERT INTO episodes (id, title, summary, started_at, ended_at, sensitivity, created_at, updated_at)
+         VALUES (?1, NULL, 'summary', ?2, ?3, 'INTERNAL', ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now_str, earlier],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_episode] FAIL - ended_at before started_at should be rejected"
+    );
+
+    println!("[req_pk_episode] PASS - invalid sensitivity and ended_at-before-started_at are both rejected");
+}
+
+/// Join tables: nonexistent referenced IDs rejected, duplicate link
+/// rejected by the composite primary key.
+#[test]
+fn req_pk_join_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkjoin.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let source = mk_pk_source("USER_INPUT", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let evidence = mk_pk_evidence(source.id, Some("evidence content"), Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_evidence(&conn, &evidence).unwrap();
+    let subject = mk_pk_entity("person", "Join Defense Subject", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    let fact = mk_pk_fact(
+        subject.id,
+        "join_defense_predicate",
+        FactValue::Scalar("1".to_string()),
+        MemoryType::Fact,
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &fact).unwrap();
+    let now = Utc::now();
+
+    // nonexistent fact_id
+    let result = storage::personal_knowledge_repo::insert_fact_evidence_link(
+        &conn,
+        FactId::new(),
+        evidence.id,
+        now,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join] FAIL - a nonexistent fact_id in fact_evidence should be rejected"
+    );
+
+    // nonexistent evidence_id
+    let result = storage::personal_knowledge_repo::insert_fact_evidence_link(
+        &conn,
+        fact.id,
+        EvidenceId::new(),
+        now,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join] FAIL - a nonexistent evidence_id in fact_evidence should be rejected"
+    );
+
+    // valid link, then a duplicate of the exact same link
+    storage::personal_knowledge_repo::insert_fact_evidence_link(&conn, fact.id, evidence.id, now)
+        .unwrap();
+    assert!(
+        storage::personal_knowledge_repo::fact_evidence_link_exists(&conn, fact.id, evidence.id)
+            .unwrap(),
+        "[req_pk_join] FAIL - the valid link was not actually inserted"
+    );
+    let result = storage::personal_knowledge_repo::insert_fact_evidence_link(
+        &conn,
+        fact.id,
+        evidence.id,
+        now,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join] FAIL - a duplicate (fact_id, evidence_id) link should be rejected by the composite primary key"
+    );
+
+    println!("[req_pk_join] PASS - fact_evidence rejects nonexistent fact_id/evidence_id and duplicate links");
+}
+
+// --- Length-bound tests (R020 §32) ---------------------------------------
+
+/// Table-driven proof of all 15 R018-frozen max-length constants: N
+/// characters accepted, N+1 rejected, via the shared
+/// `domain::validate_personal_knowledge_text_len` helper (R020 §28).
+#[test]
+fn req_pklen1_all_frozen_length_constants_enforced() {
+    let constants: [(&str, usize); 15] = [
+        ("ENTITY_TYPE_MAX_LEN", crate::domain::ENTITY_TYPE_MAX_LEN),
+        (
+            "CANONICAL_NAME_MAX_LEN",
+            crate::domain::CANONICAL_NAME_MAX_LEN,
+        ),
+        (
+            "DOMAIN_REF_TYPE_MAX_LEN",
+            crate::domain::DOMAIN_REF_TYPE_MAX_LEN,
+        ),
+        (
+            "DOMAIN_REF_ID_MAX_LEN",
+            crate::domain::DOMAIN_REF_ID_MAX_LEN,
+        ),
+        ("PREDICATE_MAX_LEN", crate::domain::PREDICATE_MAX_LEN),
+        ("VALUE_JSON_MAX_LEN", crate::domain::VALUE_JSON_MAX_LEN),
+        (
+            "RELATION_TYPE_MAX_LEN",
+            crate::domain::RELATION_TYPE_MAX_LEN,
+        ),
+        (
+            "RELATION_NOTE_MAX_LEN",
+            crate::domain::RELATION_NOTE_MAX_LEN,
+        ),
+        (
+            "EPISODE_TITLE_MAX_LEN",
+            crate::domain::EPISODE_TITLE_MAX_LEN,
+        ),
+        (
+            "EPISODE_SUMMARY_MAX_LEN",
+            crate::domain::EPISODE_SUMMARY_MAX_LEN,
+        ),
+        ("SOURCE_TYPE_MAX_LEN", crate::domain::SOURCE_TYPE_MAX_LEN),
+        ("SOURCE_LABEL_MAX_LEN", crate::domain::SOURCE_LABEL_MAX_LEN),
+        (
+            "SOURCE_REFERENCE_MAX_LEN",
+            crate::domain::SOURCE_REFERENCE_MAX_LEN,
+        ),
+        (
+            "EVIDENCE_CONTENT_MAX_LEN",
+            crate::domain::EVIDENCE_CONTENT_MAX_LEN,
+        ),
+        (
+            "EVIDENCE_LOCATOR_MAX_LEN",
+            crate::domain::EVIDENCE_LOCATOR_MAX_LEN,
+        ),
+    ];
+    for (name, max_len) in constants {
+        let at_max = "a".repeat(max_len);
+        let over_max = "a".repeat(max_len + 1);
+        assert!(
+            crate::domain::validate_personal_knowledge_text_len(&at_max, max_len).is_ok(),
+            "[req_pklen1] FAIL - {name} = {max_len}: exactly {max_len} chars should be accepted"
+        );
+        assert_eq!(
+            crate::domain::validate_personal_knowledge_text_len(&over_max, max_len),
+            Err(max_len + 1),
+            "[req_pklen1] FAIL - {name} = {max_len}: {max_len} + 1 chars should be rejected"
+        );
+    }
+    println!("[req_pklen1] PASS - all 15 frozen length constants accept exactly-at-bound and reject one-over-bound");
+}
+
+// --- Read round-trip tests (R020 §33) ------------------------------------
+
+/// `get_entity` round-trips every field: no domain_ref, WITH
+/// domain_ref, sensitivity, timestamps, and SELF/non-SELF.
+#[test]
+fn req_pkrt1_get_entity_round_trip_all_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let e1 = mk_pk_entity("vehicle", "Test Car", Sensitivity::Public);
+    storage::personal_knowledge_repo::insert_entity(&conn, &e1).unwrap();
+    let fetched1 = get_entity(&conn, e1.id)
+        .unwrap()
+        .expect("[req_pkrt1] FAIL - entity without domain_ref not found");
+    assert_eq!(
+        fetched1, e1,
+        "[req_pkrt1] FAIL - round-trip mismatch for entity without domain_ref"
+    );
+
+    let mut e2 = mk_pk_entity("project", "Linked Project Entity", Sensitivity::Sensitive);
+    e2.domain_ref = Some(DomainRef {
+        domain_ref_type: "Project".to_string(),
+        domain_ref_id: crate::domain::ProjectId::new().to_string(),
+    });
+    storage::personal_knowledge_repo::insert_entity(&conn, &e2).unwrap();
+    let fetched2 = get_entity(&conn, e2.id)
+        .unwrap()
+        .expect("[req_pkrt1] FAIL - entity WITH domain_ref not found");
+    assert_eq!(
+        fetched2, e2,
+        "[req_pkrt1] FAIL - round-trip mismatch for entity WITH domain_ref"
+    );
+
+    let self_entity = ensure_self_entity(&conn).unwrap();
+    let fetched_self = get_entity(&conn, self_entity.id)
+        .unwrap()
+        .expect("[req_pkrt1] FAIL - SELF entity not found via get_entity");
+    assert_eq!(
+        fetched_self, self_entity,
+        "[req_pkrt1] FAIL - SELF entity round-trip mismatch"
+    );
+    assert!(fetched_self.is_self);
+    assert!(!fetched1.is_self);
+
+    println!("[req_pkrt1] PASS - get_entity round-trips all fields: no domain_ref, WITH domain_ref, sensitivity, timestamps, SELF and non-SELF");
+}
+
+/// `get_fact` round-trips a `Scalar` value Fact, an `EntityRef` value
+/// Fact, all enum parsing, nullable confidence, temporal fields,
+/// sensitivity, and a valid `superseded_by_fact_id` link.
+#[test]
+fn req_pkrt2_get_fact_round_trip_scalar_and_entity_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrt2.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let subject = mk_pk_entity("person", "Fact Subject", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    let object = mk_pk_entity("vehicle", "Fact Object Vehicle", Sensitivity::Public);
+    storage::personal_knowledge_repo::insert_entity(&conn, &object).unwrap();
+
+    let mut f1 = mk_pk_fact(
+        subject.id,
+        "prefers_work_time",
+        FactValue::Scalar("\"morning\"".to_string()),
+        MemoryType::Preference,
+        EpistemicState::UserConfirmed,
+        Sensitivity::Internal,
+    );
+    f1.confidence = Some(0.75);
+    storage::personal_knowledge_repo::insert_fact(&conn, &f1).unwrap();
+    let fetched1 = get_fact(&conn, f1.id)
+        .unwrap()
+        .expect("[req_pkrt2] FAIL - scalar-value fact not found");
+    assert_eq!(
+        fetched1, f1,
+        "[req_pkrt2] FAIL - scalar-value fact round-trip mismatch"
+    );
+
+    let f2 = mk_pk_fact(
+        subject.id,
+        "owns_vehicle",
+        FactValue::EntityRef(object.id),
+        MemoryType::Fact,
+        EpistemicState::Inferred,
+        Sensitivity::Public,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &f2).unwrap();
+    let fetched2 = get_fact(&conn, f2.id)
+        .unwrap()
+        .expect("[req_pkrt2] FAIL - entity-ref fact not found");
+    assert_eq!(
+        fetched2, f2,
+        "[req_pkrt2] FAIL - entity-ref fact round-trip mismatch"
+    );
+    assert!(
+        fetched2.confidence.is_none(),
+        "[req_pkrt2] FAIL - expected NULL confidence to round-trip as None"
+    );
+
+    // A valid superseded_by_fact_id link (test-fixture raw UPDATE - no
+    // CorrectMemory exists yet to do this for real, Slice C).
+    let successor = mk_pk_fact(
+        subject.id,
+        "prefers_work_time",
+        FactValue::Scalar("\"evening\"".to_string()),
+        MemoryType::Preference,
+        EpistemicState::UserConfirmed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &successor).unwrap();
+    let valid_until = Utc::now();
+    conn.execute(
+        "UPDATE facts SET valid_until = ?2, superseded_by_fact_id = ?3, epistemic_state = 'STALE' WHERE id = ?1",
+        rusqlite::params![
+            f1.id.to_string(),
+            valid_until.to_rfc3339(),
+            successor.id.to_string()
+        ],
+    )
+    .unwrap();
+    let fetched_closed = get_fact(&conn, f1.id)
+        .unwrap()
+        .expect("[req_pkrt2] FAIL - closed predecessor fact not found");
+    assert_eq!(fetched_closed.valid_until, Some(valid_until));
+    assert_eq!(fetched_closed.superseded_by_fact_id, Some(successor.id));
+    assert_eq!(fetched_closed.epistemic_state, EpistemicState::Stale);
+
+    println!("[req_pkrt2] PASS - get_fact round-trips Scalar and EntityRef values, enum parsing, nullable confidence, temporal fields, sensitivity, and a valid superseded_by_fact_id link");
 }

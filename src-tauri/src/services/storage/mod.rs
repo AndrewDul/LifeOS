@@ -37,6 +37,7 @@ use std::path::Path;
 pub(super) mod goal_relation_repo;
 pub(super) mod goal_repo;
 pub(super) mod milestone_repo;
+pub(super) mod personal_knowledge_repo;
 pub(super) mod project_repo;
 pub(super) mod task_repo;
 
@@ -103,6 +104,7 @@ pub(super) fn open_encrypted(path: &Path, key_hex: &str) -> rusqlite::Result<Con
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "key", format!("x'{key_hex}'"))?;
     enable_foreign_keys(&conn)?;
+    enable_secure_delete(&conn)?;
     Ok(conn)
 }
 
@@ -124,6 +126,34 @@ fn enable_foreign_keys(conn: &Connection) -> rusqlite::Result<()> {
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
             Some("PRAGMA foreign_keys = ON did not take effect on this connection".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+/// `PRAGMA secure_delete = ON` (M2 Personal Knowledge Slice A, R019
+/// §17/R020's terminology correction - the canonical LifeOS choice is
+/// `ON`, never `FAST` (leaves deleted content on freelist pages) and
+/// never the nonexistent `FULL` R019 originally, incorrectly, named).
+/// Same "set, then read back, typed failure if verification fails"
+/// discipline as `enable_foreign_keys` above - this project does not
+/// trust an unverified SQLite default for a privacy-relevant setting.
+/// Actively overwrites a deleted ordinary-table row's freed page
+/// content with zeros rather than leaving old (still-encrypted, since
+/// SQLCipher encrypts every page) ciphertext sitting in a freed page
+/// until SQLite happens to reuse it - closing the specific gap R019
+/// §17 identified: a future master-key compromise could otherwise still
+/// expose "forgotten" ciphertext from an unreused freed page. This
+/// hardens storage-level behavior only - it does not, on its own,
+/// implement `ForgetMemory` (not built this run) and makes no
+/// forensic/physical-media guarantee (R019 §17, unchanged).
+fn enable_secure_delete(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    let enabled: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+    if enabled != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some("PRAGMA secure_delete = ON did not take effect on this connection".to_string()),
         ));
     }
     Ok(())

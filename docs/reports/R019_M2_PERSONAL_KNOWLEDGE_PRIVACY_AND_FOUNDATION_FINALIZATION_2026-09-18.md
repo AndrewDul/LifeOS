@@ -833,3 +833,36 @@ entity alias/resolution, ontology management, embeddings, `Relation`/
 the Memory UI, and — new to this report — any future backup/sync
 propagation policy for `ForgetMemory`, §18) — nothing here was
 speculatively pulled forward.
+
+---
+
+## Implementation correction (R020, 2026-09-18) — secure_delete mode
+
+§17 above says, in one place, conceptually "`PRAGMA secure_delete = ON`
+(or the stronger `FULL`)". **This was a factual error, found during
+R020's implementation of the Slice A foundation, corrected here without
+altering anything else in this report's original measured/historical
+text:**
+
+- SQLite's `secure_delete` pragma does **not** have a `FULL` value.
+  Its canonical values are `OFF`, `ON`, and `FAST`.
+- The canonical LifeOS choice, implemented by R020, is
+  **`PRAGMA secure_delete = ON`**.
+- `FAST` is deliberately **not** chosen: it is an intermediate mode
+  that only overwrites freed content in some cases and can still leave
+  deleted data recoverable on freelist pages — weaker than the
+  privacy-oriented guarantee this hardening step exists to provide
+  (§17's own reasoning above).
+- R020 implements this as `enable_secure_delete` in
+  `services::storage::mod::open_encrypted` — set, then read back
+  immediately, with a typed failure if verification fails, the exact
+  same discipline already established for `enable_foreign_keys`
+  (R008/R015 §4e) — on every encrypted connection, production and test
+  alike.
+- This correction does **not** introduce any forensic/physical-media
+  guarantee beyond what §17 above already, correctly, declined to
+  claim — it only fixes the pragma value named, and implements exactly
+  the hardening step §17 already called for.
+
+See `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`
+for the implementation and its verification tests.

@@ -52,7 +52,7 @@ parent-validation hardening, and UpdateProject implementation).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); **Personal Knowledge Layer v0.1 architecture fully frozen at field level (docs-only, not implemented)** 2026-09-18 (§4o), **then two rounds of post-freeze consistency review found and fixed 17 gaps total (four critical), architecture now explicitly CLOSED for implementation** 2026-09-18 (§4p, §4q); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m), **then verified deterministically + corrected for a post-file-creation cleanup edge case** 2026-09-18 (§4n); **Personal Knowledge Layer v0.1 architecture fully frozen at field level (docs-only, not implemented)** 2026-09-18 (§4o), **then two rounds of post-freeze consistency review found and fixed 17 gaps total (four critical), architecture declared CLOSED for implementation** 2026-09-18 (§4p, §4q), **then Slice A (V7 foundation, SELF bootstrap, narrow reads, secure_delete hardening) actually implemented in code** 2026-09-18 (§4r); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
@@ -173,7 +173,7 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-262 automated tests prove all of this (9 storage-spike regression, 17
+285 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
@@ -199,9 +199,23 @@ plus (R016, 2026-09-18) 12 new deterministic key-lifecycle tests
 keyring - proving all four DB/key cases, orphan-credential cleanup
 both before AND after a database file is created, and three
 credential-backend error paths, independent of OS keyring
-availability). **Not wired into the running app yet** - no Tauri
-command layer exists, so the UI cannot create/see real goals,
-projects, relations, milestones, or tasks yet.
+availability), plus (R020, 2026-09-18) 23 new M2 Personal Knowledge
+Slice A tests - `secure_delete`/`journal_mode` storage-hardening
+proofs, SELF-bootstrap proofs, `V1`-`V7`/populated-`V6`-to-`V7`
+migration-compatibility proofs, a full raw-SQL defense-in-depth matrix
+across all six Personal Knowledge tables (including a positive proof
+that Personal Knowledge `Relation.relation_type` genuinely accepts a
+value outside `GoalRelation`'s 11 closed values), all 15 frozen
+length-bound proofs, and `get_entity`/`get_fact` read-round-trip
+proofs. **The Goal/Project/GoalRelation/Milestone/Task action layer is
+still not wired into the running app** - no Tauri command layer
+exists, so the UI cannot create/see real goals, projects, relations,
+milestones, or tasks yet. **The Personal Knowledge Layer now has a
+real `V7` schema, a `SELF` entity bootstrap, and narrow
+`get_entity`/`get_fact` reads in code (R020) - but no `AddMemory`/
+`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` action exists yet**, so
+no Personal Knowledge data can be created through any path either
+(Slice B+).
 
 Repository contents as of this run:
 
@@ -231,6 +245,7 @@ LiFeOS/
 │                    R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md
 │                    R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md
 │                    R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md
+│                    R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -239,10 +254,15 @@ LiFeOS/
     │              V3__create_goal_relations.sql  (PRODUCTION schema - GoalRelation only, untouched)
     │              V4__create_milestones.sql      (PRODUCTION schema - Milestone only, untouched)
     │              V5__create_tasks.sql           (PRODUCTION schema - Task only, untouched)
-    │              V6__widen_project_audit_log_action_types.sql (new - widens
+    │              V6__widen_project_audit_log_action_types.sql (widens
     │                             project_audit_log.action_type's CHECK to allow
     │                             'UpdateProject'; projects itself untouched, see
     │                             R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md §3a)
+    │              V7__create_personal_knowledge.sql (new, R020 - the full 11-table
+    │                             Personal Knowledge foundation: entities/sources/
+    │                             evidence/facts/relations/episodes/fact_evidence/
+    │                             relation_evidence/episode_evidence/episode_entities/
+    │                             fact_audit_log; V1-V6 untouched)
     ├── src/
     │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 modules, all private)
     │   ├── core_error.rs          CoreError/CoreErrorKind - typed Core-boundary error model
@@ -258,7 +278,16 @@ LiFeOS/
     │   │   │                       MilestoneStatus (frozen closed 2-value enum, NOT
     │   │   │                       LifecycleStatus), TaskStatus (new - frozen closed
     │   │   │                       4-value enum), OrderIndex/ORDER_INDEX_MIN, Progress,
-    │   │   │                       Priority (shared)
+    │   │   │                       Priority (shared). (R020, new) EntityId/FactId/
+    │   │   │                       RelationId/EpisodeId/SourceId/EvidenceId (UUID v7),
+    │   │   │                       Sensitivity (4-value closed), MemoryType (11-value
+    │   │   │                       closed), EpistemicState (5-value closed), DomainRef,
+    │   │   │                       Entity/Source/Evidence/Fact (+ FactValue) - the
+    │   │   │                       Personal Knowledge domain structs Slice A's read
+    │   │   │                       side needs (Relation/Episode structs deliberately
+    │   │   │                       not added - no read function needs them yet), plus
+    │   │   │                       all 15 R018-frozen length constants and
+    │   │   │                       validate_personal_knowledge_text_len
     │   │   └── tests.rs             12 round-trip unit tests (3 LifecycleStatus, 3
     │   │                            GoalRelationType - all 11 values/parse round trips,
     │   │                            3 MilestoneStatus, 3 new TaskStatus)
@@ -313,8 +342,13 @@ LiFeOS/
     │       │                       .ok(); R016 - diagnostic redacted to a fixed string,
     │       │                       no longer interpolates the raw serde_json error text)
     │       │                       - capability API contract's names, no dedicated
-    │       │                       capability/module yet (LIFEOS_SPEC.md §5.6/§10.1)
-    │       ├── tests.rs            159 integration test functions against a real
+    │       │                       capability/module yet (LIFEOS_SPEC.md §5.6/§10.1).
+    │       │                       (R020, new) ensure_self_entity (0/1/>1 SELF dispatch,
+    │       │                       wired into bootstrap_db_at right after migrations,
+    │       │                       NOT into the test-only bootstrap_db_at_version),
+    │       │                       get_entity/get_fact - no AddMemory/CorrectMemory/
+    │       │                       ConfirmMemory/ForgetMemory exists yet
+    │       ├── tests.rs            182 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
     │       │                       storage integrity, 23 GoalRelation functions covering
     │       │                       26 numbered requirements, 24 Milestone functions
@@ -343,16 +377,29 @@ LiFeOS/
     │       │                       post-file-creation, 3 credential-backend error paths -
     │       │                       independent of OS keyring availability) - incl. the
     │       │                       progress-preservation regression test and the
-    │       │                       GoalRelation non-side-effect proof)
+    │       │                       GoalRelation non-side-effect proof, and (R020,
+    │       │                       2026-09-18) 23 new Personal Knowledge Slice A
+    │       │                       functions: 5 secure_delete proofs, 1 journal_mode
+    │       │                       measurement (MEASURED: delete), 5 SELF-bootstrap
+    │       │                       proofs, 2 migration proofs (fresh V1-V7, populated
+    │       │                       V6-to-V7 non-destructive), 7 raw-SQL defense-matrix
+    │       │                       functions across all 6 Personal Knowledge tables
+    │       │                       (20+ sub-assertions, incl. proving Relation.
+    │       │                       relation_type is genuinely open), 1 table-driven
+    │       │                       length-bound proof (all 15 constants), 2 get_entity/
+    │       │                       get_fact read-round-trip proofs)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
     │           │                    verifies PRAGMA foreign_keys = ON on every
     │           │                    connection - production, test, and spike alike,
-    │           │                    since all go through this one primitive); also
+    │           │                    since all go through this one primitive), then (R020,
+    │           │                    new) enable_secure_delete (same set-and-verify
+    │           │                    discipline - PRAGMA secure_delete = ON, never FAST,
+    │           │                    never the nonexistent FULL R019 had misnamed); also
     │           │                    hosts actor_str/provenance_str/
     │           │                    confirmation_class_str/parse_rfc3339 shared by all
-    │           │                    5 repo modules (not duplicated per-module)
+    │           │                    6 repo modules (not duplicated per-module)
     │           ├── goal_repo.rs     Goal SQL access, pub(in crate::services) - also
     │           │                    hosts goal_exists (shared by project_repo,
     │           │                    goal_relation_repo, AND task_repo's caller)
@@ -373,6 +420,13 @@ LiFeOS/
     │           │                    (deterministic due_at ASC, created_at ASC, id ASC
     │           │                    ordering - documented as technical, not product
     │           │                    prioritization)
+    │           ├── personal_knowledge_repo.rs  (new, R020) Entity/Fact insert+get,
+    │           │                    Source/Evidence/fact_evidence-link insert
+    │           │                    (#[cfg(test)]-only fixtures - no AddMemory exists to
+    │           │                    create these for real yet), count_self_entities/
+    │           │                    get_self_entity. NO insert_relation/insert_episode -
+    │           │                    those tables are schema-only (R019 §13), touched
+    │           │                    only by deliberate raw SQL at the test boundary
     │           └── spike/           #[cfg(test)] only - old storage-spike suite, moved
     │               ├── mod.rs, tests.rs, migrations/V1__init.sql, V2__add_note_column.sql
     ├── Cargo.toml, Cargo.lock, tauri.conf.json, build.rs
@@ -1725,32 +1779,98 @@ Full evidence, the complete logical-vs-forensic deletion analysis, and
 every corrected algorithm/acceptance criterion:
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`.
 
+### 4r. M2 Personal Knowledge Slice A Foundation (2026-09-18, R020 — first Personal Knowledge CODE, not docs-only)
+
+**The first real Personal Knowledge implementation slice.** `V7`
+migration (`src-tauri/migrations/V7__create_personal_knowledge.sql`) -
+the full eleven-table foundation R019 §12 froze (`entities`/`sources`/
+`evidence`/`facts`/`relations`/`episodes`/`fact_evidence`/
+`relation_evidence`/`episode_evidence`/`episode_entities`/
+`fact_audit_log`), a direct transcription of R017→R018→R019's frozen
+field-level schema, no field redesigned. `Sensitivity`/`MemoryType`/
+`EpistemicState` closed enums, six typed UUIDv7 IDs
+(`EntityId`/`FactId`/`RelationId`/`EpisodeId`/`SourceId`/`EvidenceId`),
+`DomainRef`, and `Entity`/`Source`/`Evidence`/`Fact` (with `FactValue`)
+domain structs added to `domain/mod.rs`, all 15 R018-frozen length
+constants. `services::ensure_self_entity` (0 rows → create the
+canonical SELF row `entity_type="person"`/`canonical_name="SELF"`/
+`sensitivity=INTERNAL`; 1 row → reuse unchanged; >1 → typed integrity
+error, never silently pick one) wired into `bootstrap_db_at` right
+after migrations - runs on every bootstrap, proven idempotent. Narrow
+`services::get_entity`/`get_fact` reads. **`secure_delete = ON`**
+storage hardening: `enable_secure_delete` (set-and-verify, matching
+`enable_foreign_keys`'s exact discipline) called from `open_encrypted`
+on every encrypted connection - closes the R019 §17 gap this codebase
+had left genuinely unverified. **A factual correction to R019 §17 was
+also made**: SQLite's `secure_delete` has no `FULL` value (canonical
+values are `OFF`/`ON`/`FAST`) - `ON` is the correct, now-implemented
+choice; a labelled addendum was appended to R019, its original text
+otherwise unedited.
+
+- **`AddMemory`/`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` do NOT
+  exist yet** - Slice B+ remains entirely unstarted. `Relation`/
+  `Episode` have zero production write paths - schema only, proven
+  unreachable through any public function; only deliberate raw-SQL
+  fixture-row tests touch those five tables, never a repo function
+  (R019 §13's explicit concern, closed).
+- **23 new tests** (285 total, up from 262 - all 262 prior tests remain
+  green, unmodified): 5 `secure_delete` proofs (fresh-connection ON,
+  ON-after-reopen, wrong-key behavior unchanged, encryption-at-rest
+  unchanged, simultaneous with `foreign_keys`), 1 `journal_mode`
+  measurement (**MEASURED: `delete`** - SQLite's own historical
+  default, observation only, not forced), 5 SELF-bootstrap proofs
+  (exactly one on fresh bootstrap, id survives reopen, idempotent
+  across 3+ calls, a raw duplicate `is_self=1` insert genuinely
+  rejected by the real DB unique index, canonical row's exact shape),
+  2 migration tests (fresh V1-V7, and a populated V6 database with
+  real Goal/Project/Milestone/Task/GoalRelation rows upgrading to V7
+  non-destructively), 7 raw-SQL defense-in-depth functions covering
+  20+ individual constraint proofs across all six tables (including a
+  positive proof that a `relation_type` far outside `GoalRelation`'s
+  11 closed values is genuinely *accepted* - proving Personal Knowledge
+  `Relation` stays a truly open vocabulary, never confused with
+  `GoalRelation`), 1 table-driven test proving all 15 frozen length
+  constants, and 2 `get_entity`/`get_fact` read-round-trip tests
+  (`Scalar` and `EntityRef` `FactValue`, nullable confidence, a valid
+  `superseded_by_fact_id` link, SELF/non-SELF, with/without
+  `domain_ref`). The established illegal-cross-module-access privacy
+  probe was re-run against the new `personal_knowledge_repo` submodule
+  (`error[E0603]: module 'storage' is private`, confirmed, then
+  removed - never left in the tree).
+- **No schema outside the frozen 11-table list; V1-V6 untouched.** No
+  new dependency. One incidental naming alignment (not a semantic
+  change): `fact_audit_log`'s timestamp column is `occurred_at`,
+  matching every other M2 audit table's actual established convention
+  (R017-R019's prose had said `created_at` in passing; the frozen
+  reports never fixed the literal SQL identifier, only that a
+  timestamp column exists).
+
+Full evidence, exact schema, and every test result:
+`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
-on an existing M2 entity is now built, and (2026-09-18, R017 §4o → R018
-§4p → R019 §4q) the Personal Knowledge Layer's v0.1 architecture is now
-fully frozen at the field level and explicitly declared **CLOSED for
-implementation** (R019 §23) - two rounds of post-freeze review (17
-total gaps, four critical) already found and fixed before any code
-exists. Two real options now exist for the next *implementation*
-slice: **the Personal Knowledge Layer's Slice A+B** (`Entity`+`Source`+
-`Evidence`+`Fact` foundation across the full 11-table `V7` scope, then
-`AddMemory` - R019 §21/§22's final corrected acceptance criteria, ready
-to implement directly since the freeze pass and both hardening
-follow-ups are done) or **`RecurringRule`** (deliberately deferred,
-still
-needs its own design/freeze pass before any code - `Task.
-recurring_rule_id` stays `NULL`-only until then, §4j). Personal
-Knowledge is no longer blocked on a freeze pass the way it was before
-this run - do not invent product rules inside the implementation pass;
-R017 already resolved the open questions a Personal Knowledge vertical
-slice would otherwise have hit mid-implementation (§4c's lesson from the
-removed terminal-status rule; §4e's/§4g's action-set-gap
-documentation-before-code discipline; §4f's relation-integrity rules and
-§4i's order_index-uniqueness rule both being frozen/resolved *before or
-as part of* coding rather than invented ad hoc mid-implementation - the
-same discipline R017 just applied to Personal Knowledge).
+on an existing M2 entity is now built. The Personal Knowledge Layer's
+v0.1 architecture was frozen (R017 §4o), hardened through two rounds of
+post-freeze review (R018 §4p/R019 §4q, 17 gaps found and fixed, four
+critical), and **Slice A - the full 11-table `V7` foundation, domain
+types, SELF bootstrap, narrow reads, and `secure_delete` storage
+hardening - is now implemented in code** (2026-09-18, R020 §4r; 285/285
+tests passing). The next *implementation* step is **Slice B
+(`AddMemory`)** - R020 §24's exact recommendation, ready to implement
+directly since Slice A's foundation is done and proven. `RecurringRule`
+remains a separate, still-deferred option, still needing its own
+design/freeze pass before any code - `Task.recurring_rule_id` stays
+`NULL`-only until then, §4j. R017-R019 already resolved the open
+questions a Personal Knowledge vertical slice would otherwise have hit
+mid-implementation (§4c's lesson from the removed terminal-status rule;
+§4e's/§4g's action-set-gap documentation-before-code discipline; §4f's
+relation-integrity rules and §4i's order_index-uniqueness rule both
+being frozen/resolved *before or as part of* coding rather than
+invented ad hoc mid-implementation - the same discipline R017-R019
+applied to Personal Knowledge, and Slice A's implementation needed to
+invent nothing further).
 
 ---
 
@@ -1838,7 +1958,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 262 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 285 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -1904,10 +2024,21 @@ audit-snapshot serialization-failure diagnostic structurally excludes
 the underlying serializer's own error text, proven with a deliberate
 marker string that must never appear in the resulting error's
 Display/Debug (`req_snap1`, strengthened - a PRE-EXISTING test, not
-new). **Test count rose from 200 to 233 to 250 to 262 across these two
-days' runs** (250→262 this run, +12 - only the 12 new `req_dkl*`
-functions increase the count) - all previously-covered behavior
-remains green.
+new), and (as of 2026-09-18, R020, §4r) that the new Personal
+Knowledge `V7` foundation is fully sound: `secure_delete`/
+`foreign_keys` both provably ON simultaneously on every connection,
+`journal_mode` measured (not forced) at `delete`, exactly one SELF
+entity created on fresh bootstrap and surviving reopen/repeated
+bootstrap unchanged, a raw duplicate SELF insert genuinely rejected, a
+populated V6 database upgrading to V7 non-destructively, a full raw-SQL
+defense-in-depth matrix across all six Personal Knowledge tables
+(closed enums, FKs, the one-semantic-object XOR, self-supersession,
+self-edge rejection, and Personal Knowledge `Relation.relation_type`
+proven genuinely open by accepting a value far outside `GoalRelation`'s
+11 closed values), all 15 frozen length bounds, and `get_entity`/
+`get_fact` full round-trips (23 new tests). **Test count rose from 200
+to 233 to 250 to 262 to 285 across these two days' runs** (262→285
+this run, +23) - all previously-covered behavior remains green.
 
 ---
 
@@ -1920,25 +2051,23 @@ implemented, `UpdateProject` closing out the last frozen, shovel-ready
 action, (2026-09-18, R015 §4m then R016 §4n) the master-key lifecycle
 and mandatory audit-snapshot safety gaps closed and then verified
 deterministically/corrected for a post-file-creation failure edge case,
-and (2026-09-18, R017 §4o → R018 §4p → R019 §4q) the Personal
-Knowledge Layer's v0.1 architecture now fully frozen at the field
-level and explicitly declared CLOSED for implementation, with two
-rounds of post-freeze review finding and fixing 17 gaps total (four
+and (2026-09-18, R017 §4o → R018 §4p → R019 §4q → R020 §4r) the
+Personal Knowledge Layer's v0.1 architecture was fully frozen, hardened
+through two rounds of post-freeze review (17 gaps found and fixed, four
 critical - an inbound FK that would have blocked `ForgetMemory`
 outright, pre-existing audit snapshots that could have retained
 forgotten content, no orphan-Entity cleanup, and an unverified "true
 deletion" claim now correctly split into a logical guarantee and an
-honestly-evaluated forensic-storage guarantee) already found and fixed
-before any code exists, the recommended next step is the **Personal
-Knowledge Layer's implementation Slice A+B** (the full 11-table `V7`
-foundation, then `AddMemory` - R019 §21/§22's final corrected
-acceptance criteria) - a real implementation slice can now begin there
-without inventing product rules mid-implementation, since the freeze
-pass and both hardening follow-ups are already done. `RecurringRule`
-remains deliberately deferred (§4j),
-still needing its own design/freeze pass before any code. M2's
-storage/security foundation is safe to proceed into implementation - see
-R016 §15 and R019 §23.
+honestly-evaluated forensic-storage guarantee), and **Slice A (the full
+11-table `V7` foundation, `ensure_self_entity` bootstrap, narrow
+`get_entity`/`get_fact` reads, `secure_delete = ON` storage hardening)
+is now actually implemented and proven (285/285 tests)**, the
+recommended next step is **Slice B (`AddMemory`)** - R020 §24's exact
+recommendation - ready to implement directly since Slice A's foundation
+is done and proven, not merely designed. `RecurringRule` remains
+deliberately deferred (§4j), still needing its own design/freeze pass
+before any code. M2's storage/security foundation is safe to proceed
+into implementation - see R016 §15 and R019 §23.
 
 ---
 
@@ -2033,11 +2162,15 @@ R016 §15 and R019 §23.
   physical-media-level guarantee is or can be claimed).** All
   identified explicitly and corrected in R019; architecture is now
   explicitly declared CLOSED for Slice A/B implementation (R019 §23).
-- **Personal Knowledge Layer is still not implemented in code** — R017/
-  R018/R019 freeze the architecture only; `Entity`/`Fact`/`Relation`/
-  `Episode`/`Source`/`Evidence` do not exist as real tables yet. The
-  recommended next implementation slice is R019 §21/§22's final
-  corrected Slice A+B (§4q/§9 above).
+- **RESOLVED in part (2026-09-18, M2 Personal Knowledge Slice A
+  Foundation, R020 §4r above): the `V7` schema, `SELF` bootstrap, and
+  narrow `get_entity`/`get_fact` reads are now real, implemented, and
+  tested (285/285).** `Entity`/`Source`/`Evidence`/`Fact`/`Relation`/
+  `Episode` all exist as real tables now (`Relation`/`Episode` schema
+  only, no write path). **Still not implemented: `AddMemory`/
+  `CorrectMemory`/`ConfirmMemory`/`ForgetMemory`** - no Personal
+  Knowledge data can be created through any path yet. The recommended
+  next implementation slice is Slice B (`AddMemory`), R020 §24.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2189,5 +2322,6 @@ summaries - open the file for full reasoning.
 | R017 | M2 Personal Knowledge Layer Architecture Freeze | `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md` |
 | R018 | M2 Personal Knowledge Architecture Consistency Hardening | `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md` |
 | R019 | M2 Personal Knowledge Privacy and Foundation Finalization | `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md` |
+| R020 | M2 Personal Knowledge Slice A Foundation | `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md` |
 
-Next report allocated will be **R020**.
+Next report allocated will be **R021**.

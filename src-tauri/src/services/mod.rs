@@ -25,10 +25,12 @@ use crate::actions::{
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
-    Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
-    MilestoneStatus, Project, ProjectId, Task, TaskId, TaskStatus,
+    Entity, EntityId, Fact, FactId, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus,
+    Milestone, MilestoneId, MilestoneStatus, Project, ProjectId, Sensitivity, Task, TaskId,
+    TaskStatus,
 };
 use crate::security;
+use chrono::Utc;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -114,7 +116,56 @@ fn bootstrap_db_at(path: &std::path::Path, key_hex: &str) -> Result<Connection, 
     let mut conn = storage::open_encrypted(path, key_hex)?;
     storage::verify_key(&conn)?;
     storage::run_production_migrations(&mut conn)?;
+    // Personal Knowledge SELF bootstrap (M2 Slice A, R019 §3/R020 §21-22)
+    // - runs on every bootstrap, after migrations, before the connection
+    // is considered ready for Personal Knowledge use. NOT called by
+    // `bootstrap_db_at_version` below (test-only, freezes at an
+    // arbitrary older schema version that may predate V7 entirely).
+    ensure_self_entity(&conn)?;
     Ok(conn)
+}
+
+/// Guarantees exactly one canonical SELF `Entity` exists, together with
+/// the DB-level partial unique index (`idx_entities_single_self`,
+/// `V7__create_personal_knowledge.sql`) - that index alone only proves
+/// AT MOST one; this proves AT LEAST one (R019 §3). Idempotent - safe
+/// to call on every bootstrap and repeatedly in tests. Deliberately
+/// NOT placed inside the V7 migration itself: a migration is schema,
+/// not Core-level bootstrap logic.
+fn ensure_self_entity(conn: &Connection) -> Result<Entity, BootstrapError> {
+    let count = storage::personal_knowledge_repo::count_self_entities(conn)?;
+    match count {
+        0 => {
+            let now = Utc::now();
+            let entity = Entity {
+                id: EntityId::new(),
+                entity_type: "person".to_string(),
+                canonical_name: "SELF".to_string(),
+                is_self: true,
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+                created_at: now,
+                updated_at: now,
+            };
+            storage::personal_knowledge_repo::insert_entity(conn, &entity)?;
+            Ok(entity)
+        }
+        1 => storage::personal_knowledge_repo::get_self_entity(conn)?.ok_or_else(|| {
+            BootstrapError::Storage(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some("SELF entity count was 1 but the row could not be read back".to_string()),
+            ))
+        }),
+        // Should be structurally impossible given the DB partial unique
+        // index, but detected and reported explicitly anyway rather
+        // than silently picking the first row and continuing (R019 §3).
+        _ => Err(BootstrapError::Storage(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(format!(
+                "integrity violation: {count} SELF entities found, expected at most 1"
+            )),
+        ))),
+    }
 }
 
 /// Test-only: same as `bootstrap_db_at` but stops migrating at
@@ -1514,6 +1565,34 @@ pub(crate) fn get_tasks_for_goal(
     goal_id: GoalId,
 ) -> Result<Vec<Task>, rusqlite::Error> {
     storage::task_repo::get_tasks_for_goal(conn, goal_id)
+}
+
+// --- Personal Knowledge (M2 Slice A foundation, 2026-09-18) -----------
+//
+// Schema (`V7__create_personal_knowledge.sql`) + SELF bootstrap
+// (`ensure_self_entity`, above, wired into `bootstrap_db_at`) + this
+// narrow read side only. No `AddMemory`/`CorrectMemory`/`ConfirmMemory`/
+// `ForgetMemory` action exists yet (Slice B+) - see
+// `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
+
+/// Narrow internal read (M2 Personal Knowledge Slice A) - same "read
+/// side stays narrow, add only when a real caller needs it" precedent
+/// as every other M2 entity's `get_*` function. No production action
+/// creates `Entity` rows yet besides `ensure_self_entity`'s own SELF
+/// row; this exists for that bootstrap path's own use and for Slice B+.
+pub(crate) fn get_entity(
+    conn: &Connection,
+    id: EntityId,
+) -> Result<Option<Entity>, rusqlite::Error> {
+    storage::personal_knowledge_repo::get_entity(conn, id)
+}
+
+/// Same reasoning as `get_entity`, above. No production action creates
+/// `Fact` rows yet (Slice B's `AddMemory`) - this exists for Slice B+
+/// and for this slice's own read-round-trip proofs against test
+/// fixtures.
+pub(crate) fn get_fact(conn: &Connection, id: FactId) -> Result<Option<Fact>, rusqlite::Error> {
+    storage::personal_knowledge_repo::get_fact(conn, id)
 }
 
 #[cfg(test)]

@@ -74,18 +74,25 @@ orphan-Entity cleanup at all, so a newly-created Entity could outlive
 the one Fact that justified it; "true deletion" was never separated
 into a logical guarantee, fully upheld, versus a forensic-storage
 guarantee, honestly evaluated against this project's actual, inspected
-configuration rather than assumed) - see R019 §2. **Architecture is now
-explicitly declared CLOSED for Slice A/B implementation (R019 §23).**
-Nothing is implemented yet; see `PROJECT_STATE.md` §4o-§4q,
+configuration rather than assumed) - see R019 §2. Architecture was then
+explicitly declared CLOSED for Slice A/B implementation (R019 §23).
+**(2026-09-18, R020)** Slice A - the full 11-table `V7` foundation, the
+`SELF` entity bootstrap, narrow `get_entity`/`get_fact` reads, and
+`secure_delete = ON` storage hardening (correcting R019 §17's misnamed
+`FULL` value to the real canonical `ON`) - is now implemented in code
+and tested (285/285 tests). `AddMemory`/`CorrectMemory`/`ConfirmMemory`/
+`ForgetMemory` still do not exist (Slice B+). See `PROJECT_STATE.md`
+§4o-§4r,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
+`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
 and
-`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`.
+`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
-Milestone, and Task).
+Milestone, Task, and now the Personal Knowledge Slice A foundation).
 
 ---
 
@@ -805,12 +812,15 @@ its own audit row's `previous_snapshot` is unconditionally `NULL`,
 never the mandatory-snapshot helper used by every other Update*
 action. **"True deletion" is a logical/product guarantee — no live
 row, no query path, no payload-bearing audit snapshot anywhere LifeOS's
-own code can reach — deliberately not a forensic-storage claim**: this
-project currently sets neither `journal_mode` nor `secure_delete`
-(confirmed by direct inspection, R019 §17), so no physical-media-level
-irrecoverability is or can be promised; a concrete future hardening
-step (`PRAGMA secure_delete = ON`, set-and-verified) is frozen but not
-implemented.
+own code can reach — deliberately not a forensic-storage claim**: no
+physical-media-level irrecoverability is or can be promised.
+**`PRAGMA secure_delete = ON` is now implemented and set-and-verified
+on every encrypted connection (R020, correcting R019 §17's misnamed
+"or the stronger `FULL`" — SQLite has no `FULL` value; `ON`, not
+`FAST`, is the canonical choice)** — this narrows, but does not close,
+the forensic gap: freed pages are now actively overwritten, but no
+claim beyond that is made. `journal_mode` was measured (R020), not
+forced, at SQLite's own default (`delete`).
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
@@ -824,16 +834,20 @@ confirming them — is implemented starting at M6 (Personal Intelligence,
 will be written through (Qwen/Luna never mutate Personal Knowledge
 directly — they propose typed, `Provenance::Inferred` candidates that
 still go through the same Core validation/confirmation path as any
-other actor, R017 §27). **Not implemented in code at M2** — R017/R018/
-R019 are documentation-only; see `docs/PROJECT_STATE.md` §4o-§4q,
-`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`
-(with its own forward pointer to R019),
-`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`
-(with its own R019 addendum), and
-`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`
-for full detail and the final, corrected recommended implementation
-slicing. **Architecture is CLOSED for Slice A/B implementation (R019
-§23).**
+other actor, R017 §27). **R017/R018/R019 were documentation-only; as of
+2026-09-18 (R020), Slice A is real, implemented code**: the full
+11-table `V7` schema, the `SELF` entity bootstrap, and narrow
+`get_entity`/`get_fact` reads all exist and are tested (285/285 tests).
+**`AddMemory`/`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` still do
+NOT exist** — no Personal Knowledge data can be created through any
+path yet; Slice B (`AddMemory`) is the recommended next step (R020
+§24). See `docs/PROJECT_STATE.md` §4o-§4r,
+`docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
+`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
+`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
+and
+`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`
+for full detail.
 
 ### 5.4 Action layer (frozen, M2)
 
