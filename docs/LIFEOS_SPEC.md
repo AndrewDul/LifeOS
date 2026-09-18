@@ -67,11 +67,20 @@ review found and corrected eleven further gaps in R017 before any code
 existed - two critical (a foreign key that would have blocked
 `ForgetMemory` outright on any previously-superseded Fact; pre-existing
 audit snapshots that could have retained exactly the text `ForgetMemory`
-exists to erase) - see R018 §2. Nothing is implemented yet; see
-`PROJECT_STATE.md` §4o-§4p,
+exists to erase) - see R018 §2. **(2026-09-18, R019, same day,
+documentation/architecture only)** A final pre-`V7` review found and
+corrected six more gaps - two more critical (`ForgetMemory` had no
+orphan-Entity cleanup at all, so a newly-created Entity could outlive
+the one Fact that justified it; "true deletion" was never separated
+into a logical guarantee, fully upheld, versus a forensic-storage
+guarantee, honestly evaluated against this project's actual, inspected
+configuration rather than assumed) - see R019 §2. **Architecture is now
+explicitly declared CLOSED for Slice A/B implementation (R019 §23).**
+Nothing is implemented yet; see `PROJECT_STATE.md` §4o-§4q,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
+`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 and
-`docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`.
+`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -705,12 +714,14 @@ yet"). Corrected in that report and here.
 Layer Architecture Freeze, R017 — superseding R003 §B's original
 table-shape-only sketch on several specific points, each an explicit,
 documented correction, not a silent rewrite; see R017 §2 for the full
-list), **then corrected by a dedicated post-freeze consistency review
-the same day** (M2 Personal Knowledge Architecture Consistency
-Hardening, R018 — eleven further gaps found and fixed before any `V7`
-migration or implementation existed, two critical; see R018 §2/§17 for
-the full list and R017's own addendum). Six tables, unchanged in count
-and purpose from R003: `Entity`,
+list), **then corrected by two rounds of dedicated post-freeze
+consistency review the same day** (M2 Personal Knowledge Architecture
+Consistency Hardening, R018, eleven gaps, two critical; M2 Personal
+Knowledge Privacy and Foundation Finalization, R019, six further gaps,
+two more critical — see R018 §2/§17 and R019 §2/§20 for the full lists;
+**architecture is now explicitly declared CLOSED for implementation,
+R019 §23**). Six tables, unchanged in count and purpose from R003:
+`Entity`,
 `Fact`, `Relation`, `Episode`, `Evidence`, `Source` — do **not** flatten
 LifeOS memory into one text-memory table, a vector store, or chat
 history. `Fact` is a structured subject-predicate-object assertion
@@ -735,12 +746,15 @@ interchangeably. **Sensitivity is now a frozen four-value closed set**
 (`PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`, R017 §13,
 resolving the previously-open §13-below question below) — a dimension
 independent of `epistemic_state` and `confidence` (three separate axes,
-never derived from one another). **Applies to `Fact`/`Relation`/
-`Episode`/`Source`/`Evidence`** (R018 §13 corrected this to include
-`Source` — metadata can still be privacy-sensitive even though it never
-holds a raw excerpt, which R017 had understated). `Entity` remains the
-one table without a `sensitivity` field — structural identity metadata,
-not a knowledge assertion.
+never derived from one another). **Applies to all six tables —
+`Entity`/`Fact`/`Relation`/`Episode`/`Source`/`Evidence`** (R018 §13
+corrected this to include `Source` — metadata can still be
+privacy-sensitive even though it never holds a raw excerpt; R019 §3
+then corrected the same gap for `Entity` — a `canonical_name` or
+`domain_ref` can itself be sensitive, the exact reasoning R018 had
+already applied to `Source`). Every table's `sensitivity` stays
+structurally independent of every other's — no automatic equality
+assumed in either direction.
 
 Provenance is structural, not conventional, but the exact mechanism
 changed from R003's sketch: a `Fact` has **no direct `source_id`** —
@@ -777,16 +791,26 @@ R018 §6); its `confidence` field is `FieldPatch<f32>`, not
 Fact's `epistemic_state` in place — never creates a duplicate temporal
 successor) confirming a `DISPUTED` Fact resolves only that one
 assertion — sibling disputes remain and retrieval must keep surfacing
-them (R018 §9). `ForgetMemory` (`DELETE`, true permanent deletion — R018
-§14 freezes the corrected, exact deterministic, privacy-safe deletion
-algorithm) now also scrubs any pre-existing `CorrectMemory`/
-`ConfirmMemory` audit snapshots for the forgotten Fact before deleting
-it (R018 §10 — R017 had only guaranteed `ForgetMemory`'s own new audit
-row was payload-free), and explicitly clears any inbound
-`superseded_by_fact_id` reference first, since that FK would otherwise
-block the deletion outright (R018 §11); its own audit row's
-`previous_snapshot` is unconditionally `NULL`, never the mandatory-
-snapshot helper used by every other Update* action.
+them (R018 §9). `ForgetMemory` (`DELETE` — R019 §14 freezes the final,
+14-step, FK-safe, privacy-complete deletion algorithm) scrubs any
+pre-existing `CorrectMemory`/`ConfirmMemory` audit snapshots for the
+forgotten Fact before deleting it (R018 §10 — R017 had only guaranteed
+`ForgetMemory`'s own new audit row was payload-free), explicitly clears
+any inbound `superseded_by_fact_id` reference first since that FK would
+otherwise block the deletion outright (R018 §11), and now also deletes
+any newly-orphaned, non-SELF Entity that existed solely to serve the
+forgotten Fact (R019 §8 — R018's original "never delete an Entity" rule
+was too broad once `AddMemory` could create brand-new ones, R019 §4);
+its own audit row's `previous_snapshot` is unconditionally `NULL`,
+never the mandatory-snapshot helper used by every other Update*
+action. **"True deletion" is a logical/product guarantee — no live
+row, no query path, no payload-bearing audit snapshot anywhere LifeOS's
+own code can reach — deliberately not a forensic-storage claim**: this
+project currently sets neither `journal_mode` nor `secure_delete`
+(confirmed by direct inspection, R019 §17), so no physical-media-level
+irrecoverability is or can be promised; a concrete future hardening
+step (`PRAGMA secure_delete = ON`, set-and-verified) is frozen but not
+implemented.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
@@ -800,12 +824,16 @@ confirming them — is implemented starting at M6 (Personal Intelligence,
 will be written through (Qwen/Luna never mutate Personal Knowledge
 directly — they propose typed, `Provenance::Inferred` candidates that
 still go through the same Core validation/confirmation path as any
-other actor, R017 §27). **Not implemented in code at M2** — R017/R018
-are documentation-only; see `docs/PROJECT_STATE.md` §4o-§4p,
+other actor, R017 §27). **Not implemented in code at M2** — R017/R018/
+R019 are documentation-only; see `docs/PROJECT_STATE.md` §4o-§4q,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`
-(with its own R018 addendum), and
+(with its own forward pointer to R019),
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`
-for full detail and the corrected recommended implementation slicing.
+(with its own R019 addendum), and
+`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`
+for full detail and the final, corrected recommended implementation
+slicing. **Architecture is CLOSED for Slice A/B implementation (R019
+§23).**
 
 ### 5.4 Action layer (frozen, M2)
 
@@ -1392,14 +1420,17 @@ These are genuinely unresolved and should not be treated as decided:
   and a small internal Polish eval still needs to run against GPT-5.6
   Luna once chat exists (M5).
 - **Resolved 2026-09-18 (M2 Personal Knowledge Layer Architecture
-  Freeze, R017 §13):** exact data-sensitivity classification levels for
-  the Personal Knowledge Layer (§4.3/§5.3) — four frozen values,
-  `PUBLIC`/`INTERNAL`/`SENSITIVE`/`NEVER_LEAVES_DEVICE`, applied to
-  `Fact`/`Relation`/`Episode`/`Evidence` (deliberately not `Source`,
-  which is metadata-only by design and structurally cannot hold
-  sensitive payload). Still open: whether/how this same four-value
-  scheme extends to non-Personal-Knowledge domain fields (Goal/Project/
-  Task/etc.) — R017 only froze it for the Personal Knowledge Layer.
+  Freeze, R017 §13; extended R018 §13 and R019 §3):** exact
+  data-sensitivity classification levels for the Personal Knowledge
+  Layer (§4.3/§5.3) — four frozen values, `PUBLIC`/`INTERNAL`/
+  `SENSITIVE`/`NEVER_LEAVES_DEVICE`, applied to all six tables
+  (`Entity`/`Fact`/`Relation`/`Episode`/`Source`/`Evidence` — R017
+  originally froze only `Fact`/`Relation`/`Episode`/`Evidence`; R018
+  added `Source`; R019 added `Entity`, closing the last gap — metadata
+  itself, on any of these six tables, can be sensitive, not only an
+  excerpt). Still open: whether/how this same four-value scheme extends
+  to non-Personal-Knowledge domain fields (Goal/Project/Task/etc.) —
+  R017-R019 only froze it for the Personal Knowledge Layer.
 - Multi-device sync strategy — CRDT-based (AFFiNE's y-octo/OctoBase
   pattern) vs. a sidecar tool like Syncthing vs. no sync in v1. Deferred;
   not needed for a single-device initial release.

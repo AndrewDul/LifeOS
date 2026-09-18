@@ -1201,3 +1201,9 @@ migration or implementation slice was written, all fixed in R018:
 See R018 for the full corrected design, the rewritten `ForgetMemory`
 transaction algorithm, and updated Slice A/B acceptance criteria.
 R018 is authoritative wherever it corrects this report.
+
+**Forward pointer:** R018 was itself further corrected by
+`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`
+(Entity sensitivity, orphan-Entity deletion, the exact `V7` table
+scope, and the logical-vs-forensic deletion distinction) — R019 is
+authoritative wherever it corrects either this report or R018.

@@ -924,3 +924,57 @@ corrected schema/bootstrap/bounds) immediately followed by Slice B
 (`AddMemory`, this report's corrected `EntityInputRef`/atomicity/
 confirmation semantics). **Not started in this run** — still
 documentation only, per this run's explicit constraint.
+
+---
+
+## Addendum (R019, 2026-09-18) — final privacy/foundation corrections
+
+A final pre-`V7` consistency pass
+(`docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`)
+found and corrected six further gaps before any migration or
+implementation existed:
+
+- **`Entity` needed a `sensitivity` field too**, by this report's own
+  reasoning for `Source` (§13 above) — metadata like
+  `canonical_name`/`domain_ref` can itself be sensitive. R019 freezes
+  it, using the same four-value set, structurally independent of
+  every other table's own `sensitivity`.
+- **`ForgetMemory`'s "never delete subject/object Entity rows" rule
+  (§20 above) was too broad** once `AddMemory` could create brand-new
+  Entities (§4 above) — a forgotten Fact's only mention of a
+  newly-created, sensitive Entity could otherwise survive forever.
+  R019 freezes a deterministic orphan-Entity cleanup step: delete a
+  captured non-SELF Entity only if no surviving Fact/Relation/
+  `episode_entities` reference remains.
+- **The same-payload duplicate-`domain_ref` case** (two `New()`
+  Entity inputs in one `AddMemory` call requesting the identical
+  domain reference) was left to the real DB constraint alone. R019
+  freezes an explicit Core preflight check across the whole payload,
+  ahead of the DB constraint, matching every other duplicate-
+  detection case in this document.
+- **R017's and R018's stated `V7` table scope disagreed** — R017 froze
+  all eleven tables (six entities + four join tables) as schema-ready;
+  R018's corrected Slice A acceptance listed only six. R019 resolves
+  this explicitly: `V7` creates all eleven tables from day one, with
+  `Relation`/`Episode`'s own action families still deferred - table
+  existence is not mutation permission.
+- **`NewSourceData`/`NewEvidenceData`'s exact shapes**, left unfrozen
+  after `Source.sensitivity` was added, are now specified in full.
+- **"True/permanent deletion" was never explicitly separated into a
+  logical guarantee (what LifeOS's own code/queries provide) versus a
+  forensic-storage guarantee (what the underlying encrypted SQLite
+  file's actual, inspected configuration provides).** Direct
+  inspection found this project currently sets neither
+  `journal_mode` nor `secure_delete` anywhere — R019 freezes the
+  logical guarantee (fully upheld) as the correct thing to tell a
+  user, explicitly declines to claim an unverified forensic guarantee,
+  and freezes a concrete, actionable future hardening step
+  (`PRAGMA secure_delete = ON`, set-and-verified, matching the
+  existing `enable_foreign_keys` precedent) rather than promising
+  something physical-media-level that no application code can
+  actually guarantee.
+
+See R019 for the full corrected `ForgetMemory` transaction (now 14
+steps), the resolved `V7` table list, and the complete logical-vs-
+forensic deletion analysis. R019 is authoritative wherever it corrects
+R017 or R018.
