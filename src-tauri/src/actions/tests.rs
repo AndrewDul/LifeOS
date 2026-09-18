@@ -1491,6 +1491,209 @@ fn add_memory_required_and_optional_field_bounds_enforced() {
     }
 }
 
+/// Post-run correctness hardening (2026-09-18): exact-boundary proof,
+/// driven through `validate_add_memory` itself (not the generic
+/// `validate_personal_knowledge_text_len` helper in isolation), for
+/// every one of AddMemory's eleven bounded free-text fields - the exact
+/// maximum length is structurally accepted, one character more is
+/// rejected with the correct `field`/`max`.
+#[test]
+fn add_memory_all_bounded_fields_exact_max_accepted_and_over_max_rejected() {
+    type Builder = Box<dyn Fn(String) -> AddMemoryPayload>;
+    let cases: Vec<(&'static str, usize, Builder)> = vec![
+        (
+            "entity_type",
+            ENTITY_TYPE_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                subject: EntityInputRef::New(NewEntityData {
+                    entity_type: s,
+                    canonical_name: "Name".to_string(),
+                    sensitivity: Sensitivity::Internal,
+                    domain_ref: None,
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "canonical_name",
+            CANONICAL_NAME_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                subject: EntityInputRef::New(NewEntityData {
+                    entity_type: "person".to_string(),
+                    canonical_name: s,
+                    sensitivity: Sensitivity::Internal,
+                    domain_ref: None,
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "domain_ref_type",
+            DOMAIN_REF_TYPE_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                subject: EntityInputRef::New(NewEntityData {
+                    entity_type: "person".to_string(),
+                    canonical_name: "Name".to_string(),
+                    sensitivity: Sensitivity::Internal,
+                    domain_ref: Some(DomainRef {
+                        domain_ref_type: s,
+                        domain_ref_id: "x".to_string(),
+                    }),
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "domain_ref_id",
+            DOMAIN_REF_ID_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                subject: EntityInputRef::New(NewEntityData {
+                    entity_type: "person".to_string(),
+                    canonical_name: "Name".to_string(),
+                    sensitivity: Sensitivity::Internal,
+                    domain_ref: Some(DomainRef {
+                        domain_ref_type: "x".to_string(),
+                        domain_ref_id: s,
+                    }),
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "predicate",
+            PREDICATE_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                predicate: s,
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "source_type",
+            SOURCE_TYPE_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                source: SourceRef::New(NewSourceData {
+                    source_type: s,
+                    label: None,
+                    reference: None,
+                    sensitivity: Sensitivity::Internal,
+                    captured_at: Utc::now(),
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "label",
+            SOURCE_LABEL_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                source: SourceRef::New(NewSourceData {
+                    source_type: "conversation".to_string(),
+                    label: Some(s),
+                    reference: None,
+                    sensitivity: Sensitivity::Internal,
+                    captured_at: Utc::now(),
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "reference",
+            SOURCE_REFERENCE_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                source: SourceRef::New(NewSourceData {
+                    source_type: "conversation".to_string(),
+                    label: None,
+                    reference: Some(s),
+                    sensitivity: Sensitivity::Internal,
+                    captured_at: Utc::now(),
+                }),
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "content",
+            EVIDENCE_CONTENT_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                evidence: NewEvidenceData {
+                    content: Some(s),
+                    locator: None,
+                    sensitivity: Sensitivity::Internal,
+                },
+                ..base_add_memory_payload()
+            }),
+        ),
+        (
+            "locator",
+            EVIDENCE_LOCATOR_MAX_LEN,
+            Box::new(|s: String| AddMemoryPayload {
+                evidence: NewEvidenceData {
+                    content: None,
+                    locator: Some(s),
+                    sensitivity: Sensitivity::Internal,
+                },
+                ..base_add_memory_payload()
+            }),
+        ),
+    ];
+
+    for (field, max, build) in &cases {
+        let exact = "x".repeat(*max);
+        let payload_ok = build(exact);
+        assert!(
+            validate_add_memory(&payload_ok).is_ok(),
+            "field {field} at exactly its max length {max} should be structurally accepted"
+        );
+
+        let over = "x".repeat(*max + 1);
+        let payload_over = build(over);
+        match validate_add_memory(&payload_over) {
+            Err(errors) => assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::PersonalKnowledgeFieldTooLong { field: f, max: m, .. }
+                        if *f == *field && *m == *max
+                )),
+                "field {field} over max {max} should report PersonalKnowledgeFieldTooLong{{field: {field:?}, max: {max}, ..}}, got {errors:?}"
+            ),
+            Ok(_) => panic!("field {field} over max {max} should have been rejected"),
+        }
+    }
+
+    // value_json is a special case: the TOTAL JSON string (including its
+    // wrapping quote characters) must be exactly VALUE_JSON_MAX_LEN /
+    // VALUE_JSON_MAX_LEN + 1 while remaining syntactically valid JSON.
+    let exact_json = format!("\"{}\"", "x".repeat(VALUE_JSON_MAX_LEN - 2));
+    assert_eq!(exact_json.chars().count(), VALUE_JSON_MAX_LEN);
+    let payload_json_ok = AddMemoryPayload {
+        value: FactValueInput::ScalarJson(exact_json),
+        ..base_add_memory_payload()
+    };
+    assert!(
+        validate_add_memory(&payload_json_ok).is_ok(),
+        "value_json at exactly VALUE_JSON_MAX_LEN (including quotes) should be structurally accepted"
+    );
+
+    let over_json = format!("\"{}\"", "x".repeat(VALUE_JSON_MAX_LEN - 1));
+    assert_eq!(over_json.chars().count(), VALUE_JSON_MAX_LEN + 1);
+    let payload_json_over = AddMemoryPayload {
+        value: FactValueInput::ScalarJson(over_json),
+        ..base_add_memory_payload()
+    };
+    match validate_add_memory(&payload_json_over) {
+        Err(errors) => assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PersonalKnowledgeFieldTooLong {
+                    field: "value_json",
+                    max: VALUE_JSON_MAX_LEN,
+                    ..
+                }
+            )),
+            "value_json over VALUE_JSON_MAX_LEN should report PersonalKnowledgeFieldTooLong{{field: \"value_json\", ..}}, got {errors:?}"
+        ),
+        Ok(_) => panic!("value_json over VALUE_JSON_MAX_LEN should have been rejected"),
+    }
+}
+
 #[test]
 fn add_memory_same_payload_duplicate_domain_ref_rejected_subject_and_object() {
     let domain_ref = DomainRef {

@@ -10447,6 +10447,23 @@ fn am_fact_audit_row_count(conn: &Connection) -> i64 {
         .unwrap()
 }
 
+/// `(entities, sources, evidence, facts, fact_evidence, fact_audit_log)`
+/// - every table `AddMemory` can possibly mutate. Post-run correctness
+/// hardening (2026-09-18): a rejected `AddMemory` call (same-payload or
+/// persisted duplicate-domain-ref) must leave every one of these six
+/// counts unchanged, not merely the two or three a narrower proof might
+/// happen to check.
+fn am_full_table_snapshot(conn: &Connection) -> (i64, i64, i64, i64, i64, i64) {
+    (
+        entity_row_count(conn),
+        am_source_row_count(conn),
+        am_evidence_row_count(conn),
+        am_fact_row_count(conn),
+        am_fact_evidence_row_count(conn),
+        am_fact_audit_row_count(conn),
+    )
+}
+
 /// `(relations, episodes, relation_evidence, episode_evidence, episode_entities)`
 /// - the five tables `AddMemory` must never write to (schema-only, R019
 /// §13). Read with raw SQL, the same "tests reach these tables directly,
@@ -10629,6 +10646,62 @@ fn req_am_conf_d_explicit_call_persists_deliberate_hypothesis_inferred_state() {
         }
         other => panic!("[req_am_conf_d] FAIL - expected Success, got {other:?}"),
     }
+}
+
+/// Post-run correctness hardening (2026-09-18): the confirmation gate
+/// must precede ALL database-dependent resolution, not merely block
+/// before a write. A structurally valid but database-invalid payload
+/// (an `Existing` reference to a nonexistent `EntityId`/`SourceId`, each
+/// tried independently) must still return `ConfirmationRequired` for an
+/// unconfirmed `Inferred` call - never `ValidationFailed(
+/// ReferencedEntityNotFound/ReferencedSourceNotFound)` - proving the
+/// database-dependent stage was never reached at all.
+#[test]
+fn req_am_conf_gate_precedes_db_dependent_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_conf_gate_order.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_entity = EntityId::new();
+    let fake_source = SourceId::new();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+
+    let payload_subject = AddMemoryPayload {
+        subject: EntityInputRef::Existing(fake_entity),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, meta, payload_subject) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!(
+            "[req_am_conf_gate_order] FAIL - expected ConfirmationRequired (gate must precede DB-dependent subject resolution), got {other:?}"
+        ),
+    }
+
+    let payload_source = AddMemoryPayload {
+        source: SourceRef::Existing(fake_source),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, meta, payload_source) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!(
+            "[req_am_conf_gate_order] FAIL - expected ConfirmationRequired (gate must precede DB-dependent source resolution), got {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        entity_row_count(&conn),
+        1,
+        "[req_am_conf_gate_order] FAIL - only the bootstrap SELF entity should exist"
+    );
+    assert_eq!(am_source_row_count(&conn), 0);
+    assert_eq!(am_evidence_row_count(&conn), 0);
+    assert_eq!(am_fact_row_count(&conn), 0);
+    assert_eq!(am_fact_evidence_row_count(&conn), 0);
+    assert_eq!(am_fact_audit_row_count(&conn), 0);
 }
 
 // --- Success combination matrix (R021 - 10 required combinations, ------
@@ -10915,8 +10988,11 @@ fn req_am_dup_persisted_duplicate_domain_ref_rejected_across_two_calls_zero_writ
         ActionOutcome::Success { .. } => {}
         other => panic!("[req_am_dup] FAIL first insert, got {other:?}"),
     }
-    let entity_count_after_first = entity_row_count(&conn);
-    let fact_count_after_first = am_fact_row_count(&conn);
+    // Full-table snapshot (post-run correctness hardening, 2026-09-18) -
+    // the first call's own writes are the baseline the rejected second
+    // call must not disturb in any way.
+    let snapshot_after_first = am_full_table_snapshot(&conn);
+    let self_after_first = self_entity_id(&conn);
 
     // A SEPARATE AddMemory call (not the same payload) tries to create
     // ANOTHER New Entity with the same domain_ref - the persisted-
@@ -10939,11 +11015,81 @@ fn req_am_dup_persisted_duplicate_domain_ref_rejected_across_two_calls_zero_writ
         other => panic!("[req_am_dup] FAIL - expected ValidationFailed, got {other:?}"),
     }
     assert_eq!(
-        entity_row_count(&conn),
-        entity_count_after_first,
-        "[req_am_dup] FAIL - zero writes on the rejected second call"
+        am_full_table_snapshot(&conn),
+        snapshot_after_first,
+        "[req_am_dup] FAIL - the rejected second call must leave every AddMemory-mutated table (entities/sources/evidence/facts/fact_evidence/fact_audit_log) exactly as the first call left them"
     );
-    assert_eq!(am_fact_row_count(&conn), fact_count_after_first);
+    assert_eq!(
+        self_entity_id(&conn),
+        self_after_first,
+        "[req_am_dup] FAIL - SELF must remain exactly the same entity"
+    );
+}
+
+/// Post-run correctness hardening (2026-09-18): the same-payload
+/// duplicate-domain-ref preflight (`actions::validate_add_memory`, pure)
+/// is proven directly in `actions::tests` - this proves the full
+/// `add_memory` action respects it too, with genuinely zero writes
+/// across every mutated table, not only that the pure validator function
+/// itself rejects the shape.
+#[test]
+fn req_am_dup_same_payload_full_zero_write_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_dup_same_payload.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Same-Payload Dup Goal"),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal.id.to_string(),
+    };
+    let self_before = self_entity_id(&conn);
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    let payload = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Goal Entity Subject".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref.clone()),
+        }),
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Goal Entity Object, different name".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref),
+        })),
+        ..mk_am_payload()
+    };
+
+    match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::DuplicateDomainReference),
+                "[req_am_dup_same_payload] FAIL - expected DuplicateDomainReference, got {errors:?}"
+            );
+        }
+        other => {
+            panic!("[req_am_dup_same_payload] FAIL - expected ValidationFailed, got {other:?}")
+        }
+    }
+
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        snapshot_before,
+        "[req_am_dup_same_payload] FAIL - a same-payload duplicate-domain-ref rejection must leave every AddMemory-mutated table (entities/sources/evidence/facts/fact_evidence/fact_audit_log) completely unchanged"
+    );
+    assert_eq!(
+        self_entity_id(&conn),
+        self_before,
+        "[req_am_dup_same_payload] FAIL - SELF must remain exactly the same entity"
+    );
 }
 
 // --- Authoritative domain-ref matrix (R021 §7) --------------------------
@@ -11334,21 +11480,35 @@ fn req_am_audit_row_fields_correct_and_previous_snapshot_always_null() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "am_audit1.db");
     let mut conn = bootstrap_db_at(&path, &key).unwrap();
-    let fact = match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+
+    // A deliberately known requested_at, not Utc::now(), so occurred_at
+    // can be proven equal to it exactly rather than merely "recent".
+    let requested_at: chrono::DateTime<chrono::Utc> = "2026-09-18T12:34:56Z"
+        .parse()
+        .expect("valid RFC3339 literal");
+    let meta = ActionMeta {
+        actor: Actor::Ui,
+        provenance: Provenance::Explicit,
+        requested_at,
+        confirmed: false,
+    };
+
+    let fact = match add_memory(&mut conn, meta, mk_am_payload()) {
         ActionOutcome::Success { value, .. } => value,
         other => panic!("setup failed: {other:?}"),
     };
-    let (action_type, actor, provenance, confirmation_class, previous_snapshot): (
+    let (action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at): (
         String,
         String,
         String,
         String,
         Option<String>,
+        String,
     ) = conn
         .query_row(
-            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot FROM fact_audit_log WHERE fact_id = ?1",
+            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at FROM fact_audit_log WHERE fact_id = ?1",
             rusqlite::params![fact.id.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .unwrap();
     assert_eq!(action_type, "AddMemory");
@@ -11358,6 +11518,11 @@ fn req_am_audit_row_fields_correct_and_previous_snapshot_always_null() {
     assert!(
         previous_snapshot.is_none(),
         "[req_am_audit1] FAIL - previous_snapshot must always be NULL for AddMemory (a create, never an update)"
+    );
+    assert_eq!(
+        occurred_at,
+        requested_at.to_rfc3339(),
+        "[req_am_audit1] FAIL - fact_audit_log.occurred_at must equal ActionMeta.requested_at exactly, using the project's canonical RFC3339 representation"
     );
 }
 

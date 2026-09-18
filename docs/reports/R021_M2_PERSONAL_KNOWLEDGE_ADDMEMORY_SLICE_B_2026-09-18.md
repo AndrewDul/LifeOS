@@ -465,3 +465,190 @@ dominates `InferredChange`, severity 2), plus `serialize_required_
 snapshot`-backed `previous_snapshot` population (this is an update, not
 a create) and the supersession-vs-in-place-correction distinction R018/
 R019 froze.
+
+---
+
+## Post-run correctness and verification hardening (2026-09-18)
+
+A small, deliberate pass conducted before Slice C, prompted by a review
+of `services::add_memory`'s actual execution order against the intended
+`AddMemory` safety boundary. Found and corrected **one genuine ordering
+deviation** (not a data-integrity defect — no write ever happened before
+confirmation either way) and closed several verification gaps in R021's
+own test coverage. **Does not create R022** — appended here as
+instructed; the original §1-§25 above are otherwise unedited.
+
+### Confirmation-gate ordering correction
+
+**Before this pass**, `add_memory` ran: pure structural validation →
+subject/object/source database-dependent resolution (Existing-existence,
+domain-ref authoritative existence, persisted-duplicate-domain-ref) →
+confirmation gate → transaction. An inferred, unconfirmed proposal could
+therefore cause real database reads against Personal Knowledge and
+authoritative domain tables (Goal/Project/Milestone/Task) before the
+user had approved anything — never a write, but a semantically wrong
+place for those reads to happen relative to the safety boundary the
+confirmation gate exists to enforce.
+
+**After this pass**, the order is corrected to:
+
+1. pure structural validation (`actions::validate_add_memory` — no SQL,
+   no mutation, no external reads)
+2. `effective_class`/`blocks_until_confirmed` confirmation-class
+   calculation
+3. the blocking confirmation gate itself — `ConfirmationRequired`
+   returned here, before step 4, for any inferred/unconfirmed call
+4. database-dependent validation/resolution (subject/object/source
+   existence, domain-ref authoritative existence, persisted-duplicate-
+   domain-ref)
+5. zero-write validation result (`ValidationFailed` if step 4 found
+   anything)
+6. the atomic transaction
+
+Implemented as a straightforward reorder inside `services::add_memory`
+— the confirmation-gate block now runs immediately after `normalized =
+validate_add_memory(&payload)` succeeds, before `resolve_entity_input_
+ref`/`resolve_source_ref` are ever called. No change to `actions::
+validate_add_memory` itself (pure structural validation correctly stays
+*before* the gate, per this pass's own explicit instruction — rejecting
+a malformed payload before asking for confirmation is desired, not a
+deviation). No change to `effective_class`/`blocks_until_confirmed`
+themselves, and no Personal-Knowledge-specific override was added — the
+existing generic formula still does all the work (R021 §2, unchanged).
+The function's own doc comment was updated to describe the corrected
+order and explain why it is deliberately this way round.
+
+**New test**, `req_am_conf_gate_precedes_db_dependent_validation`:
+an unconfirmed `Inferred` call with a *structurally valid* payload whose
+`subject`/`source` are each `Existing(<nonexistent id>)` (tried
+independently) now returns `ConfirmationRequired { InferredChange }` in
+both cases — never `ValidationFailed([ReferencedEntityNotFound])` or
+`ValidationFailed([ReferencedSourceNotFound])` — proving the database-
+dependent stage is never reached at all while unconfirmed. All six
+`AddMemory`-mutated table counts (`entities`/`sources`/`evidence`/
+`facts`/`fact_evidence`/`fact_audit_log`) confirmed unchanged
+afterward.
+
+**Explicit-provenance behavior is unchanged and re-confirmed**: for a
+direct `Explicit` call (which never blocks at `AddMemory`'s
+`ExplicitAdd` floor), the same nonexistent `Existing` references still
+reach database-dependent resolution and still return the correct typed
+`ValidationError` — `req_am_not_found_existing_subject_object_source_
+rejected_zero_writes` (pre-existing, unmodified) remains green,
+confirming normal validation was not weakened by the reorder.
+
+### Action-level length-bound completeness
+
+R021's original `add_memory_required_and_optional_field_bounds_enforced`
+covered only 4 of `AddMemory`'s 11 bounded fields, and only at `N+1`
+(never proving `N`, the exact maximum, is actually *accepted*). A new
+test, `add_memory_all_bounded_fields_exact_max_accepted_and_over_max_
+rejected`, drives `validate_add_memory` directly (not the generic
+`validate_personal_knowledge_text_len` helper in isolation) for all
+eleven bounded fields — `entity_type`/`canonical_name`/
+`domain_ref_type`/`domain_ref_id` (`NewEntityData`), `predicate`/
+`value_json` (`Fact`), `source_type`/`label`/`reference`
+(`NewSourceData`), `content`/`locator` (`NewEvidenceData`) — proving
+the exact frozen maximum is structurally accepted and one character more
+is rejected with the correct `field`/`max`, for every one. `value_json`
+is handled as its own special case: the total JSON string, *including*
+its wrapping quote characters, is constructed to be exactly
+`VALUE_JSON_MAX_LEN`/`VALUE_JSON_MAX_LEN + 1` characters while remaining
+syntactically valid JSON (`"` + `x` × (`VALUE_JSON_MAX_LEN - 2`) + `"`).
+`domain_ref_type`/`domain_ref_id` are proven as pure structural bounds
+only (a trivial well-formed companion value on the other side of the
+pair) — authoritative domain-ref *existence* remains a `services::tests`
+concern (R021 §6/§15), not retested here. The original narrower test was
+kept alongside (not deleted) since it still adds coverage of the
+`content`-and-`source_type`-together interaction it originally proved.
+
+### Audit `occurred_at` direct proof
+
+`req_am_audit_row_fields_correct_and_previous_snapshot_always_null` now
+constructs `ActionMeta` with a deliberately fixed, non-`Utc::now()`
+`requested_at` (`"2026-09-18T12:34:56Z"`) instead of `ui_explicit()`'s
+call-time timestamp, `SELECT`s `fact_audit_log.occurred_at` in addition
+to the fields already checked, and asserts it equals `requested_at.
+to_rfc3339()` exactly — the project's canonical RFC3339 timestamp
+representation, matching `insert_fact_audit_log`'s own
+`occurred_at.to_rfc3339()` call. `previous_snapshot IS NULL` remains
+asserted, unchanged. No audit schema change.
+
+### Duplicate-domain-ref: full zero-write proof, both layers
+
+**Same-payload layer** (previously proven only at the pure-validator
+level, `actions::tests::add_memory_same_payload_duplicate_domain_ref_
+rejected_subject_and_object`): a new service-level test,
+`req_am_dup_same_payload_full_zero_write_proof`, calls `add_memory`
+itself with a subject `New` + object `New` payload sharing one
+`domain_ref`, confirms `ValidationFailed([DuplicateDomainReference])`,
+and confirms all six `AddMemory`-mutated table counts plus the SELF
+entity's own id are completely unchanged from immediately before the
+call — proving the full action respects the preflight, not only that
+the pure validator function itself does.
+
+**Persisted (cross-call) layer**: `req_am_dup_persisted_duplicate_
+domain_ref_rejected_across_two_calls_zero_writes` previously snapshotted
+only `entities`/`facts` row counts around the rejected second call. A
+new shared helper, `am_full_table_snapshot`, returns
+`(entities, sources, evidence, facts, fact_evidence, fact_audit_log)` in
+one call; the test now asserts this full six-table tuple (plus the SELF
+entity's own id) is byte-for-byte unchanged by the rejected second call,
+while the first call's own successful writes remain the — now
+explicitly captured — baseline.
+
+### Exact new test count
+
+**Previous (R021 original): 324. New this pass: 3
+(`req_am_conf_gate_precedes_db_dependent_validation`,
+`add_memory_all_bounded_fields_exact_max_accepted_and_over_max_rejected`,
+`req_am_dup_same_payload_full_zero_write_proof` — the audit-`occurred_
+at` and cross-call-duplicate strengthenings extended two PRE-EXISTING
+tests rather than adding new ones). Final: 327. Failed: 0.** The
+original R021 §20 result — **293 → 324 (+31)** — remains this report's
+unedited historical record; **327** is this pass's own separately-
+reported measured result, not a retroactive edit to §20.
+
+### Build/package results (this pass)
+
+- `cargo fmt --check`: clean (after one `cargo fmt` pass).
+- `cargo check --tests`: clean, zero warnings.
+- `cargo test -- --test-threads=1`: **327 passed; 0 failed; 0 ignored**.
+- `cargo build --release`: succeeded (2m37s).
+- `npm run build`: succeeded.
+- `npm run tauri build`: run this pass (required — production
+  `AddMemory` execution order changed) — see the chat reply for the
+  measured MSI/NSIS result, verified from the captured log and the
+  actual bundle files on disk, not the wrapper's exit code alone.
+
+### Files changed (this pass)
+
+- `src-tauri/src/services/mod.rs` — `add_memory`'s confirmation-gate
+  reordered ahead of database-dependent resolution; doc comment updated
+  to match.
+- `src-tauri/src/services/tests.rs` — 1 new test
+  (`req_am_conf_gate_precedes_db_dependent_validation`), 1 new test
+  (`req_am_dup_same_payload_full_zero_write_proof`), 1 new shared helper
+  (`am_full_table_snapshot`), 2 existing tests strengthened
+  (`req_am_audit_row_fields_correct_and_previous_snapshot_always_null`,
+  `req_am_dup_persisted_duplicate_domain_ref_rejected_across_two_calls_
+  zero_writes`).
+- `src-tauri/src/actions/tests.rs` — 1 new test
+  (`add_memory_all_bounded_fields_exact_max_accepted_and_over_max_
+  rejected`); the original narrower bounds test was kept, not removed.
+- `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`
+  (this addendum).
+
+**No `V7` migration change. No V8 created. No `CorrectMemory`/
+`ConfirmMemory`/`ForgetMemory` code. No UI/Tauri command changes. No
+retrieval/Qwen/Luna work.** `docs/PROJECT_STATE.md`/`docs/LIFEOS_SPEC.md`
+were reviewed for wording describing `AddMemory`'s internal confirmation-
+vs-database-dependent-validation ordering; neither document made a
+specific claim about that ordering, so neither required a correction —
+left unedited by this pass.
+
+### Next substantial report
+
+Unchanged: **R022**, allocated to whichever of Slice C (`CorrectMemory`)
+or another explicitly-instructed run comes next. `CorrectMemory` was
+**not** started by this pass.

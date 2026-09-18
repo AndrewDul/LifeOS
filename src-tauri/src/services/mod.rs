@@ -1791,17 +1791,28 @@ fn resolve_source_ref(
 /// is needed here (unlike `CorrectMemory`'s floor) - see
 /// `services::tests::req_am_inferred_unconfirmed_blocks_with_zero_writes`.
 ///
-/// Validation-before-write ordering: (1) pure structural validation
+/// Execution order (corrected post-R021 verification hardening,
+/// 2026-09-18 - see R021's "Post-run correctness and verification
+/// hardening" addendum): (1) pure structural validation
 /// (`actions::validate_add_memory` - lengths, JSON syntax, confidence
-/// bounds, same-payload duplicate-domain-ref); (2) subject/object/source
-/// database-dependent resolution, aggregating every reference error
-/// found rather than stopping at the first (matches `add_task`'s
+/// bounds, same-payload duplicate-domain-ref) - no SQL, no mutation, no
+/// external reads; (2) the confirmation gate, immediately after pure
+/// validation succeeds - `effective_class`/`blocks_until_confirmed`
+/// against `meta.provenance`/`meta.confirmed`; (3) only once
+/// confirmation is satisfied does subject/object/source database-
+/// dependent resolution run, aggregating every reference error found
+/// rather than stopping at the first (matches `add_task`'s
 /// `project_id`/`goal_id` aggregation precedent) - Existing-not-found,
 /// domain-ref authoritative existence, and persisted-duplicate-domain-ref
-/// are all checked here; (3) only once every check above has succeeded
-/// does the confirmation gate run, and only after that does the
-/// transaction open. Nothing is written to any table before all
-/// validation succeeds.
+/// are all checked here; (4) the transaction opens only after every
+/// check above has succeeded. **Deliberately not the other way around**:
+/// an inferred/unconfirmed model proposal must not read Personal
+/// Knowledge or authoritative domain objects merely to prepare a
+/// mutation the user has not yet approved - the gate blocks before any
+/// database-dependent validation is even attempted, proven directly by
+/// `req_am_conf_gate_precedes_db_dependent_validation`. Nothing is
+/// written to any table before all validation succeeds, in either
+/// case.
 ///
 /// Atomic transaction, in order: new subject Entity (if any) -> new
 /// object Entity (if any) -> new Source (if `SourceRef::New`) -> Fact ->
@@ -1839,6 +1850,18 @@ pub(crate) fn add_memory(
         Err(errors) => return ActionOutcome::ValidationFailed(errors),
     };
 
+    // Confirmation gate runs immediately after pure structural
+    // validation and BEFORE any database-dependent resolution - an
+    // inferred/unconfirmed proposal must not read Personal Knowledge or
+    // authoritative domain objects to prepare a mutation the user has
+    // not yet approved (R021 post-run correctness hardening).
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
     let now = meta.requested_at;
     let mut errors: Vec<ValidationError> = Vec::new();
 
@@ -1868,13 +1891,6 @@ pub(crate) fn add_memory(
 
     let subject = subject.expect("no reference errors implies subject resolved");
     let source = source.expect("no reference errors implies source resolved");
-
-    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
-    if blocks_until_confirmed(class) && !meta.confirmed {
-        return ActionOutcome::ConfirmationRequired {
-            confirmation_class: class,
-        };
-    }
 
     let persisted_epistemic_state = if meta.provenance == Provenance::Inferred && meta.confirmed {
         EpistemicState::UserConfirmed
