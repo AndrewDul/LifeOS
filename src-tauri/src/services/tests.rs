@@ -15100,3 +15100,97 @@ fn req_fm_rollback_mid_step_forced_fact_delete_failure() {
         "[req_fm_rollback2] FAIL - T must still exist"
     );
 }
+
+// --- Post-run transaction-isolation hardening (2026-09-18) --------------
+
+/// Direct proof that `ForgetMemory` opens its transaction with
+/// `TransactionBehavior::Immediate`, not the default `Deferred` every
+/// other action's plain `conn.transaction()` uses - a `Deferred`
+/// transaction would let a concurrent writer change the exact rows
+/// `ForgetMemory` is about to read/delete before it ever acquires a
+/// write lock. Two real connections to the SAME encrypted database
+/// file: Connection A opens `ForgetMemory`'s transaction via the exact
+/// production helper; Connection B (a zero busy timeout, so the
+/// outcome is immediate and deterministic - no sleeps) attempts a
+/// harmless write and must be rejected with `SQLITE_BUSY`/`LOCKED`
+/// while A's transaction is open, then must succeed normally once A's
+/// transaction is dropped (rolled back).
+#[test]
+fn req_fm_uses_immediate_transaction_blocking_concurrent_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_immediate_lock.db");
+    let mut conn_a = bootstrap_db_at(&path, &key).unwrap();
+    let conn_b = bootstrap_db_at(&path, &key).unwrap();
+    conn_b
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+
+    let tx_a = begin_forget_transaction(&mut conn_a).unwrap();
+
+    let harmless_write = || {
+        conn_b.execute(
+            "INSERT INTO sources (id, source_type, sensitivity, captured_at, created_at)
+             VALUES (?1, 'conversation', 'INTERNAL', ?2, ?2)",
+            rusqlite::params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+        )
+    };
+
+    let blocked_result = harmless_write();
+    match &blocked_result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert!(
+                matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "[req_fm_immediate_lock] FAIL - expected SQLITE_BUSY/LOCKED, got {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_fm_immediate_lock] FAIL - a concurrent writer must be blocked while ForgetMemory's IMMEDIATE transaction holds the write lock, got {other:?}"
+        ),
+    }
+
+    drop(tx_a);
+
+    let unblocked_result = harmless_write();
+    assert!(
+        unblocked_result.is_ok(),
+        "[req_fm_immediate_lock] FAIL - after A's transaction is dropped/rolled back, B should be able to write normally, got {unblocked_result:?}"
+    );
+}
+
+/// Direct repo-level proof for `delete_fact_forget_target`, matching
+/// the standard already established for `CorrectMemory`/`ConfirmMemory`'s
+/// own guarded updates: an existing Fact deletes successfully; a
+/// missing `FactId` returns a real `Err`, never a silent `Ok`.
+#[test]
+fn req_fm_repo_delete_fact_forget_target_direct_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "fm_repo_delete_direct.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let target = mk_fm_target(&mut conn);
+    // This narrow function only deletes the `facts` row itself - the
+    // caller (`forget_memory`) is responsible for clearing
+    // `fact_evidence` first; remove it directly here so this isolated
+    // proof does not trip the real `ON DELETE RESTRICT` FK.
+    conn.execute(
+        "DELETE FROM fact_evidence WHERE fact_id = ?1",
+        rusqlite::params![target.id.to_string()],
+    )
+    .unwrap();
+    let result = storage::personal_knowledge_repo::delete_fact_forget_target(&conn, target.id);
+    assert!(
+        result.is_ok(),
+        "[req_fm_repo_delete_direct] FAIL - existing Fact delete should succeed, got {result:?}"
+    );
+    assert!(get_fact(&conn, target.id).unwrap().is_none());
+
+    let missing_result =
+        storage::personal_knowledge_repo::delete_fact_forget_target(&conn, FactId::new());
+    assert!(
+        missing_result.is_err(),
+        "[req_fm_repo_delete_direct] FAIL - missing FactId delete should be a real Err, not silently Ok, got {missing_result:?}"
+    );
+}

@@ -299,14 +299,18 @@ guarantee, never described as forensic/physical-media erasure.
 
 ## 18. Forensic-storage boundary
 
-`PRAGMA secure_delete = ON` (R020) is unchanged and unverified-again by
-this run only in the sense that no new test re-proves it — it was
-already proven in R020/R021/R022's suites and nothing in this run
-alters `open_encrypted`. No `VACUUM`, no journal-mode change, no WAL
-change, no SSD-erase command was added. `ForgetMemory`'s guarantee
-remains exactly logical/product-level deletion from the canonical
-database plus the existing SQLite-level `secure_delete` hardening —
-never a claim of impossible SSD/filesystem/snapshot erasure.
+`PRAGMA secure_delete = ON` (R020) is unchanged by this run — nothing in
+`ForgetMemory` touches `open_encrypted`. No new `secure_delete`-specific
+test was added this run (none was needed), but R020's own regression
+proof (`req_sd1`-`req_sd5`) is not a stale historical claim either: it
+is part of the same suite this report's §26/§30 counts, so it ran and
+remained green as part of this run's own full `cargo test` pass, not
+merely "previously" in R020/R021/R022. No `VACUUM`, no journal-mode
+change, no WAL change, no SSD-erase command was added.
+`ForgetMemory`'s guarantee remains exactly logical/product-level
+deletion from the canonical database plus the existing SQLite-level
+`secure_delete` hardening — never a claim of impossible SSD/filesystem/
+snapshot erasure.
 
 ---
 
@@ -553,3 +557,162 @@ machinery — Entity resolution, the same confirmation-class/audit
 patterns, `Evidence`'s already-implemented lifecycle), but it explicitly
 requires its own freeze pass before any code, exactly as this run's
 instructions require. This recommendation is not a decision to proceed.
+
+---
+
+## Post-run transaction-isolation hardening (2026-09-18)
+
+A small, deliberate pass conducted before R025, prompted by a review of
+`forget_memory`'s actual read/write ordering against the privacy
+guarantee it promises. Found and corrected **one genuine atomicity/
+TOCTOU gap** (not a defect that has occurred — no concurrent writer to
+Personal Knowledge exists yet in this codebase; the gap was in the
+production code's *general* correctness, not in anything this run's own
+tests had exercised incorrectly) and closed it before it could become
+load-bearing as concurrent write paths (Relation/Episode actions, a
+future sync engine) are added later.
+
+### The gap
+
+R024's original §7 stated steps 1-4 (reading the target Fact, capturing
+candidate Entity ids, collecting linked `EvidenceId`s, collecting their
+`SourceId`s) ran on the plain `&mut Connection` **before**
+`conn.transaction()` opened, with the destructive steps 5-13 running
+inside that (default `Deferred`) transaction. A `Deferred` transaction
+acquires no lock until its first actual write, so between the moment
+`ForgetMemory` finished reading the deletion set and the moment its
+transaction's first write actually executed, a hypothetical concurrent
+writer could have linked a NEW `fact_evidence` row to the target Fact.
+`ForgetMemory`'s already-collected `EvidenceId` set would not contain
+that new link, so: step 7 would never remove its
+`relation_evidence`/`episode_evidence` rows, step 8 would never delete
+that Evidence row, step 9 would never consider its Source for orphan
+cleanup — while step 10's defensive `DELETE FROM fact_evidence WHERE
+fact_id = T` would still remove the *link* itself. Net result: the
+target Fact is gone, but Evidence genuinely associated with it could
+survive, undetected. This is a real privacy-guarantee gap in the
+general case, independent of whether any code in this repository
+currently creates such a concurrent write (none does yet).
+
+### The fix
+
+`ForgetMemory` now opens its own transaction with
+`TransactionBehavior::Immediate` (`services::begin_forget_transaction`,
+a narrow private helper used by no other action) **immediately after
+the confirmation gate**, and performs the ENTIRE deletion-set
+determination — the target Fact read, candidate Entity capture, Evidence
+collection, Source collection — through that same transaction, before
+any destructive step runs. `Immediate` acquires SQLite's write
+(`RESERVED`) lock at `BEGIN` time, before any of those reads execute —
+no other connection can acquire a competing write lock and change
+`fact_evidence`/`evidence`/`sources` out from under the collected set
+for the remainder of the call. Opening the transaction still happens
+only after the confirmation gate (opening a transaction is not itself
+semantic access to Personal Knowledge) — an unconfirmed call still never
+reaches `begin_forget_transaction` at all, proven by the pre-existing
+`req_fm_conf_a`/`req_fm_conf_d` tests remaining green unmodified.
+
+**R019's semantic 14-step algorithm is completely unchanged** — this
+pass only moves WHERE steps 1-4 execute (from the plain connection to
+inside the `Immediate` transaction), never WHAT any step does, adds no
+new step, removes no step, and reorders nothing relative to the other
+steps. No new `ValidationError`, no new `ConfirmationClass`, no schema
+change.
+
+### New tests
+
+- `req_fm_uses_immediate_transaction_blocking_concurrent_writer` — two
+  real connections to the same encrypted database file. Connection A
+  opens `ForgetMemory`'s transaction via the exact production helper
+  (`begin_forget_transaction`); Connection B (a zero `busy_timeout`, so
+  the result is immediate and deterministic, no sleeps) attempts a
+  harmless write and is rejected with `SQLITE_BUSY`/`SQLITE_LOCKED`
+  while A's transaction is open, then succeeds normally once A's
+  transaction is dropped (rolled back) — direct proof the production
+  path uses `Immediate`, not `Deferred`.
+- `req_fm_repo_delete_fact_forget_target_direct_proof` — a repo-level
+  proof for `delete_fact_forget_target` matching the standard already
+  established for `update_fact_as_superseded`/`confirm_fact_epistemic_
+  state`: an existing Fact (with its `fact_evidence` link removed first,
+  so this isolated proof does not trip the real FK) deletes
+  successfully; a nonexistent `FactId` returns a real `Err`, never a
+  silent `Ok`.
+
+Deliberately not added: a synthetic "collect-before-write" callback hook
+in production code purely to prove the ordering to a test — the
+two-connection lock-contention test above already proves the actual
+production transaction boundary directly, without any test-only
+production hook.
+
+### Existing coverage re-verified, not duplicated
+
+All 22 pre-existing `ForgetMemory` tests remain green, unmodified,
+including both rollback proofs (`req_fm_rollback_forced_final_audit_
+failure_restores_everything`, `req_fm_rollback_mid_step_forced_fact_
+delete_failure`) — now exercising the `Immediate` transaction boundary
+and confirmed to still restore the target Fact, scrubbed audit
+snapshots, inbound supersession references, Evidence, join rows,
+Source, and the candidate Entity, with no `ForgetMemory` marker left
+behind. The confirmation-gate-precedes-lookup tests
+(`req_fm_conf_a`/`req_fm_conf_d`, nonexistent `FactId` + unconfirmed)
+remain green, confirming the gate still runs before
+`begin_forget_transaction` is ever called.
+
+### `secure_delete = ON` wording correction (§18 above)
+
+R024's original §18 wording implied `secure_delete` was only "proven in
+R020/R021/R022's suites," which understated the truth: R020's own
+`secure_delete` regression tests (`req_sd1`-`req_sd5`) are part of the
+same full suite this report counts, so they ran and remained green as
+part of THIS run's own `cargo test` pass too — no new test was needed,
+and none was added merely for prose symmetry. §18 above has been
+corrected to state this precisely.
+
+### Exact new test count
+
+**Previous (R024 original): 398. New this pass: 2**
+(`req_fm_uses_immediate_transaction_blocking_concurrent_writer`,
+`req_fm_repo_delete_fact_forget_target_direct_proof`). **Final: 400.
+Failed: 0.** The original R024 §30 result — **375 → 398 (+23)** —
+remains this report's unedited historical record; **400** is this
+pass's own separately-reported measured result, not a retroactive edit
+to §30.
+
+### Build/package results (this pass)
+
+- `cargo fmt --check`: clean (after one `cargo fmt` pass).
+- `cargo check --tests`: clean, zero warnings.
+- `cargo test -- --test-threads=1`: **400 passed; 0 failed; 0 ignored**.
+- `cargo build --release`: succeeded.
+- `npm run build`: succeeded.
+- `npm run tauri build`: run this pass (required — production
+  `ForgetMemory` transaction semantics changed) — see the chat reply
+  for the measured MSI/NSIS result, verified from the captured log and
+  the actual bundle files on disk.
+
+### Files changed (this pass)
+
+- `src-tauri/src/services/mod.rs` — new private `begin_forget_
+  transaction` helper; `forget_memory` restructured so the confirmation
+  gate is followed immediately by opening this `Immediate` transaction,
+  with target lookup and all deletion-set collection moved inside it;
+  doc comments updated to describe the corrected boundary.
+- `src-tauri/src/services/tests.rs` — 2 new tests (above).
+- `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`
+  (this addendum, plus the §18 wording correction).
+
+**No `V7` migration change. No V8 created. `ForgetMemory`'s observable
+14-step algorithm and every other frozen guarantee (target eligibility,
+no Undo, Evidence privacy-first deletion, Source/Entity orphan rules,
+SELF protection, hard Fact deletion, payload-free audit marker, logical-
+vs-forensic boundary) are unchanged** — this pass only strengthens
+transaction isolation around the existing algorithm. `docs/PROJECT_
+STATE.md`/`docs/LIFEOS_SPEC.md` were checked for the old "steps 1-4
+outside the transaction" wording; neither document made that specific
+claim, so neither required a correction — left unedited by this pass.
+Relation actions, Episode actions, and retrieval/Context Pack remain
+entirely unstarted.
+
+### Next substantial report
+
+Unchanged: **R025**. Not started by this pass.
