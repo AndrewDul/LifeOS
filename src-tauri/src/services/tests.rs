@@ -7,7 +7,9 @@
 
 use super::*;
 use crate::actions::{
-    ActionMeta, ActionOutcome, Actor, ConfirmationClass, FieldPatch, Provenance, ValidationError,
+    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmationClass, EntityInputRef,
+    FactValueInput, FieldPatch, NewEntityData, NewEvidenceData, NewSourceData, Provenance,
+    SourceRef, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
@@ -10361,4 +10363,1108 @@ fn req_pkrt2_get_fact_round_trip_scalar_and_entity_ref() {
     assert_eq!(fetched_closed.epistemic_state, EpistemicState::Stale);
 
     println!("[req_pkrt2] PASS - get_fact round-trips Scalar and EntityRef values, enum parsing, nullable confidence, temporal fields, sensitivity, and a valid superseded_by_fact_id link");
+}
+
+// =========================================================================
+// M2 Personal Knowledge Slice B - AddMemory (2026-09-18)
+//
+// Evidence for
+// `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`.
+// The first production Personal Knowledge mutation. Database-dependent
+// behavior only - pure `validate_add_memory` structural tests live in
+// `actions::tests` instead (same split as every other action).
+// =========================================================================
+
+fn mk_am_source_new() -> SourceRef {
+    SourceRef::New(NewSourceData {
+        source_type: "conversation".to_string(),
+        label: None,
+        reference: None,
+        sensitivity: Sensitivity::Internal,
+        captured_at: Utc::now(),
+    })
+}
+
+fn mk_am_evidence() -> NewEvidenceData {
+    NewEvidenceData {
+        content: Some("test evidence content".to_string()),
+        locator: None,
+        sensitivity: Sensitivity::Internal,
+    }
+}
+
+/// A minimal, always-valid baseline payload - Self subject, scalar JSON
+/// value, brand-new Source, Evidence with content only. Every test below
+/// overrides only the fields it cares about via struct-update syntax.
+fn mk_am_payload() -> AddMemoryPayload {
+    AddMemoryPayload {
+        subject: EntityInputRef::SelfEntity,
+        predicate: "likes".to_string(),
+        value: FactValueInput::ScalarJson("\"coffee\"".to_string()),
+        memory_type: MemoryType::Preference,
+        epistemic_state: EpistemicState::UserConfirmed,
+        confidence: None,
+        sensitivity: Sensitivity::Internal,
+        source: mk_am_source_new(),
+        evidence: mk_am_evidence(),
+    }
+}
+
+fn self_entity_id(conn: &Connection) -> EntityId {
+    storage::personal_knowledge_repo::get_self_entity(conn)
+        .unwrap()
+        .unwrap()
+        .id
+}
+
+fn entity_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn am_source_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn am_fact_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM facts", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn am_evidence_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM evidence", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn am_fact_evidence_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM fact_evidence", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn am_fact_audit_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM fact_audit_log", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// `(relations, episodes, relation_evidence, episode_evidence, episode_entities)`
+/// - the five tables `AddMemory` must never write to (schema-only, R019
+/// §13). Read with raw SQL, the same "tests reach these tables directly,
+/// production never does" precedent `req_pkrt2` and its neighbors
+/// already established.
+fn relation_episode_side_effect_counts(conn: &Connection) -> (i64, i64, i64, i64, i64) {
+    let q = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    (
+        q("relations"),
+        q("episodes"),
+        q("relation_evidence"),
+        q("episode_evidence"),
+        q("episode_entities"),
+    )
+}
+
+/// Full-field comparison for a `Source` - there is no production
+/// `get_source` (nothing besides existence needs one, `source_exists`
+/// covers `AddMemory`'s own needs), so immutability-on-reuse proofs read
+/// the row directly, matching the raw-SQL-for-tests-only precedent above.
+fn read_source_fields(
+    conn: &Connection,
+    id: SourceId,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+) {
+    conn.query_row(
+        "SELECT source_type, label, reference, sensitivity, captured_at, created_at FROM sources WHERE id = ?1",
+        rusqlite::params![id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    )
+    .unwrap()
+}
+
+/// Same forced-failure mechanism as `install_audit_failure_trigger`/
+/// `install_project_audit_failure_trigger`/etc. - `RAISE(FAIL, ...)`
+/// aborts only the failing statement, proving `add_memory`'s own
+/// `Transaction`-drop rollback, not SQLite doing it unprompted.
+fn install_fact_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_fact_audit_failure
+         BEFORE INSERT ON fact_audit_log
+         BEGIN
+             SELECT RAISE(FAIL, 'forced fact audit failure');
+         END;",
+    )
+    .expect("failed to install the forced fact-audit-failure trigger");
+}
+
+fn remove_fact_audit_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_fact_audit_failure;")
+        .expect("failed to remove the forced fact-audit-failure trigger");
+}
+
+/// An earlier-stage forced failure (before the final audit-log write) -
+/// proves the rollback also covers a failure that happens partway
+/// through the insert sequence, not only the very last step.
+fn install_evidence_insert_failure_trigger(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TRIGGER force_evidence_failure
+         BEFORE INSERT ON evidence
+         BEGIN
+             SELECT RAISE(FAIL, 'forced evidence insert failure');
+         END;",
+    )
+    .expect("failed to install the forced evidence-insert-failure trigger");
+}
+
+fn remove_evidence_insert_failure_trigger(conn: &Connection) {
+    conn.execute_batch("DROP TRIGGER IF EXISTS force_evidence_failure;")
+        .expect("failed to remove the forced evidence-insert-failure trigger");
+}
+
+// --- Confirmation gate (R018 §3/R021 §2) --------------------------------
+
+#[test]
+fn req_am_conf_a_explicit_unconfirmed_executes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+        }
+        other => panic!("[req_am_conf_a] FAIL - expected Success, got {other:?}"),
+    }
+    assert_eq!(am_fact_row_count(&conn), 1);
+}
+
+/// Central safety proof: `Provenance::Inferred` at `AddMemory`'s
+/// `ExplicitAdd` floor must block with genuinely zero writes across
+/// every table `AddMemory` could otherwise touch - no override code
+/// exists for this in `add_memory` (unlike `CorrectMemory`), so this
+/// proves the *generic* `effective_class`/`blocks_until_confirmed`
+/// machinery alone is sufficient.
+#[test]
+fn req_am_conf_b_inferred_unconfirmed_blocks_with_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match add_memory(&mut conn, meta, mk_am_payload()) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!("[req_am_conf_b] FAIL - expected ConfirmationRequired, got {other:?}"),
+    }
+    assert_eq!(
+        am_fact_row_count(&conn),
+        0,
+        "[req_am_conf_b] FAIL - zero Fact writes expected"
+    );
+    assert_eq!(
+        entity_row_count(&conn),
+        1,
+        "[req_am_conf_b] FAIL - only the bootstrap SELF entity should exist"
+    );
+    assert_eq!(am_source_row_count(&conn), 0);
+    assert_eq!(am_evidence_row_count(&conn), 0);
+    assert_eq!(am_fact_audit_row_count(&conn), 0);
+}
+
+#[test]
+fn req_am_conf_c_inferred_confirmed_persists_user_confirmed_regardless_of_payload_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    let payload = AddMemoryPayload {
+        epistemic_state: EpistemicState::Observed,
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, meta, payload) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(
+                value.epistemic_state,
+                EpistemicState::UserConfirmed,
+                "[req_am_conf_c] FAIL - a confirmed Inferred resubmission must persist USER_CONFIRMED, not the payload's originally-proposed state"
+            );
+        }
+        other => panic!("[req_am_conf_c] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// The only path that can persist a deliberate `HYPOTHESIS`+`INFERRED`
+/// memory (R018 §5): a direct `Explicit` call persists exactly the
+/// caller's requested `epistemic_state`, even though `Inferred` normally
+/// implies a not-yet-confirmed model proposal.
+#[test]
+fn req_am_conf_d_explicit_call_persists_deliberate_hypothesis_inferred_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut meta = ui_explicit();
+    meta.confirmed = true; // irrelevant for Explicit - included to prove it stays irrelevant
+    let payload = AddMemoryPayload {
+        memory_type: MemoryType::Hypothesis,
+        epistemic_state: EpistemicState::Inferred,
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, meta, payload) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.memory_type, MemoryType::Hypothesis);
+            assert_eq!(
+                value.epistemic_state,
+                EpistemicState::Inferred,
+                "[req_am_conf_d] FAIL - an explicit call must persist exactly the requested epistemic_state unchanged"
+            );
+        }
+        other => panic!("[req_am_conf_d] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+// --- Success combination matrix (R021 - 10 required combinations, ------
+// grouped into a handful of table-driven tests rather than one test per
+// trivial combination) ----------------------------------------------------
+
+/// Combinations 1-2: Self subject + ScalarJson value + New Source, with
+/// Evidence provided as content-only and as locator-only.
+#[test]
+fn req_am_success_self_subject_scalar_value_evidence_content_or_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_succ1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+
+    let p1 = AddMemoryPayload {
+        evidence: NewEvidenceData {
+            content: Some("user explicitly said it".to_string()),
+            locator: None,
+            sensitivity: Sensitivity::Internal,
+        },
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p1) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value.subject_entity_id, self_id),
+        other => panic!("[req_am_success1] FAIL content-only evidence, got {other:?}"),
+    }
+
+    let p2 = AddMemoryPayload {
+        predicate: "mentioned_in".to_string(),
+        evidence: NewEvidenceData {
+            content: None,
+            locator: Some("chat://conversation/42".to_string()),
+            sensitivity: Sensitivity::Internal,
+        },
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p2) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_am_success1] FAIL locator-only evidence, got {other:?}"),
+    }
+
+    assert_eq!(am_fact_row_count(&conn), 2);
+    assert_eq!(am_evidence_row_count(&conn), 2);
+    assert_eq!(am_fact_evidence_row_count(&conn), 2);
+}
+
+/// Combinations 3-4 + 10: Entity-valued Fact with a brand-new object (no
+/// `domain_ref`), an Existing object, and a self-edge (subject == object,
+/// both `Existing` referencing the same `EntityId`) - explicitly allowed,
+/// no invented restriction.
+#[test]
+fn req_am_success_entity_valued_facts_new_existing_and_self_edge_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_succ2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let self_id = self_entity_id(&conn);
+
+    let p1 = AddMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "vehicle".to_string(),
+            canonical_name: "My Car".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..mk_am_payload()
+    };
+    let new_object_id = match add_memory(&mut conn, ui_explicit(), p1) {
+        ActionOutcome::Success { value, .. } => match value.value {
+            FactValue::EntityRef(id) => id,
+            other => panic!("[req_am_success2] FAIL - expected EntityRef, got {other:?}"),
+        },
+        other => panic!("[req_am_success2] FAIL new object, got {other:?}"),
+    };
+    assert_ne!(new_object_id, self_id);
+
+    let p2 = AddMemoryPayload {
+        predicate: "also_owns".to_string(),
+        value: FactValueInput::Entity(EntityInputRef::Existing(new_object_id)),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p2) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_am_success2] FAIL existing object, got {other:?}"),
+    }
+
+    let p3 = AddMemoryPayload {
+        subject: EntityInputRef::SelfEntity,
+        value: FactValueInput::Entity(EntityInputRef::SelfEntity),
+        predicate: "reflects_on_self".to_string(),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p3) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.subject_entity_id, self_id);
+            assert_eq!(value.value, FactValue::EntityRef(self_id));
+        }
+        other => panic!("[req_am_success2] FAIL self-edge, got {other:?}"),
+    }
+
+    assert_eq!(am_fact_row_count(&conn), 3);
+    assert_eq!(
+        entity_row_count(&conn),
+        2,
+        "SELF + the one new vehicle Entity"
+    );
+}
+
+/// Combinations 5-6: Existing subject, and New subject without a
+/// `domain_ref`.
+#[test]
+fn req_am_success_subject_variants_existing_and_new_without_domain_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_succ3.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let p_new_person = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "Alex".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        ..mk_am_payload()
+    };
+    let alex_id = match add_memory(&mut conn, ui_explicit(), p_new_person) {
+        ActionOutcome::Success { value, .. } => value.subject_entity_id,
+        other => panic!("[req_am_success3] FAIL new subject, got {other:?}"),
+    };
+
+    let p_existing = AddMemoryPayload {
+        subject: EntityInputRef::Existing(alex_id),
+        predicate: "works_at".to_string(),
+        value: FactValueInput::ScalarJson("\"Acme\"".to_string()),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p_existing) {
+        ActionOutcome::Success { value, .. } => assert_eq!(value.subject_entity_id, alex_id),
+        other => panic!("[req_am_success3] FAIL existing subject, got {other:?}"),
+    }
+
+    assert_eq!(am_fact_row_count(&conn), 2);
+    assert_eq!(entity_row_count(&conn), 2, "SELF + Alex");
+}
+
+/// Combinations 7-9: subject/object backed by an authoritative
+/// `domain_ref` on both roles (`Goal`/`Project`, then `Milestone`/`Task`),
+/// and a `SourceRef::Existing` reuse.
+#[test]
+fn req_am_success_domain_ref_backed_new_entities_both_roles_and_existing_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_succ4.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal D")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project D", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup project failed: {other:?}"),
+    };
+    let milestone = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Milestone D", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup milestone failed: {other:?}"),
+    };
+    let task = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Task D", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup task failed: {other:?}"),
+    };
+
+    let p1 = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Goal D Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Goal".to_string(),
+                domain_ref_id: goal.id.to_string(),
+            }),
+        }),
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "project".to_string(),
+            canonical_name: "Project D Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Project".to_string(),
+                domain_ref_id: project.id.to_string(),
+            }),
+        })),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p1) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_am_success4] FAIL goal/project new entities, got {other:?}"),
+    }
+
+    let existing_source_id: String = conn
+        .query_row("SELECT id FROM sources LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let existing_source_id = SourceId::parse(&existing_source_id).unwrap();
+
+    let p2 = AddMemoryPayload {
+        predicate: "tracks".to_string(),
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "milestone".to_string(),
+            canonical_name: "Milestone D Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Milestone".to_string(),
+                domain_ref_id: milestone.id.to_string(),
+            }),
+        }),
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "task".to_string(),
+            canonical_name: "Task D Entity".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Task".to_string(),
+                domain_ref_id: task.id.to_string(),
+            }),
+        })),
+        source: SourceRef::Existing(existing_source_id),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p2) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_am_success4] FAIL milestone/task new entities + existing source, got {other:?}"
+        ),
+    }
+
+    assert_eq!(am_fact_row_count(&conn), 2);
+    assert_eq!(
+        entity_row_count(&conn),
+        5,
+        "SELF + Goal/Project/Milestone/Task-backed Entities"
+    );
+    assert_eq!(
+        am_source_row_count(&conn),
+        1,
+        "[req_am_success4] FAIL - the second call must reuse the existing Source, not create a new one"
+    );
+}
+
+// --- Duplicate domain-ref detection (two layers, R018 §9/R019 §9) ------
+
+#[test]
+fn req_am_dup_persisted_duplicate_domain_ref_rejected_across_two_calls_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_dup.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Dup Goal")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let domain_ref = DomainRef {
+        domain_ref_type: "Goal".to_string(),
+        domain_ref_id: goal.id.to_string(),
+    };
+
+    let p1 = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Goal Entity 1".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref.clone()),
+        }),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p1) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_am_dup] FAIL first insert, got {other:?}"),
+    }
+    let entity_count_after_first = entity_row_count(&conn);
+    let fact_count_after_first = am_fact_row_count(&conn);
+
+    // A SEPARATE AddMemory call (not the same payload) tries to create
+    // ANOTHER New Entity with the same domain_ref - the persisted-
+    // duplicate check (find_entity_by_domain_ref), not the same-payload
+    // preflight, must catch this.
+    let p2 = AddMemoryPayload {
+        predicate: "different_predicate".to_string(),
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "goal".to_string(),
+            canonical_name: "Goal Entity 2, different name".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(domain_ref),
+        }),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p2) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::DuplicateDomainReference));
+        }
+        other => panic!("[req_am_dup] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        entity_row_count(&conn),
+        entity_count_after_first,
+        "[req_am_dup] FAIL - zero writes on the rejected second call"
+    );
+    assert_eq!(am_fact_row_count(&conn), fact_count_after_first);
+}
+
+// --- Authoritative domain-ref matrix (R021 §7) --------------------------
+
+#[test]
+fn req_am_dref_matrix_supported_types_accepted_invalid_and_unsupported_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_dref.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let goal = match create_goal(&mut conn, ui_explicit(), mk_create_payload("Goal for dref")) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup goal failed: {other:?}"),
+    };
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project for dref", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup project failed: {other:?}"),
+    };
+    let milestone = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Milestone for dref", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup milestone failed: {other:?}"),
+    };
+    let task = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Task for dref", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup task failed: {other:?}"),
+    };
+
+    let cases: Vec<(&str, String)> = vec![
+        ("Goal", goal.id.to_string()),
+        ("Project", project.id.to_string()),
+        ("Milestone", milestone.id.to_string()),
+        ("Task", task.id.to_string()),
+    ];
+
+    // Accepted: a real, existing row of each supported type.
+    for (type_str, id_str) in &cases {
+        let payload = AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: type_str.to_lowercase(),
+                canonical_name: format!("{type_str} entity"),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: type_str.to_string(),
+                    domain_ref_id: id_str.clone(),
+                }),
+            }),
+            ..mk_am_payload()
+        };
+        match add_memory(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { .. } => {}
+            other => panic!(
+                "[req_am_dref] FAIL - existing {type_str} domain_ref should be accepted, got {other:?}"
+            ),
+        }
+    }
+
+    // Rejected: well-formed but nonexistent id, for each supported type.
+    for (type_str, _) in &cases {
+        let fake_id = EntityId::new().to_string();
+        let payload = AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: type_str.to_lowercase(),
+                canonical_name: "Nonexistent ref".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: type_str.to_string(),
+                    domain_ref_id: fake_id,
+                }),
+            }),
+            ..mk_am_payload()
+        };
+        match add_memory(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::ValidationFailed(errors) => assert!(
+                errors.contains(&ValidationError::ReferencedDomainObjectNotFound),
+                "[req_am_dref] FAIL - {type_str} well-formed-but-nonexistent id should reject with ReferencedDomainObjectNotFound, got {errors:?}"
+            ),
+            other => panic!(
+                "[req_am_dref] FAIL - {type_str} nonexistent id should be ValidationFailed, got {other:?}"
+            ),
+        }
+    }
+
+    // Rejected: syntactically invalid id, for each supported type.
+    for (type_str, _) in &cases {
+        let payload = AddMemoryPayload {
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: type_str.to_lowercase(),
+                canonical_name: "Malformed ref".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: Some(DomainRef {
+                    domain_ref_type: type_str.to_string(),
+                    domain_ref_id: "not-a-uuid".to_string(),
+                }),
+            }),
+            ..mk_am_payload()
+        };
+        match add_memory(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::ValidationFailed(errors) => assert!(
+                errors.contains(&ValidationError::ReferencedDomainObjectNotFound),
+                "[req_am_dref] FAIL - {type_str} malformed id should reject with ReferencedDomainObjectNotFound, got {errors:?}"
+            ),
+            other => panic!(
+                "[req_am_dref] FAIL - {type_str} malformed id should be ValidationFailed, got {other:?}"
+            ),
+        }
+    }
+
+    // Rejected: unsupported domain_ref_type - does not close the open
+    // domain_ref_type vocabulary, only limits what Core validates today.
+    let payload = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "vehicle".to_string(),
+            canonical_name: "My Car".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: Some(DomainRef {
+                domain_ref_type: "Vehicle".to_string(),
+                domain_ref_id: "anything".to_string(),
+            }),
+        }),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::UnsupportedDomainReferenceType));
+        }
+        other => panic!(
+            "[req_am_dref] FAIL - unsupported domain_ref_type should be ValidationFailed, got {other:?}"
+        ),
+    }
+
+    // Every rejected attempt above must have written nothing at all -
+    // only the 4 accepted-case Entities (+ SELF) and their Facts exist.
+    assert_eq!(entity_row_count(&conn), 1 + 4);
+    assert_eq!(am_fact_row_count(&conn), 4);
+}
+
+// --- Existing-reference not-found (R021 §6) -----------------------------
+
+#[test]
+fn req_am_not_found_existing_subject_object_source_rejected_zero_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_nf.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fake_entity = EntityId::new();
+    let fake_source = SourceId::new();
+
+    let p1 = AddMemoryPayload {
+        subject: EntityInputRef::Existing(fake_entity),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p1) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedEntityNotFound))
+        }
+        other => panic!("[req_am_nf] FAIL subject, got {other:?}"),
+    }
+
+    let p2 = AddMemoryPayload {
+        value: FactValueInput::Entity(EntityInputRef::Existing(fake_entity)),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p2) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedEntityNotFound))
+        }
+        other => panic!("[req_am_nf] FAIL object, got {other:?}"),
+    }
+
+    let p3 = AddMemoryPayload {
+        source: SourceRef::Existing(fake_source),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), p3) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::ReferencedSourceNotFound))
+        }
+        other => panic!("[req_am_nf] FAIL source, got {other:?}"),
+    }
+
+    assert_eq!(am_fact_row_count(&conn), 0);
+    assert_eq!(entity_row_count(&conn), 1, "SELF only");
+    assert_eq!(am_source_row_count(&conn), 0);
+}
+
+// --- Existing Entity/Source immutability-on-reuse (R021) ----------------
+
+#[test]
+fn req_am_existing_entity_and_source_untouched_on_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_immut.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let setup = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "Jordan".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        ..mk_am_payload()
+    };
+    let (jordan_id, source_id) = match add_memory(&mut conn, ui_explicit(), setup) {
+        ActionOutcome::Success { value, .. } => {
+            let source_id_str: String = conn
+                .query_row(
+                    "SELECT e.source_id FROM evidence e
+                     JOIN fact_evidence fe ON fe.evidence_id = e.id
+                     WHERE fe.fact_id = ?1",
+                    rusqlite::params![value.id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (
+                value.subject_entity_id,
+                SourceId::parse(&source_id_str).unwrap(),
+            )
+        }
+        other => panic!("[req_am_immut] FAIL setup, got {other:?}"),
+    };
+
+    let entity_before = get_entity(&conn, jordan_id).unwrap().unwrap();
+    let source_before = read_source_fields(&conn, source_id);
+
+    let reuse = AddMemoryPayload {
+        subject: EntityInputRef::Existing(jordan_id),
+        predicate: "lives_in".to_string(),
+        value: FactValueInput::ScalarJson("\"Warsaw\"".to_string()),
+        source: SourceRef::Existing(source_id),
+        ..mk_am_payload()
+    };
+    match add_memory(&mut conn, ui_explicit(), reuse) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_am_immut] FAIL reuse call, got {other:?}"),
+    }
+
+    let entity_after = get_entity(&conn, jordan_id).unwrap().unwrap();
+    let source_after = read_source_fields(&conn, source_id);
+    assert_eq!(
+        entity_before, entity_after,
+        "[req_am_immut] FAIL - Existing Entity was mutated on reuse"
+    );
+    assert_eq!(
+        source_before, source_after,
+        "[req_am_immut] FAIL - Existing Source was mutated on reuse"
+    );
+    assert_eq!(entity_row_count(&conn), 2, "SELF + Jordan");
+    assert_eq!(
+        am_source_row_count(&conn),
+        1,
+        "[req_am_immut] FAIL - reuse must not create a second Source row"
+    );
+}
+
+// --- Full atomic rollback (R021 - one of Slice B's central acceptance --
+// tests) ------------------------------------------------------------------
+
+#[test]
+fn req_am_rollback_forced_audit_failure_rolls_back_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_rollback1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    install_fact_audit_failure_trigger(&conn);
+
+    let payload = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "Rollback Subject".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        value: FactValueInput::Entity(EntityInputRef::New(NewEntityData {
+            entity_type: "place".to_string(),
+            canonical_name: "Rollback Object".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        })),
+        ..mk_am_payload()
+    };
+
+    match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!(
+            "[req_am_rollback1] FAIL - expected StorageError from the forced audit failure, got {other:?}"
+        ),
+    }
+
+    remove_fact_audit_failure_trigger(&conn);
+
+    assert_eq!(
+        entity_row_count(&conn),
+        1,
+        "[req_am_rollback1] FAIL - only SELF should survive; the new subject+object Entities must be rolled back"
+    );
+    assert_eq!(
+        am_source_row_count(&conn),
+        0,
+        "[req_am_rollback1] FAIL - the new Source must be rolled back"
+    );
+    assert_eq!(
+        am_fact_row_count(&conn),
+        0,
+        "[req_am_rollback1] FAIL - the Fact must be rolled back"
+    );
+    assert_eq!(
+        am_evidence_row_count(&conn),
+        0,
+        "[req_am_rollback1] FAIL - the Evidence must be rolled back"
+    );
+    assert_eq!(am_fact_evidence_row_count(&conn), 0);
+    assert_eq!(am_fact_audit_row_count(&conn), 0);
+
+    // The connection remains usable afterward - a normal AddMemory call
+    // succeeds, and SELF is still exactly the original bootstrap row.
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_am_rollback1] FAIL - connection should remain usable after rollback, got {other:?}"
+        ),
+    }
+    let self_entity = storage::personal_knowledge_repo::get_self_entity(&conn)
+        .unwrap()
+        .unwrap();
+    assert!(self_entity.is_self);
+}
+
+/// An earlier-stage failure (before the final `fact_audit_log` write) -
+/// the same rollback guarantee must hold no matter which insert in the
+/// sequence fails.
+#[test]
+fn req_am_rollback_earlier_stage_forced_evidence_failure_rolls_back_new_entity_and_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_rollback2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    install_evidence_insert_failure_trigger(&conn);
+
+    let payload = AddMemoryPayload {
+        subject: EntityInputRef::New(NewEntityData {
+            entity_type: "person".to_string(),
+            canonical_name: "Earlier Rollback Subject".to_string(),
+            sensitivity: Sensitivity::Internal,
+            domain_ref: None,
+        }),
+        ..mk_am_payload()
+    };
+
+    match add_memory(&mut conn, ui_explicit(), payload) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_am_rollback2] FAIL - expected StorageError, got {other:?}"),
+    }
+
+    remove_evidence_insert_failure_trigger(&conn);
+
+    assert_eq!(
+        entity_row_count(&conn),
+        1,
+        "the new subject Entity must be rolled back"
+    );
+    assert_eq!(
+        am_source_row_count(&conn),
+        0,
+        "the new Source must be rolled back"
+    );
+    assert_eq!(
+        am_fact_row_count(&conn),
+        0,
+        "the Fact insert happens before Evidence in the sequence but must still roll back"
+    );
+    assert_eq!(am_evidence_row_count(&conn), 0);
+}
+
+// --- Audit correctness (R021) --------------------------------------------
+
+#[test]
+fn req_am_audit_row_fields_correct_and_previous_snapshot_always_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_audit1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let fact = match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let (action_type, actor, provenance, confirmation_class, previous_snapshot): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT action_type, actor, provenance, confirmation_class, previous_snapshot FROM fact_audit_log WHERE fact_id = ?1",
+            rusqlite::params![fact.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(action_type, "AddMemory");
+    assert_eq!(actor, "UI");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    assert!(
+        previous_snapshot.is_none(),
+        "[req_am_audit1] FAIL - previous_snapshot must always be NULL for AddMemory (a create, never an update)"
+    );
+}
+
+/// Confirmation and provenance are distinct concepts: confirming an
+/// Inferred action must never silently rewrite the audit row's
+/// `provenance` to `Explicit`, even though `epistemic_state` becomes
+/// `USER_CONFIRMED`.
+#[test]
+fn req_am_audit_provenance_not_rewritten_when_inferred_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_audit2.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    let payload = AddMemoryPayload {
+        epistemic_state: EpistemicState::Observed,
+        ..mk_am_payload()
+    };
+    let fact = match add_memory(&mut conn, meta, payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(fact.epistemic_state, EpistemicState::UserConfirmed);
+
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM fact_audit_log WHERE fact_id = ?1",
+            rusqlite::params![fact.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_am_audit2] FAIL - confirming an inferred action must never silently rewrite provenance to Explicit"
+    );
+    let actor: String = conn
+        .query_row(
+            "SELECT actor FROM fact_audit_log WHERE fact_id = ?1",
+            rusqlite::params![fact.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actor, "CloudLLM");
+}
+
+// --- Zero side effects on Relation/Episode tables (schema-only, R019 §13) -
+
+#[test]
+fn req_am_no_side_effects_on_relation_episode_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_no_side.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    assert_eq!(
+        relation_episode_side_effect_counts(&conn),
+        (0, 0, 0, 0, 0),
+        "[req_am_no_side] FAIL - AddMemory must never write to relations/episodes/relation_evidence/episode_evidence/episode_entities"
+    );
+}
+
+// --- No implicit dedup/correction/alias-merge (R021 §16) ----------------
+
+#[test]
+fn req_am_no_implicit_dedup_two_identical_calls_create_two_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_no_dedup.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    for _ in 0..2 {
+        match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+            ActionOutcome::Success { .. } => {}
+            other => panic!("[req_am_no_dedup] FAIL, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        am_fact_row_count(&conn),
+        2,
+        "[req_am_no_dedup] FAIL - two explicit, identical AddMemory calls must create two distinct Facts - no implicit dedup/correction/auto-STALE/similarity-merge"
+    );
+}
+
+#[test]
+fn req_am_no_entity_alias_merge_same_canonical_name_creates_two_entities() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "am_no_alias.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    for i in 0..2 {
+        let payload = AddMemoryPayload {
+            predicate: format!("predicate_{i}"),
+            subject: EntityInputRef::New(NewEntityData {
+                entity_type: "person".to_string(),
+                canonical_name: "Sam".to_string(),
+                sensitivity: Sensitivity::Internal,
+                domain_ref: None,
+            }),
+            ..mk_am_payload()
+        };
+        match add_memory(&mut conn, ui_explicit(), payload) {
+            ActionOutcome::Success { .. } => {}
+            other => panic!("[req_am_no_alias] FAIL, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        entity_row_count(&conn),
+        3,
+        "[req_am_no_alias] FAIL - two New Entities sharing a canonical_name (no domain_ref) must not be merged - SELF + 2 distinct Sam Entities expected"
+    );
 }

@@ -80,14 +80,23 @@ explicitly declared CLOSED for Slice A/B implementation (R019 §23).
 `SELF` entity bootstrap, narrow `get_entity`/`get_fact` reads, and
 `secure_delete = ON` storage hardening (correcting R019 §17's misnamed
 `FULL` value to the real canonical `ON`) - is now implemented in code
-and tested (285/285 tests). `AddMemory`/`CorrectMemory`/`ConfirmMemory`/
-`ForgetMemory` still do not exist (Slice B+). See `PROJECT_STATE.md`
-§4o-§4r,
+and tested (285/285, then 293/293 after post-run verification
+hardening). **(2026-09-18, R021)** Slice B - `AddMemory`, the first
+production Personal Knowledge mutation - is now also implemented and
+tested (324/324 tests): creates a Fact (new-or-existing subject/object
+Entity, new-or-existing Source, always-new Evidence, the `fact_evidence`
+link, one audit row) in a single atomic transaction, with authoritative
+`domain_ref` validation against `Goal`/`Project`/`Milestone`/`Task` and
+two-layer duplicate-domain-ref detection. `CorrectMemory`/
+`ConfirmMemory`/`ForgetMemory` still do not exist (Slice C+), and no
+Tauri command wires `AddMemory` into the running app yet. See
+`PROJECT_STATE.md` §4o-§4s,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
+`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 and
-`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
+`docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -837,16 +846,24 @@ still go through the same Core validation/confirmation path as any
 other actor, R017 §27). **R017/R018/R019 were documentation-only; as of
 2026-09-18 (R020), Slice A is real, implemented code**: the full
 11-table `V7` schema, the `SELF` entity bootstrap, and narrow
-`get_entity`/`get_fact` reads all exist and are tested (285/285 tests).
-**`AddMemory`/`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` still do
-NOT exist** — no Personal Knowledge data can be created through any
-path yet; Slice B (`AddMemory`) is the recommended next step (R020
-§24). See `docs/PROJECT_STATE.md` §4o-§4r,
+`get_entity`/`get_fact` reads all exist and are tested (285/285, then
+293/293 after post-run verification hardening). **As of 2026-09-18
+(R021), Slice B is also real, implemented code**: `AddMemory` — the
+first production Personal Knowledge mutation — creates a `Fact` (new-
+or-existing subject/object `Entity`, new-or-existing `Source`, always-
+new `Evidence`, the `fact_evidence` link, one audit row) in a single
+atomic transaction, validated and tested end-to-end (324/324 tests).
+**`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` still do NOT exist**,
+and no Tauri command wires `AddMemory` into the running app yet — no
+Personal Knowledge data can be created through the UI, only through
+direct Core calls; Slice C (`CorrectMemory`) is the recommended next
+step (R021 §25). See `docs/PROJECT_STATE.md` §4o-§4s,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
+`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 and
-`docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`
+`docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`
 for full detail.
 
 ### 5.4 Action layer (frozen, M2)

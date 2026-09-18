@@ -175,6 +175,18 @@ pub(in crate::services) fn insert_audit_entry(
     Ok(())
 }
 
+pub(in crate::services) fn milestone_exists(
+    conn: &Connection,
+    id: MilestoneId,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM milestones WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+}
+
 #[cfg(test)]
 pub(in crate::services) fn count_audit_entries_for_milestone(
     conn: &Connection,

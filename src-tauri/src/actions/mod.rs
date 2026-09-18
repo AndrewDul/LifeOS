@@ -18,10 +18,14 @@
 
 use crate::core_error::CoreError;
 use crate::domain::{
-    Goal, GoalId, GoalRelationType, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
-    OrderIndex, Priority, Progress, Project, ProjectId, Task, TaskId, TaskStatus,
-    DESCRIPTION_MAX_LEN, DOMAIN_TAG_MAX_LEN, ORDER_INDEX_MIN, PRIORITY_MAX, PRIORITY_MIN,
-    PROGRESS_MAX, PROGRESS_MIN, TITLE_MAX_LEN,
+    validate_personal_knowledge_text_len, DomainRef, EntityId, EpistemicState, Goal, GoalId,
+    GoalRelationType, LifecycleStatus, MemoryType, Milestone, MilestoneId, MilestoneStatus,
+    OrderIndex, Priority, Progress, Project, ProjectId, Sensitivity, SourceId, Task, TaskId,
+    TaskStatus, CANONICAL_NAME_MAX_LEN, DESCRIPTION_MAX_LEN, DOMAIN_REF_ID_MAX_LEN,
+    DOMAIN_REF_TYPE_MAX_LEN, DOMAIN_TAG_MAX_LEN, ENTITY_TYPE_MAX_LEN, EVIDENCE_CONTENT_MAX_LEN,
+    EVIDENCE_LOCATOR_MAX_LEN, ORDER_INDEX_MIN, PREDICATE_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN,
+    PROGRESS_MAX, PROGRESS_MIN, SOURCE_LABEL_MAX_LEN, SOURCE_REFERENCE_MAX_LEN,
+    SOURCE_TYPE_MAX_LEN, TITLE_MAX_LEN, VALUE_JSON_MAX_LEN,
 };
 use chrono::{DateTime, Utc};
 
@@ -251,6 +255,86 @@ pub(crate) enum ValidationError {
     /// NOT a duplicate; a `Milestone` being updated keeping its own
     /// current `order_index` is NOT a duplicate either.
     DuplicateMilestoneOrderIndex,
+    /// `AddMemory`'s `EntityInputRef::Existing(id)` does not reference an
+    /// existing `Entity` - needs a database read, so
+    /// `services::add_memory` performs it and reports it here (M2
+    /// Personal Knowledge Slice B, 2026-09-18). An Existing reference is
+    /// never mutated on reuse regardless of the rest of the payload.
+    ReferencedEntityNotFound,
+    /// `AddMemory`'s `SourceRef::Existing(id)` does not reference an
+    /// existing `Source` - same reasoning as `ReferencedEntityNotFound`.
+    ReferencedSourceNotFound,
+    /// Two `New` Entity candidates in one `AddMemory` payload (subject
+    /// and/or object) share the same `domain_ref`, or a `New` Entity
+    /// candidate's `domain_ref` already belongs to a persisted `Entity` -
+    /// checked explicitly (same-payload comparison, then a
+    /// `find_entity_by_domain_ref` read) rather than left to the real
+    /// `idx_entities_domain_ref` UNIQUE index to catch first, which
+    /// remains defense-in-depth only (R018 §9/R019 §9).
+    DuplicateDomainReference,
+    /// A `NewEntityData.domain_ref.domain_ref_type` is not one of the
+    /// domain types Core can currently authoritatively validate
+    /// (`Goal`/`Project`/`Milestone`/`Task` - see R021 §7). This does
+    /// **not** close the open `domain_ref_type` vocabulary at the schema
+    /// level, it only limits what `AddMemory` can validate today.
+    UnsupportedDomainReferenceType,
+    /// A `NewEntityData.domain_ref` names a supported `domain_ref_type`
+    /// but the `domain_ref_id` is either not a well-formed id for that
+    /// type or does not reference an existing row - needs a database
+    /// read (or a parse of a supported id format), so
+    /// `services::add_memory` performs it and reports it here. Both the
+    /// syntactically-invalid and the well-formed-but-nonexistent cases
+    /// use this same variant (both are "cannot be validated as an
+    /// existing X"; see R021 for the deliberate non-split).
+    ReferencedDomainObjectNotFound,
+    /// A required Personal Knowledge free-text field (`entity_type`/
+    /// `canonical_name`/`domain_ref_type`/`domain_ref_id`/`predicate`/
+    /// `source_type`) was empty after trimming. One generic
+    /// field-parameterized variant rather than six near-identical
+    /// `Empty*` variants, matching the same field-parameterized design
+    /// as `PersonalKnowledgeFieldTooLong` below (R021 - deliberately
+    /// smaller than the per-field taxonomy `EmptyTitle`/`NoteTooLong`
+    /// established, given the number of Personal Knowledge free-text
+    /// fields involved).
+    PersonalKnowledgeFieldEmpty {
+        field: &'static str,
+    },
+    /// A Personal Knowledge free-text field exceeded its frozen max
+    /// length (`domain::validate_personal_knowledge_text_len`, R018
+    /// §15). One generic field-parameterized variant covering all
+    /// eleven bounded fields (`entity_type`/`canonical_name`/
+    /// `domain_ref_type`/`domain_ref_id`/`predicate`/`value_json`/
+    /// `source_type`/`label`/`reference`/`content`/`locator`) rather
+    /// than eleven separate `*TooLong` variants - `field` names exactly
+    /// which one failed, so nothing is lost versus the per-field style
+    /// (R021).
+    PersonalKnowledgeFieldTooLong {
+        field: &'static str,
+        max: usize,
+        actual: usize,
+    },
+    /// `AddMemory`'s `FactValueInput::ScalarJson` is not syntactically
+    /// valid JSON (`serde_json::from_str` failed). The JSON is never
+    /// executed or evaluated, only checked for well-formedness -
+    /// `value_json` accepts any JSON type (string/number/bool/null/
+    /// object/array), not "scalar-only" despite the field's name (R021
+    /// §10).
+    InvalidValueJson,
+    /// `AddMemory`'s `confidence` was `Some(c)` where `c` is not finite
+    /// (`NaN`/`+Infinity`/`-Infinity`) or falls outside `[0.0, 1.0]`.
+    /// `None` (no confidence supplied) is always valid and never reaches
+    /// this check (R021 §11).
+    ConfidenceOutOfBounds {
+        min: f32,
+        max: f32,
+        actual: f32,
+    },
+    /// `AddMemory`'s `NewEvidenceData` supplied neither `content` nor
+    /// `locator` - the DB `CHECK ((content IS NOT NULL) OR (locator IS
+    /// NOT NULL))` on `evidence` (`V7__create_personal_knowledge.sql`)
+    /// mirrored here so the failure is a typed `ValidationError` with
+    /// zero writes, not a raw SQLite constraint failure (R021 §12).
+    EvidenceRequiresContentOrLocator,
 }
 
 #[derive(Debug, Clone)]
@@ -877,6 +961,419 @@ pub(crate) fn validate_update_task(
     } else {
         Err(errors)
     }
+}
+
+// --- Personal Knowledge: AddMemory (M2 Personal Knowledge Slice B,
+// 2026-09-18) -----------------------------------------------------------
+//
+// The first production Memory action/mutation. Frozen input shapes from
+// R018 §4/R019 §4-§7, restated verbatim by the Slice B brief. Deliberately
+// NO `valid_from`/`valid_until`/`superseded_by_fact_id`/`created_at`/
+// `updated_at`/`EvidenceId`/`FactId` anywhere in this payload - those are
+// always Core-generated (`services::add_memory`), never caller-supplied.
+//
+// Confirmation floor is `ExplicitAdd` (R018 §3) - the *generic*
+// `effective_class` formula alone already forces a pre-write block for
+// `Provenance::Inferred` (severity 2, `InferredChange`, dominates
+// `ExplicitAdd`'s severity 1), so unlike `CorrectMemory`'s `ImportantChange`
+// floor, `AddMemory` needs no Personal-Knowledge-specific confirmation
+// override here - only a dedicated test proving this frozen safety
+// property holds (`services::tests`), since it is safety-critical even
+// where it falls out "for free" from shared infrastructure.
+
+/// An `AddMemory` (or future Memory-action) reference to an `Entity` -
+/// the user themselves, an already-persisted `Entity`, or a brand-new one
+/// to create in the same transaction. `SelfEntity` is resolved only
+/// through the existing trusted bootstrap path (`services::
+/// get_self_entity`) - this action never creates, searches for, or
+/// mutates SELF.
+#[derive(Debug, Clone)]
+pub(crate) enum EntityInputRef {
+    SelfEntity,
+    Existing(EntityId),
+    New(NewEntityData),
+}
+
+/// Fields for a brand-new `Entity` `AddMemory` creates inline. `domain_ref`
+/// is optional - most new Entities (a person, a place) have none; when
+/// present, both `domain_ref_type`/`domain_ref_id` must resolve
+/// authoritatively (R021 §7) and must not collide with any other `New`
+/// candidate in the same payload or any already-persisted `Entity`
+/// (`ValidationError::DuplicateDomainReference`).
+#[derive(Debug, Clone)]
+pub(crate) struct NewEntityData {
+    pub entity_type: String,
+    pub canonical_name: String,
+    pub sensitivity: Sensitivity,
+    pub domain_ref: Option<DomainRef>,
+}
+
+/// A Fact's value - either an opaque JSON scalar/structure, or a
+/// reference to another `Entity` (which may itself be Self/Existing/New,
+/// exactly like the subject). The DB enforces "exactly one of
+/// `value_json`/`object_entity_id`" as a `CHECK`; this Rust sum type makes
+/// the same invariant unrepresentable-otherwise at the type level (R018
+/// §2).
+#[derive(Debug, Clone)]
+pub(crate) enum FactValueInput {
+    ScalarJson(String),
+    Entity(EntityInputRef),
+}
+
+/// `AddMemory`'s reference to a `Source` - reuse an existing one (never
+/// mutated) or create a new one in the same transaction.
+#[derive(Debug, Clone)]
+pub(crate) enum SourceRef {
+    Existing(SourceId),
+    New(NewSourceData),
+}
+
+/// Fields for a brand-new `Source` `AddMemory` creates inline.
+/// `captured_at` is preserved exactly as supplied (it may legitimately
+/// predate `created_at` - a Source can describe when something was
+/// originally captured, not when LifeOS learned of it).
+#[derive(Debug, Clone)]
+pub(crate) struct NewSourceData {
+    pub source_type: String,
+    pub label: Option<String>,
+    pub reference: Option<String>,
+    pub sensitivity: Sensitivity,
+    pub captured_at: DateTime<Utc>,
+}
+
+/// `AddMemory` always creates a brand-new `Evidence` row - Evidence is
+/// never reused across Facts (R018 §11). Sensitivity is independent of
+/// the Fact/Source/Entity it is attached to, never inherited. At least
+/// one of `content`/`locator` is required, mirroring the DB `CHECK` on
+/// `evidence`.
+#[derive(Debug, Clone)]
+pub(crate) struct NewEvidenceData {
+    pub content: Option<String>,
+    pub locator: Option<String>,
+    pub sensitivity: Sensitivity,
+}
+
+/// The frozen `AddMemory` payload (R018 §4/R019 §4-§7). No implicit
+/// deduplication/contradiction-detection/correction/auto-`STALE`/
+/// similarity-merge/alias-merge ever happens as a side effect of this
+/// action - two explicit `AddMemory` calls may create two Facts that look
+/// alike (R021 §16).
+#[derive(Debug, Clone)]
+pub(crate) struct AddMemoryPayload {
+    pub subject: EntityInputRef,
+    pub predicate: String,
+    pub value: FactValueInput,
+    pub memory_type: MemoryType,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// `validate_add_memory`'s success output - the same payload shape with
+/// every free-text field that gets trimmed (identifier-like fields only:
+/// `entity_type`/`canonical_name`/`domain_ref_type`/`domain_ref_id`/
+/// `predicate`/`source_type`, matching `validate_title`'s precedent)
+/// replaced by its normalized value, so `services::add_memory` never
+/// re-derives what was actually validated. `value_json`/`label`/
+/// `reference`/`content`/`locator` are free text, never trimmed, matching
+/// `validate_description`'s precedent (semantic content preserved
+/// exactly as supplied).
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedAddMemory {
+    pub subject: EntityInputRef,
+    pub predicate: String,
+    pub value: FactValueInput,
+    pub memory_type: MemoryType,
+    pub epistemic_state: EpistemicState,
+    pub confidence: Option<f32>,
+    pub sensitivity: Sensitivity,
+    pub source: SourceRef,
+    pub evidence: NewEvidenceData,
+}
+
+/// A required Personal Knowledge free-text field: trims, rejects empty,
+/// rejects over-length, and returns the normalized value on success.
+/// Pushes directly into the shared `errors` accumulator (matching
+/// `validate_update_milestone`'s aggregate-everything style) rather than
+/// returning a `Result`, so every caller composes uniformly regardless of
+/// how many fields it validates.
+fn validate_pk_required_field(
+    field: &'static str,
+    value: &str,
+    max_len: usize,
+    errors: &mut Vec<ValidationError>,
+) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        errors.push(ValidationError::PersonalKnowledgeFieldEmpty { field });
+        return None;
+    }
+    match validate_personal_knowledge_text_len(trimmed, max_len) {
+        Ok(()) => Some(trimmed.to_string()),
+        Err(actual) => {
+            errors.push(ValidationError::PersonalKnowledgeFieldTooLong {
+                field,
+                max: max_len,
+                actual,
+            });
+            None
+        }
+    }
+}
+
+/// An optional Personal Knowledge free-text field: no trim, no
+/// emptiness requirement (matching `validate_description`'s precedent -
+/// free text is preserved exactly as supplied), only a length bound.
+fn validate_pk_optional_field(
+    field: &'static str,
+    value: &str,
+    max_len: usize,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Err(actual) = validate_personal_knowledge_text_len(value, max_len) {
+        errors.push(ValidationError::PersonalKnowledgeFieldTooLong {
+            field,
+            max: max_len,
+            actual,
+        });
+    }
+}
+
+/// Structurally validates an `EntityInputRef` - `SelfEntity`/`Existing`
+/// pass through unchanged (their existence needs a database read;
+/// `services::add_memory` performs it, not this pure module). `New`
+/// validates and normalizes `entity_type`/`canonical_name`/`domain_ref`.
+/// Returns `None` (having pushed the specific errors) if `New` data is
+/// invalid, without short-circuiting the caller's other checks.
+fn validate_entity_input_ref(
+    input: &EntityInputRef,
+    errors: &mut Vec<ValidationError>,
+) -> Option<EntityInputRef> {
+    match input {
+        EntityInputRef::SelfEntity => Some(EntityInputRef::SelfEntity),
+        EntityInputRef::Existing(id) => Some(EntityInputRef::Existing(*id)),
+        EntityInputRef::New(data) => {
+            let start_len = errors.len();
+            let entity_type = validate_pk_required_field(
+                "entity_type",
+                &data.entity_type,
+                ENTITY_TYPE_MAX_LEN,
+                errors,
+            );
+            let canonical_name = validate_pk_required_field(
+                "canonical_name",
+                &data.canonical_name,
+                CANONICAL_NAME_MAX_LEN,
+                errors,
+            );
+            let domain_ref = match &data.domain_ref {
+                None => Some(None),
+                Some(r) => {
+                    let t = validate_pk_required_field(
+                        "domain_ref_type",
+                        &r.domain_ref_type,
+                        DOMAIN_REF_TYPE_MAX_LEN,
+                        errors,
+                    );
+                    let i = validate_pk_required_field(
+                        "domain_ref_id",
+                        &r.domain_ref_id,
+                        DOMAIN_REF_ID_MAX_LEN,
+                        errors,
+                    );
+                    match (t, i) {
+                        (Some(t), Some(i)) => Some(Some(DomainRef {
+                            domain_ref_type: t,
+                            domain_ref_id: i,
+                        })),
+                        _ => None,
+                    }
+                }
+            };
+            if errors.len() > start_len {
+                return None;
+            }
+            Some(EntityInputRef::New(NewEntityData {
+                entity_type: entity_type.expect("validated above"),
+                canonical_name: canonical_name.expect("validated above"),
+                sensitivity: data.sensitivity,
+                domain_ref: domain_ref.expect("validated above"),
+            }))
+        }
+    }
+}
+
+/// Structurally validates a `FactValueInput`. `ScalarJson` checks length
+/// then syntactic JSON validity (`serde_json::from_str`) - any JSON type
+/// is accepted, the value is never executed/evaluated and never silently
+/// altered (returned exactly as supplied, not re-serialized). `Entity`
+/// delegates to `validate_entity_input_ref` - subject==object self-edges
+/// are structurally identical to any other Entity reference and are not
+/// restricted here (R021 §10: explicitly allowed).
+fn validate_fact_value_input(
+    input: &FactValueInput,
+    errors: &mut Vec<ValidationError>,
+) -> Option<FactValueInput> {
+    match input {
+        FactValueInput::ScalarJson(s) => {
+            if let Err(actual) = validate_personal_knowledge_text_len(s, VALUE_JSON_MAX_LEN) {
+                errors.push(ValidationError::PersonalKnowledgeFieldTooLong {
+                    field: "value_json",
+                    max: VALUE_JSON_MAX_LEN,
+                    actual,
+                });
+                return None;
+            }
+            if serde_json::from_str::<serde_json::Value>(s).is_err() {
+                errors.push(ValidationError::InvalidValueJson);
+                return None;
+            }
+            Some(FactValueInput::ScalarJson(s.clone()))
+        }
+        FactValueInput::Entity(entity_ref) => {
+            validate_entity_input_ref(entity_ref, errors).map(FactValueInput::Entity)
+        }
+    }
+}
+
+/// Structurally validates a `SourceRef`. `Existing`'s existence needs a
+/// database read; `services::add_memory` performs it. `New` validates
+/// `source_type` (required) and `label`/`reference` (optional, unbounded
+/// emptiness).
+fn validate_source_ref(input: &SourceRef, errors: &mut Vec<ValidationError>) -> Option<SourceRef> {
+    match input {
+        SourceRef::Existing(id) => Some(SourceRef::Existing(*id)),
+        SourceRef::New(data) => {
+            let start_len = errors.len();
+            let source_type = validate_pk_required_field(
+                "source_type",
+                &data.source_type,
+                SOURCE_TYPE_MAX_LEN,
+                errors,
+            );
+            if let Some(label) = &data.label {
+                validate_pk_optional_field("label", label, SOURCE_LABEL_MAX_LEN, errors);
+            }
+            if let Some(reference) = &data.reference {
+                validate_pk_optional_field(
+                    "reference",
+                    reference,
+                    SOURCE_REFERENCE_MAX_LEN,
+                    errors,
+                );
+            }
+            if errors.len() > start_len {
+                return None;
+            }
+            Some(SourceRef::New(NewSourceData {
+                source_type: source_type.expect("validated above"),
+                label: data.label.clone(),
+                reference: data.reference.clone(),
+                sensitivity: data.sensitivity,
+                captured_at: data.captured_at,
+            }))
+        }
+    }
+}
+
+/// Validates `NewEvidenceData`: `content`/`locator` are each bounded when
+/// present (no trim/emptiness requirement, free text), and at least one
+/// of the two must be present at all (mirrors the DB `CHECK` on
+/// `evidence`).
+fn validate_new_evidence_data(
+    data: &NewEvidenceData,
+    errors: &mut Vec<ValidationError>,
+) -> Option<NewEvidenceData> {
+    let start_len = errors.len();
+    if let Some(content) = &data.content {
+        validate_pk_optional_field("content", content, EVIDENCE_CONTENT_MAX_LEN, errors);
+    }
+    if let Some(locator) = &data.locator {
+        validate_pk_optional_field("locator", locator, EVIDENCE_LOCATOR_MAX_LEN, errors);
+    }
+    if data.content.is_none() && data.locator.is_none() {
+        errors.push(ValidationError::EvidenceRequiresContentOrLocator);
+    }
+    if errors.len() > start_len {
+        return None;
+    }
+    Some(NewEvidenceData {
+        content: data.content.clone(),
+        locator: data.locator.clone(),
+        sensitivity: data.sensitivity,
+    })
+}
+
+/// `confidence` must be `None`, or `Some(c)` with `c` finite and in
+/// `[0.0, 1.0]` - `NaN`/`+Infinity`/`-Infinity` are explicitly rejected
+/// even though a naive `c < 0.0 || c > 1.0` range check alone would let
+/// `NaN` slip through (`NaN` compares false to everything) (R021 §11).
+fn validate_confidence(confidence: Option<f32>, errors: &mut Vec<ValidationError>) {
+    if let Some(c) = confidence {
+        if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+            errors.push(ValidationError::ConfidenceOutOfBounds {
+                min: 0.0,
+                max: 1.0,
+                actual: c,
+            });
+        }
+    }
+}
+
+/// Pure structural validation for `AddMemory` - no database read (Entity/
+/// Source existence, domain-ref authoritative existence, and persisted-
+/// duplicate-domain-ref checks all need one; `services::add_memory`
+/// performs them). Collects every structural error before returning
+/// (matching every other `validate_*` in this module), including the
+/// same-payload duplicate-domain-ref check: two `New` Entity candidates
+/// (subject and/or object) sharing one `domain_ref` are rejected here,
+/// before any SQL runs at all - the persisted-duplicate check against
+/// already-committed Entities is a second, separate layer in
+/// `services::add_memory`.
+pub(crate) fn validate_add_memory(
+    payload: &AddMemoryPayload,
+) -> Result<NormalizedAddMemory, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    let subject = validate_entity_input_ref(&payload.subject, &mut errors);
+    let predicate = validate_pk_required_field(
+        "predicate",
+        &payload.predicate,
+        PREDICATE_MAX_LEN,
+        &mut errors,
+    );
+    let value = validate_fact_value_input(&payload.value, &mut errors);
+    validate_confidence(payload.confidence, &mut errors);
+    let source = validate_source_ref(&payload.source, &mut errors);
+    let evidence = validate_new_evidence_data(&payload.evidence, &mut errors);
+
+    if let (Some(EntityInputRef::New(s)), Some(FactValueInput::Entity(EntityInputRef::New(o)))) =
+        (&subject, &value)
+    {
+        if let (Some(sd), Some(od)) = (&s.domain_ref, &o.domain_ref) {
+            if sd == od {
+                errors.push(ValidationError::DuplicateDomainReference);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(NormalizedAddMemory {
+        subject: subject.expect("validated above"),
+        predicate: predicate.expect("validated above"),
+        value: value.expect("validated above"),
+        memory_type: payload.memory_type,
+        epistemic_state: payload.epistemic_state,
+        confidence: payload.confidence,
+        sensitivity: payload.sensitivity,
+        source: source.expect("validated above"),
+        evidence: evidence.expect("validated above"),
+    })
 }
 
 /// `LIFEOS_SPEC.md` §5.4 - never a persisted result, a bare string

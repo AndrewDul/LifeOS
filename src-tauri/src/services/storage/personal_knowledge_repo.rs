@@ -9,27 +9,31 @@
 //! happens here - that is `actions`'/`services`' job; this module
 //! trusts its caller to have already validated.
 //!
-//! This slice implements only what Slice A actually needs: `Entity`
-//! insert/get (the SELF bootstrap needs both), `Fact` insert (test
-//! fixture only, `#[cfg(test)]`)/get, and `Source`/`Evidence` insert
-//! (test fixtures only, `#[cfg(test)]`, needed to seed `Fact`/`Evidence`
-//! round-trip and defense-in-depth tests without an `AddMemory` action,
-//! which does not exist yet). `relations`/`episodes`/
-//! `relation_evidence`/`episode_evidence`/`episode_entities` have no
-//! functions here at all this slice - schema only (R019 §13); tests
-//! that need to exercise their constraints do so with deliberate raw
-//! SQL at the test boundary, never through a production repo function
-//! (no `insert_relation`/`insert_episode` exists).
+//! Slice A (2026-09-18) added `Entity` insert/get (the SELF bootstrap
+//! needs both) and `Fact`/`Source`/`Evidence` insert as test-fixture-only
+//! helpers plus `Fact` get. Slice B (2026-09-18, `AddMemory`) promotes
+//! `insert_fact`/`insert_source`/`insert_evidence`/
+//! `insert_fact_evidence_link` to production (the first real Memory
+//! action writes through them now) and adds `find_entity_by_domain_ref`/
+//! `entity_exists`/`source_exists` (authoritative domain-ref and
+//! Existing-reference validation) and `insert_fact_audit_log` (the first
+//! production writer of `fact_audit_log`). `relations`/`episodes`/
+//! `relation_evidence`/`episode_evidence`/`episode_entities` still have
+//! no functions here at all - schema only (R019 §13); `AddMemory` must
+//! never write to them, and tests that need to exercise their
+//! constraints do so with deliberate raw SQL at the test boundary, never
+//! through a production repo function (no `insert_relation`/
+//! `insert_episode` exists).
 
-use super::parse_rfc3339;
+use super::{actor_str, confirmation_class_str, parse_rfc3339, provenance_str};
+use crate::actions::{Actor, ConfirmationClass, Provenance};
 use crate::domain::{
-    DomainRef, Entity, EntityId, Fact, FactId, FactValue, MemoryType, Sensitivity,
+    DomainRef, Entity, EntityId, Evidence, EvidenceId, Fact, FactId, FactValue, MemoryType,
+    Sensitivity, Source, SourceId,
 };
-#[cfg(test)]
-use crate::domain::{Evidence, EvidenceId, Source};
-#[cfg(test)]
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use uuid::Uuid;
 
 fn parse_sensitivity(s: &str) -> rusqlite::Result<Sensitivity> {
     Sensitivity::parse(s).ok_or_else(|| {
@@ -212,10 +216,6 @@ fn row_to_fact(row: &Row) -> rusqlite::Result<Fact> {
     })
 }
 
-/// Test-fixture only - no `AddMemory`/`CorrectMemory` action exists
-/// yet to produce a real `Fact` row (Slice B+). Used solely to seed
-/// `get_fact` round-trip proofs and defense-in-depth tests.
-#[cfg(test)]
 pub(in crate::services) fn insert_fact(conn: &Connection, fact: &Fact) -> rusqlite::Result<()> {
     let (value_json, object_entity_id): (Option<&str>, Option<String>) = match &fact.value {
         FactValue::Scalar(v) => (Some(v.as_str()), None),
@@ -258,9 +258,6 @@ pub(in crate::services) fn get_fact(
     .optional()
 }
 
-/// Test-fixture only - no `AddMemory` action exists yet to create a
-/// `Source` row for real (Slice B+).
-#[cfg(test)]
 pub(in crate::services) fn insert_source(
     conn: &Connection,
     source: &Source,
@@ -281,9 +278,6 @@ pub(in crate::services) fn insert_source(
     Ok(())
 }
 
-/// Test-fixture only - no `AddMemory` action exists yet to create an
-/// `Evidence` row for real (Slice B+).
-#[cfg(test)]
 pub(in crate::services) fn insert_evidence(
     conn: &Connection,
     evidence: &Evidence,
@@ -317,9 +311,7 @@ pub(in crate::services) fn fact_evidence_link_exists(
     .map(|c| c > 0)
 }
 
-/// Test-fixture only - links a Fact to Evidence via `fact_evidence`.
-/// No `AddMemory` action exists yet to create this link for real.
-#[cfg(test)]
+/// Links a Fact to Evidence via `fact_evidence`.
 pub(in crate::services) fn insert_fact_evidence_link(
     conn: &Connection,
     fact_id: FactId,
@@ -332,6 +324,89 @@ pub(in crate::services) fn insert_fact_evidence_link(
             fact_id.to_string(),
             evidence_id.to_string(),
             created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Authoritative persisted-duplicate check for a `domain_ref` - the
+/// second layer of `AddMemory`'s duplicate-domain-reference defense
+/// (the first layer is the same-payload preflight in `actions::
+/// validate_add_memory`; the real `idx_entities_domain_ref` UNIQUE
+/// index remains defense-in-depth only, never the first detector).
+pub(in crate::services) fn find_entity_by_domain_ref(
+    conn: &Connection,
+    domain_ref_type: &str,
+    domain_ref_id: &str,
+) -> rusqlite::Result<Option<Entity>> {
+    conn.query_row(
+        "SELECT id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at
+         FROM entities WHERE domain_ref_type = ?1 AND domain_ref_id = ?2",
+        params![domain_ref_type, domain_ref_id],
+        row_to_entity,
+    )
+    .optional()
+}
+
+/// Lightweight existence check for `EntityInputRef::Existing` - matches
+/// the `goal_exists`/`project_exists`/`milestone_exists`/`task_exists`
+/// precedent (a dedicated `count(*)` check, not `get_entity(...).
+/// is_some()`), since `AddMemory` only needs to know an Existing entity
+/// is real, never its field values, to validate a reference.
+pub(in crate::services) fn entity_exists(
+    conn: &Connection,
+    id: EntityId,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM entities WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+}
+
+/// Lightweight existence check for `SourceRef::Existing` - same
+/// precedent as `entity_exists`.
+pub(in crate::services) fn source_exists(
+    conn: &Connection,
+    id: SourceId,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM sources WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+}
+
+/// First production writer of `fact_audit_log`. `previous_snapshot` is
+/// always `None` for `AddMemory` (this creates a Fact, it does not
+/// update one - `serialize_required_snapshot` is never called here,
+/// matching every other Create* action's audit row, not the Update*
+/// actions' mandatory-snapshot convention).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::services) fn insert_fact_audit_log(
+    conn: &Connection,
+    fact_id: FactId,
+    action_type: &str,
+    actor: Actor,
+    provenance: Provenance,
+    confirmation_class: ConfirmationClass,
+    previous_snapshot_json: Option<String>,
+    occurred_at: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO fact_audit_log (id, fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            Uuid::now_v7().to_string(),
+            fact_id.to_string(),
+            action_type,
+            actor_str(actor),
+            provenance_str(provenance),
+            confirmation_class_str(confirmation_class),
+            previous_snapshot_json,
+            occurred_at.to_rfc3339(),
         ],
     )?;
     Ok(())

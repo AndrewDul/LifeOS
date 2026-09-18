@@ -18,16 +18,17 @@
 mod storage;
 
 use crate::actions::{
-    blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMilestonePayload,
-    AddTaskPayload, ConfirmationClass, CreateGoalPayload, CreateProjectPayload, FieldPatch,
-    LinkGoalsPayload, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
+    blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
+    AddMilestonePayload, AddTaskPayload, ConfirmationClass, CreateGoalPayload,
+    CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch, LinkGoalsPayload, Provenance,
+    SourceRef, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
     UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
-    Entity, EntityId, Fact, FactId, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus,
-    Milestone, MilestoneId, MilestoneStatus, Project, ProjectId, Sensitivity, Task, TaskId,
-    TaskStatus,
+    Entity, EntityId, EpistemicState, Evidence, EvidenceId, Fact, FactId, FactValue, Goal, GoalId,
+    GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId, MilestoneStatus,
+    Project, ProjectId, Sensitivity, Source, SourceId, Task, TaskId, TaskStatus,
 };
 use crate::security;
 use chrono::Utc;
@@ -1571,9 +1572,12 @@ pub(crate) fn get_tasks_for_goal(
 //
 // Schema (`V7__create_personal_knowledge.sql`) + SELF bootstrap
 // (`ensure_self_entity`, above, wired into `bootstrap_db_at`) + this
-// narrow read side only. No `AddMemory`/`CorrectMemory`/`ConfirmMemory`/
-// `ForgetMemory` action exists yet (Slice B+) - see
-// `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`.
+// narrow read side + Slice B's `AddMemory` (below) - see
+// `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`
+// and `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`.
+// `CorrectMemory`/`ConfirmMemory`/`ForgetMemory` still do not exist
+// (Slice C/D+) - `AddMemory` never performs correction, confirmation, or
+// deletion logic of any kind.
 
 /// Narrow internal read (M2 Personal Knowledge Slice A) - same "read
 /// side stays narrow, add only when a real caller needs it" precedent
@@ -1593,6 +1597,380 @@ pub(crate) fn get_entity(
 /// fixtures.
 pub(crate) fn get_fact(conn: &Connection, id: FactId) -> Result<Option<Fact>, rusqlite::Error> {
     storage::personal_knowledge_repo::get_fact(conn, id)
+}
+
+/// A resolved `EntityInputRef` ready for `Fact` construction:
+/// `id` is always populated (SELF/Existing/New all resolve to a real
+/// `EntityId`), `to_insert` is `Some` only for `New` - the entity that
+/// must be inserted inside `add_memory`'s transaction. `SelfEntity`/
+/// `Existing` are never mutated - `to_insert` stays `None` for both, so
+/// nothing about them is ever written.
+struct ResolvedEntityRef {
+    id: EntityId,
+    to_insert: Option<Entity>,
+}
+
+/// Same shape as `ResolvedEntityRef`, for `SourceRef`.
+struct ResolvedSourceRef {
+    id: SourceId,
+    to_insert: Option<Source>,
+}
+
+/// Authoritative domain-ref existence check (R021 §7) - reuses each
+/// domain module's own `*_exists` read, never duplicating SQL against
+/// Goal/Project/Milestone/Task tables inside Personal Knowledge. The
+/// exact currently-supported `domain_ref_type` set is `Goal`/`Project`/
+/// `Milestone`/`Task` - the minimum the Slice B brief requires. An
+/// unknown type pushes `UnsupportedDomainReferenceType` (does not close
+/// the open `domain_ref_type` vocabulary, only limits what Core can
+/// validate today); a supported type with a syntactically-invalid or
+/// well-formed-but-nonexistent id pushes `ReferencedDomainObjectNotFound`
+/// (deliberately the same variant for both - see `ValidationError`'s
+/// doc). Returns `Ok(true)` only when the reference is confirmed to
+/// exist; any `Ok(false)` means a `ValidationError` was already pushed.
+fn validate_domain_ref_authoritative(
+    conn: &Connection,
+    domain_ref: &crate::domain::DomainRef,
+    errors: &mut Vec<ValidationError>,
+) -> Result<bool, CoreError> {
+    let exists = match domain_ref.domain_ref_type.as_str() {
+        "Goal" => match GoalId::parse(&domain_ref.domain_ref_id) {
+            Ok(id) => storage::goal_repo::goal_exists(conn, id)?,
+            Err(_) => false,
+        },
+        "Project" => match ProjectId::parse(&domain_ref.domain_ref_id) {
+            Ok(id) => storage::project_repo::project_exists(conn, id)?,
+            Err(_) => false,
+        },
+        "Milestone" => match MilestoneId::parse(&domain_ref.domain_ref_id) {
+            Ok(id) => storage::milestone_repo::milestone_exists(conn, id)?,
+            Err(_) => false,
+        },
+        "Task" => match TaskId::parse(&domain_ref.domain_ref_id) {
+            Ok(id) => storage::task_repo::task_exists(conn, id)?,
+            Err(_) => false,
+        },
+        _ => {
+            errors.push(ValidationError::UnsupportedDomainReferenceType);
+            return Ok(false);
+        }
+    };
+    if exists {
+        Ok(true)
+    } else {
+        errors.push(ValidationError::ReferencedDomainObjectNotFound);
+        Ok(false)
+    }
+}
+
+/// Resolves one `EntityInputRef` (subject or, when the value is
+/// `FactValueInput::Entity`, the object) against the database.
+/// `SelfEntity` reads the existing SELF row through the same trusted
+/// path `ensure_self_entity`/`get_self_entity` use - `AddMemory` never
+/// creates, searches for, or mutates SELF. `Existing` requires the
+/// referenced `Entity` to already exist (`ReferencedEntityNotFound`
+/// otherwise) and is never mutated on reuse. `New` validates the
+/// `domain_ref` authoritatively (if present) and checks it against
+/// already-persisted Entities (`find_entity_by_domain_ref` -
+/// `DuplicateDomainReference`) before allocating a fresh `EntityId` in
+/// memory - nothing is written here; the caller inserts `to_insert`
+/// inside the transaction. `Ok(None)` means one or more
+/// `ValidationError`s were pushed into `errors`; `Err` is a genuine
+/// storage failure that must abort the whole action immediately.
+fn resolve_entity_input_ref(
+    conn: &Connection,
+    input: &EntityInputRef,
+    now: chrono::DateTime<Utc>,
+    errors: &mut Vec<ValidationError>,
+) -> Result<Option<ResolvedEntityRef>, CoreError> {
+    match input {
+        EntityInputRef::SelfEntity => {
+            match storage::personal_knowledge_repo::get_self_entity(conn)? {
+                Some(e) => Ok(Some(ResolvedEntityRef {
+                    id: e.id,
+                    to_insert: None,
+                })),
+                None => Err(CoreError::from(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                    Some(
+                        "SELF entity missing at AddMemory time - bootstrap invariant violated"
+                            .to_string(),
+                    ),
+                ))),
+            }
+        }
+        EntityInputRef::Existing(id) => {
+            if storage::personal_knowledge_repo::entity_exists(conn, *id)? {
+                Ok(Some(ResolvedEntityRef {
+                    id: *id,
+                    to_insert: None,
+                }))
+            } else {
+                errors.push(ValidationError::ReferencedEntityNotFound);
+                Ok(None)
+            }
+        }
+        EntityInputRef::New(data) => {
+            if let Some(domain_ref) = &data.domain_ref {
+                if !validate_domain_ref_authoritative(conn, domain_ref, errors)? {
+                    return Ok(None);
+                }
+                if storage::personal_knowledge_repo::find_entity_by_domain_ref(
+                    conn,
+                    &domain_ref.domain_ref_type,
+                    &domain_ref.domain_ref_id,
+                )?
+                .is_some()
+                {
+                    errors.push(ValidationError::DuplicateDomainReference);
+                    return Ok(None);
+                }
+            }
+            let id = EntityId::new();
+            let entity = Entity {
+                id,
+                entity_type: data.entity_type.clone(),
+                canonical_name: data.canonical_name.clone(),
+                is_self: false,
+                sensitivity: data.sensitivity,
+                domain_ref: data.domain_ref.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            Ok(Some(ResolvedEntityRef {
+                id,
+                to_insert: Some(entity),
+            }))
+        }
+    }
+}
+
+/// Same reasoning as `resolve_entity_input_ref`, for `SourceRef`.
+fn resolve_source_ref(
+    conn: &Connection,
+    input: &SourceRef,
+    now: chrono::DateTime<Utc>,
+    errors: &mut Vec<ValidationError>,
+) -> Result<Option<ResolvedSourceRef>, CoreError> {
+    match input {
+        SourceRef::Existing(id) => {
+            if storage::personal_knowledge_repo::source_exists(conn, *id)? {
+                Ok(Some(ResolvedSourceRef {
+                    id: *id,
+                    to_insert: None,
+                }))
+            } else {
+                errors.push(ValidationError::ReferencedSourceNotFound);
+                Ok(None)
+            }
+        }
+        SourceRef::New(data) => {
+            let id = SourceId::new();
+            let source = Source {
+                id,
+                source_type: data.source_type.clone(),
+                label: data.label.clone(),
+                reference: data.reference.clone(),
+                sensitivity: data.sensitivity,
+                captured_at: data.captured_at,
+                created_at: now,
+            };
+            Ok(Some(ResolvedSourceRef {
+                id,
+                to_insert: Some(source),
+            }))
+        }
+    }
+}
+
+/// `AddMemory` - the first production Personal Knowledge mutation (M2
+/// Personal Knowledge Slice B, 2026-09-18). Confirmation floor is
+/// `ExplicitAdd`; for `Provenance::Inferred` the generic `effective_class`
+/// formula alone already forces a pre-write block (`InferredChange`
+/// dominates `ExplicitAdd`), so no Personal-Knowledge-specific override
+/// is needed here (unlike `CorrectMemory`'s floor) - see
+/// `services::tests::req_am_inferred_unconfirmed_blocks_with_zero_writes`.
+///
+/// Validation-before-write ordering: (1) pure structural validation
+/// (`actions::validate_add_memory` - lengths, JSON syntax, confidence
+/// bounds, same-payload duplicate-domain-ref); (2) subject/object/source
+/// database-dependent resolution, aggregating every reference error
+/// found rather than stopping at the first (matches `add_task`'s
+/// `project_id`/`goal_id` aggregation precedent) - Existing-not-found,
+/// domain-ref authoritative existence, and persisted-duplicate-domain-ref
+/// are all checked here; (3) only once every check above has succeeded
+/// does the confirmation gate run, and only after that does the
+/// transaction open. Nothing is written to any table before all
+/// validation succeeds.
+///
+/// Atomic transaction, in order: new subject Entity (if any) -> new
+/// object Entity (if any) -> new Source (if `SourceRef::New`) -> Fact ->
+/// Evidence -> `fact_evidence` link -> `fact_audit_log`. Any failure at
+/// any step means `tx` drops without a commit and rusqlite rolls back
+/// everything, including any newly-created Entities/Source - pre-
+/// existing Entity/Source rows are never touched regardless (`to_insert`
+/// is `None` for both `SelfEntity` and `Existing`).
+///
+/// `fact_audit_log.previous_snapshot` is always `None` - this creates a
+/// Fact, it never updates one, so `serialize_required_snapshot` (the
+/// Update* actions' mandatory-snapshot helper) is never called here.
+/// `epistemic_state` persists `USER_CONFIRMED` when this is an
+/// `Inferred`, now-confirmed resubmission (regardless of the payload's
+/// originally-proposed `epistemic_state`), or exactly the caller's
+/// requested `epistemic_state` for a direct `Explicit` call - the only
+/// path that can persist a deliberate `HYPOTHESIS`+`INFERRED` memory
+/// (R018 §5). `provenance` itself is stored in the audit row exactly as
+/// given - confirming an inferred action never silently rewrites it to
+/// `Explicit` (confirmation and provenance are distinct concepts).
+///
+/// Never performs implicit deduplication, contradiction detection,
+/// correction, auto-`STALE` transition, similarity merge, or entity-
+/// alias merge - two explicit `AddMemory` calls may create two Facts
+/// that look alike (R021 §16). Never writes to `relations`/`episodes`/
+/// `relation_evidence`/`episode_evidence`/`episode_entities` - those
+/// remain schema-only.
+pub(crate) fn add_memory(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: AddMemoryPayload,
+) -> ActionOutcome<Fact> {
+    let normalized = match crate::actions::validate_add_memory(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let now = meta.requested_at;
+    let mut errors: Vec<ValidationError> = Vec::new();
+
+    let subject = match resolve_entity_input_ref(conn, &normalized.subject, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    let object = match &normalized.value {
+        FactValueInput::Entity(entity_ref) => {
+            match resolve_entity_input_ref(conn, entity_ref, now, &mut errors) {
+                Ok(r) => r,
+                Err(e) => return ActionOutcome::StorageError(e),
+            }
+        }
+        FactValueInput::ScalarJson(_) => None,
+    };
+
+    let source = match resolve_source_ref(conn, &normalized.source, now, &mut errors) {
+        Ok(r) => r,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    if !errors.is_empty() {
+        return ActionOutcome::ValidationFailed(errors);
+    }
+
+    let subject = subject.expect("no reference errors implies subject resolved");
+    let source = source.expect("no reference errors implies source resolved");
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let persisted_epistemic_state = if meta.provenance == Provenance::Inferred && meta.confirmed {
+        EpistemicState::UserConfirmed
+    } else {
+        normalized.epistemic_state
+    };
+
+    let fact_value = match &normalized.value {
+        FactValueInput::ScalarJson(s) => FactValue::Scalar(s.clone()),
+        FactValueInput::Entity(_) => FactValue::EntityRef(
+            object
+                .as_ref()
+                .expect("FactValueInput::Entity implies object resolved")
+                .id,
+        ),
+    };
+
+    let fact = Fact {
+        id: FactId::new(),
+        subject_entity_id: subject.id,
+        predicate: normalized.predicate.clone(),
+        value: fact_value,
+        memory_type: normalized.memory_type,
+        epistemic_state: persisted_epistemic_state,
+        confidence: normalized.confidence,
+        sensitivity: normalized.sensitivity,
+        valid_from: now,
+        valid_until: None,
+        superseded_by_fact_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let evidence = Evidence {
+        id: EvidenceId::new(),
+        source_id: source.id,
+        content: normalized.evidence.content.clone(),
+        locator: normalized.evidence.locator.clone(),
+        sensitivity: normalized.evidence.sensitivity,
+        created_at: now,
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Some(new_subject) = &subject.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_entity(&tx, new_subject) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Some(resolved_object) = &object {
+        if let Some(new_object) = &resolved_object.to_insert {
+            if let Err(e) = storage::personal_knowledge_repo::insert_entity(&tx, new_object) {
+                return ActionOutcome::StorageError(CoreError::from(e));
+            }
+        }
+    }
+    if let Some(new_source) = &source.to_insert {
+        if let Err(e) = storage::personal_knowledge_repo::insert_source(&tx, new_source) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact(&tx, &fact) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_evidence(&tx, &evidence) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) =
+        storage::personal_knowledge_repo::insert_fact_evidence_link(&tx, fact.id, evidence.id, now)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact_audit_log(
+        &tx,
+        fact.id,
+        "AddMemory",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: fact,
+        confirmation_class: class,
+    }
 }
 
 #[cfg(test)]
