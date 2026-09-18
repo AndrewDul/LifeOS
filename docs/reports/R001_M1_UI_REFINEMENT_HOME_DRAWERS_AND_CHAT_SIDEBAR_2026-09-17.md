@@ -1,4 +1,4 @@
-# UI Refinement: Home Edge Drawers, Face Geometry, Constellation Background, Chat Sidebar
+# R001 — M1 UI Refinement: Home Edge Drawers, Face Geometry, Constellation Background, Chat Sidebar
 
 Date: 2026-09-17
 Scope: M1 visual refinement only. No M2 (backend/database/AI) work.
@@ -78,7 +78,7 @@ history panel, which the user explicitly said was wrong.
 
 **New:**
 - `src/components/ChatSidebar.tsx`
-- `docs/reports/REPORT_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md` (this file)
+- `docs/reports/R001_M1_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md` (this file)
 
 **Recreated** (previously deleted in the last visual-refinement pass,
 now rebuilt with a different, more minimal design):

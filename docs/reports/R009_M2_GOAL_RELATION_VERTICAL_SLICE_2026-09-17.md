@@ -1,4 +1,4 @@
-# REPORT — M2 GoalRelation Vertical Slice
+# R009 — M2 GoalRelation Vertical Slice
 
 **Date:** 2026-09-17
 **Scope:** The third real M2 domain entity, `GoalRelation`, and its one
@@ -20,9 +20,9 @@ every connection via `storage::open_encrypted`); Goal implemented and
 hardened; Project implemented and storage-integrity hardened
 (`LifecycleStatus` rename, canonical `Project.progress`, documented
 action-set gap); 73/73 tests passing at checkpoint commit `9bac125`.
-Full detail: `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`,
-`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
-`docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
+Full detail: `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`,
+`docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
 
 ---
 
@@ -53,7 +53,7 @@ This was a factual mistake, conflating three distinct things:
    `relation_type` at all.
 
 **Corrected in:**
-- `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` §14 -
+- `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` §14 -
   the erroneous paragraph rewritten in place with an explicit
   "Correction" note (reports are otherwise treated as historical/
   append-only, but a factual error is fixed rather than left standing,
@@ -447,7 +447,7 @@ All commands run from `D:\Dev\LiFeOS\src-tauri` unless noted, PowerShell,
 **New:**
 - `src-tauri/migrations/V3__create_goal_relations.sql`
 - `src-tauri/src/services/storage/goal_relation_repo.rs`
-- `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`
+- `docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`
 
 **Modified:**
 - `src-tauri/src/domain/mod.rs` - added `GoalRelationId`, `GoalRelationType`
@@ -483,7 +483,7 @@ All commands run from `D:\Dev\LiFeOS\src-tauri` unless noted, PowerShell,
 - `docs/PROJECT_STATE.md` - new §4f (GoalRelation vertical slice),
   renumbered §4g; §1/§2/§7/§8/§9/§10 updated for the new test count,
   commit list, file tree, and known-problems changes.
-- `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` - §14
+- `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` - §14
   corrected in place (§2, above).
 
 No changes to: `Cargo.toml`/`Cargo.lock` (no dependency changes),

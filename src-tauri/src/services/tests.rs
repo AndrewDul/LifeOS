@@ -1,7 +1,7 @@
 //! M2 Goal vertical slice + hardening test suite (2026-09-17).
 //!
-//! Evidence for `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
-//! and `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`. Run with:
+//! Evidence for `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
+//! and `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`. Run with:
 //! `cargo test --manifest-path src-tauri/Cargo.toml services::tests -- --nocapture --test-threads=1`
 //! (`--test-threads=1` matters for the keyring-touching test.)
 
@@ -811,7 +811,7 @@ fn req_h5_inferred_create_goal_requires_confirmation_and_does_not_write() {
 
 // =========================================================================
 // M2 Project vertical slice (2026-09-17) - new evidence below.
-// Evidence for `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
+// Evidence for `docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
 // =========================================================================
 
 fn mk_create_project_payload(
@@ -1397,7 +1397,7 @@ fn req_p16_inferred_create_project_requires_confirmation_and_does_not_write() {
 
 // =========================================================================
 // M2 UpdateProject implementation (2026-09-17) - new evidence below.
-// Evidence for `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`.
+// Evidence for `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`.
 // Closes the M2 Project action-set gap both in design (already frozen,
 // M2 Project Child Action Freeze report) and now in code.
 // =========================================================================
@@ -2234,7 +2234,7 @@ fn req_up31_32_goal_id_changes_do_not_affect_goal_or_goal_relations() {
 /// numbered list - added because this run required an unplanned V6
 /// migration, and every other migration in this codebase has a
 /// dedicated non-destructive-upgrade proof; see
-/// `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md` §3a). Builds a
+/// `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` §3a). Builds a
 /// database frozen at V5 (real `project_audit_log` rows using only the
 /// pre-V6 `action_type` values `'CreateProject'`/`'UpdateProgress'` -
 /// the actual shape of an existing user's database before this update),
@@ -2338,7 +2338,7 @@ fn req_up_v6_v5_populated_database_upgrades_cleanly_to_v6() {
 // =========================================================================
 // M2 Project/storage integrity hardening (2026-09-17) - new evidence
 // below. Evidence for
-// `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
+// `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
 // =========================================================================
 
 fn foreign_keys_pragma_value(conn: &Connection) -> i64 {
@@ -2464,7 +2464,7 @@ fn req_i4_valid_direct_project_goal_id_accepted() {
 // =========================================================================
 // M2 GoalRelation vertical slice (2026-09-17) - new evidence below.
 // Evidence for
-// `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+// `docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
 // =========================================================================
 
 fn mk_link_payload(
@@ -3557,7 +3557,7 @@ fn req_gr26_raw_hard_delete_of_referenced_goal_is_restricted() {
 
 // =========================================================================
 // M2 Milestone vertical slice (2026-09-17) - new evidence below. Evidence
-// for `docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
+// for `docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
 // The fourth real M2 domain entity, and the first required-parent child
 // entity - `milestones.project_id REFERENCES projects(id) ON DELETE
 // RESTRICT`.
@@ -4854,7 +4854,7 @@ fn req_m31_get_milestones_for_project_returns_order_index_ascending() {
 
 // =========================================================================
 // M2 Task vertical slice (2026-09-17) - new evidence below. Evidence for
-// `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`. The fifth
+// `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md`. The fifth
 // real M2 domain entity, and the first with two independent nullable
 // parent references - `tasks.project_id`/`tasks.goal_id`, both
 // `ON DELETE RESTRICT`.
@@ -5289,7 +5289,7 @@ fn req_t12_nonexistent_goal_id_rejected_before_write() {
 // =========================================================================
 // M2 Task parent-validation hardening (2026-09-17) - new evidence below.
 // Evidence for
-// `docs/reports/REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
+// `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
 // Proves `add_task`/`update_task` check `project_id`/`goal_id`
 // independently and aggregate BOTH errors (stable Project-then-Goal
 // order) when both are invalid, rather than short-circuiting on the

@@ -1,9 +1,9 @@
 //! M2 storage spike test suite (2026-09-17), unchanged in behavior after
 //! being relocated out of the production `services`/`storage` path -
-//! see `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md` Part A1.
+//! see `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md` Part A1.
 //!
 //! Evidence originally recorded in
-//! `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`; kept here as a
+//! `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`; kept here as a
 //! regression suite. Run with:
 //! `cargo test --manifest-path src-tauri/Cargo.toml services::storage::spike::tests -- --nocapture`
 

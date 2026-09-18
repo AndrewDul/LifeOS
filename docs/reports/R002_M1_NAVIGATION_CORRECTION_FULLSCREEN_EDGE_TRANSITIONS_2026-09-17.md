@@ -1,4 +1,4 @@
-# M1 Navigation Correction: Full-Screen Edge Transitions, Global Sidebar Removed, NeXa Island as Sole Global Nav
+# R002 — M1 Navigation Correction: Full-Screen Edge Transitions, Global Sidebar Removed, NeXa Island as Sole Global Nav
 
 Date: 2026-09-17
 Scope: M1 visual/interaction correction only. No M2 (backend/database/AI) work.

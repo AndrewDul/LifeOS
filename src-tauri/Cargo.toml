@@ -21,7 +21,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# M2 encrypted storage (spike, 2026-09-17 - see docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md).
+# M2 encrypted storage (spike, 2026-09-17 - see docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md).
 # sqlite3mc has no mature native-Rust integration as of this research
 # (rusqlite has no sqlite3mc feature; the only found crate is 15 days
 # old with 78 downloads) - SQLCipher, natively supported by rusqlite,
@@ -40,11 +40,11 @@ serde_json = "1"
 # `bundled-sqlcipher` (links SQLCipher's bundled C source against an
 # external OpenSSL) with a prebuilt Windows OpenSSL dev package
 # (winget: ShiningLight.OpenSSL.Dev) instead - see
-# docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md Phase B for the
+# docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md Phase B for the
 # full evidence trail. Build-time only: `dumpbin /dependents` on the
 # release binary confirms OpenSSL is statically linked, so the shipped
 # app has NO runtime DLL dependency on it - see
-# docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md. Requires
+# docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md. Requires
 # OPENSSL_DIR/OPENSSL_LIB_DIR/OPENSSL_INCLUDE_DIR set when building -
 # run scripts/setup-windows-storage-env.ps1 once per dev machine
 # (no hardcoded path committed to the repo).

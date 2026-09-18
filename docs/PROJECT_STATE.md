@@ -174,20 +174,20 @@ LiFeOS/
 │   └── setup-windows-storage-env.ps1   (new - see §4b)
 ├── docs/
 │   ├── LIFEOS_SPEC.md, RESEARCH_DECISIONS.md, PROJECT_STATE.md
-│   └── reports/    REPORT_UI_REFINEMENT_..._2026-09-17.md
-│                    REPORT_NAVIGATION_CORRECTION_..._2026-09-17.md
-│                    REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md
-│                    REPORT_M2_STORAGE_SPIKE_2026-09-17.md
-│                    REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md
-│                    REPORT_M2_GOAL_HARDENING_2026-09-17.md
-│                    REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md
-│                    REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md
-│                    REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md
-│                    REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md
-│                    REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md
-│                    REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md
-│                    REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md
-│                    REPORT_M2_UPDATE_PROJECT_2026-09-17.md
+│   └── reports/    R001_M1_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md
+│                    R002_M1_NAVIGATION_CORRECTION_FULLSCREEN_EDGE_TRANSITIONS_2026-09-17.md
+│                    R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md
+│                    R004_M2_STORAGE_SPIKE_2026-09-17.md
+│                    R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md
+│                    R006_M2_GOAL_HARDENING_2026-09-17.md
+│                    R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md
+│                    R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md
+│                    R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md
+│                    R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md
+│                    R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md
+│                    R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md
+│                    R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md
+│                    R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -199,7 +199,7 @@ LiFeOS/
     │              V6__widen_project_audit_log_action_types.sql (new - widens
     │                             project_audit_log.action_type's CHECK to allow
     │                             'UpdateProject'; projects itself untouched, see
-    │                             REPORT_M2_UPDATE_PROJECT_2026-09-17.md §3a)
+    │                             R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md §3a)
     ├── src/
     │   ├── main.rs, lib.rs       (run() unchanged; declares the 5 modules, all private)
     │   ├── core_error.rs          CoreError/CoreErrorKind - typed Core-boundary error model
@@ -352,7 +352,7 @@ refinement reports + navigation-correction report for full detail.
   found. Run once per dev machine; a new terminal picks it up
   automatically.
 
-Full evidence: `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
+Full evidence: `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
 Parts A1-A3.
 
 ### 4b. Goal vertical slice implemented (2026-09-17, later hardened - §4c)
@@ -396,7 +396,7 @@ The first real domain entity, end to end:
   Tauri command/`run()` wiring this run.
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
 
 ### 4c. Goal hardening (2026-09-17, dedicated follow-up run)
 
@@ -471,7 +471,7 @@ illegal-access probe), UUID v7 Goal IDs, UTC timestamps, progress 0-100,
 priority 1-5, the release/package build, `setup-windows-storage-env.ps1`,
 and all 9 storage-spike regression tests.
 
-Full evidence: `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`.
+Full evidence: `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`.
 
 **Goal is now considered safe to use as the template for `Project`** -
 see that report's §13 for the exact reasoning.
@@ -547,7 +547,7 @@ pattern - no separate hardening pass was needed:
   invented.
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`.
 
 ### 4e. Project/storage integrity hardening (2026-09-17, dedicated follow-up run)
 
@@ -619,7 +619,7 @@ via the illegal-access probe against the new state), atomic
 mutation+audit for both entities, `ReferencedGoalNotFound`'s existing
 behavior, and the V1→V2 migration-compatibility guarantee.
 
-Full evidence: `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
+Full evidence: `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`.
 
 ### 4f. GoalRelation vertical slice implemented (2026-09-17)
 
@@ -705,7 +705,7 @@ Goal/Project pattern (no separate hardening pass needed):
   inverse) only - no public capability transport added this run.
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
 
 **Documentation correction made before implementation began**: the
 Project/storage hardening report (§14) had incorrectly claimed
@@ -767,7 +767,7 @@ did.
   two optional parents and four statuses add complexity. Personal
   Knowledge Layer explicitly not started this run.
 
-Full reasoning: `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`.
+Full reasoning: `docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`.
 
 ### 4h. What's still architecturally frozen but not yet implemented
 
@@ -852,7 +852,7 @@ hardening pass needed):
   - no public capability transport added this run.
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
 
 ### 4j. Task vertical slice implemented (2026-09-17)
 
@@ -933,7 +933,7 @@ the pattern (no separate hardening pass needed):
   public capability transport added this run.
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
 
 ### 4k. Task parent-validation hardening (2026-09-17, dedicated follow-up run)
 
@@ -965,10 +965,10 @@ new entity or action:
   runs even when Project already failed) for both actions.
 - **Documentation correction, not a silent rewrite**: a "Correction
   note" addendum was added to
-  `REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md` §10, explaining the
+  `R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md` §10, explaining the
   inaccuracy; the original text is preserved above it.
 
-Full evidence: `docs/reports/REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
+Full evidence: `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`.
 
 ### 4l. UpdateProject implemented (2026-09-17)
 
@@ -1021,7 +1021,7 @@ frozen by the M2 Project Child Action Freeze report) and now in code:
   `action_type` values, survive the upgrade unchanged).
 
 Full evidence, exact SQL, and every test result:
-`docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`.
+`docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`.
 
 ### Next implementation step (M2)
 
@@ -1286,3 +1286,32 @@ planning pass first, the way Milestone/Task both got one.
   model integration for M4/M5, Goal Intelligence and Personal Knowledge
   UI for M6, LifeOS's own software license, bilingual detection
   mechanism) is unchanged by this run.
+
+---
+
+## 11. LifeOS report index
+
+Every substantial report, in chronological creation order (see
+`CLAUDE.md`'s Documentation policy for the permanent `R###` numbering
+rule, established 2026-09-18). Report numbers are global and permanent
+- never renumbered, never reused. This index is pointers only, not
+summaries - open the file for full reasoning.
+
+| # | Title | Filename |
+|---|---|---|
+| R001 | M1 UI Refinement: Home Edge Drawers, Face Geometry, Constellation Background, Chat Sidebar | `docs/reports/R001_M1_UI_REFINEMENT_HOME_DRAWERS_AND_CHAT_SIDEBAR_2026-09-17.md` |
+| R002 | M1 Navigation Correction: Full-Screen Edge Transitions, Global Sidebar Removed, NeXa Island as Sole Global Nav | `docs/reports/R002_M1_NAVIGATION_CORRECTION_FULLSCREEN_EDGE_TRANSITIONS_2026-09-17.md` |
+| R003 | M2 Architecture Freeze: LifeOS Core + Encrypted Local Storage | `docs/reports/R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md` |
+| R004 | M2 Storage Spike: Encrypted SQLite Candidate Verification | `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` |
+| R005 | M2 Goal Vertical Slice: Storage Hardening + First Real Domain | `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md` |
+| R006 | M2 Goal Hardening | `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md` |
+| R007 | M2 Project Vertical Slice | `docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md` |
+| R008 | M2 Project / Storage Integrity Hardening | `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` |
+| R009 | M2 GoalRelation Vertical Slice | `docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md` |
+| R010 | M2 Project Child Action Freeze | `docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` |
+| R011 | M2 Milestone Vertical Slice | `docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` |
+| R012 | M2 Task Vertical Slice | `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md` |
+| R013 | M2 Task Parent-Validation Hardening | `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` |
+| R014 | M2 UpdateProject Implementation | `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` |
+
+Next report allocated will be **R015**.

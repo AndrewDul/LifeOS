@@ -77,13 +77,47 @@ scratch:
 exists at all.
 
 **Every substantial run also produces a dedicated report** under
-`docs/reports/`, named `REPORT_<SUBJECT>_<YYYY-MM-DD>.md` (e.g.
-`REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`). A run is "substantial" if
-it does real architecture, implementation, or debugging work — a trivial
-edit (a typo fix, a one-line config change, a single doc correction) does
-not need one. When genuinely in doubt, write the report: a stray report
-costs little, but a missing one loses reasoning that is expensive to
-reconstruct later.
+`docs/reports/`, named:
+
+```
+docs/reports/R###_<MILESTONE>_<DESCRIPTIVE_NAME>_<YYYY-MM-DD>.md
+```
+
+e.g. `R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
+`R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`. A run is
+"substantial" if it does real architecture, implementation, or
+debugging work — a trivial edit (a typo fix, a one-line config change, a
+single doc correction) does not need one. When genuinely in doubt, write
+the report: a stray report costs little, but a missing one loses
+reasoning that is expensive to reconstruct later.
+
+**Permanent report-numbering rule (established 2026-09-18):**
+
+- `R###` numbers are **global** across the whole LifeOS project — three
+  digits, zero-padded (`R001`, `R002`, … `R014`, …), not per-milestone.
+- Numbers represent **chronological report-creation order** — the order
+  reports actually came into existence, verified from git history when
+  it isn't obvious from the date alone (many reports share a date).
+- Before creating a new report:
+  1. Enumerate the existing `R###` reports in `docs/reports/`.
+  2. Find the highest existing number.
+  3. Allocate exactly `next_number = highest_existing + 1`.
+  4. Never renumber a previous report merely because a new one is
+     inserted conceptually "between" existing ones, or because a report
+     is later deleted — numbers are permanent once assigned, and a
+     retired number is never reused.
+  5. Choose a concise but genuinely descriptive uppercase filename slug
+     that says what the report is actually about, keeping the relevant
+     milestone identifier (`M0`/`M1`/`M2`/…) in the filename where
+     applicable.
+  6. Include the same `R###` identifier at the start of the report's
+     top-level (`H1`) heading, e.g. `# R014 — M2 UpdateProject
+     Implementation`.
+- `docs/PROJECT_STATE.md` maintains a compact chronological index of
+  every `R###` report (number, title, real filename) so a human or a
+  future agent can say "read R012" and immediately locate it — that
+  index is not a place for full report summaries, only pointers.
+- Trivial edits still do not require a report, per the rule above.
 
 The report is where the full reasoning lives — what was done, why, files
 touched, decisions and tradeoffs, validation results, and what's still

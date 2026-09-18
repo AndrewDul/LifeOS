@@ -9,7 +9,7 @@
     (build-time only - the resulting lifeos.exe statically links OpenSSL
     and has NO runtime DLL dependency on it, verified via
     `dumpbin /dependents` - see
-    docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md).
+    docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md).
 
     This script does NOT hardcode a path into the repository. It checks
     the standard install location for a prebuilt Windows OpenSSL dev

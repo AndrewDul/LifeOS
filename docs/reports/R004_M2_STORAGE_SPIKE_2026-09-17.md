@@ -1,4 +1,4 @@
-# M2 Storage Spike: Encrypted SQLite Candidate Verification
+# R004 — M2 Storage Spike: Encrypted SQLite Candidate Verification
 
 Date: 2026-09-17
 Scope: first M2 implementation step. Architecture errata (Phase A) +
@@ -7,7 +7,7 @@ spike (Phase C) proving 10 numbered requirements. No Goal/Project/Fact
 production schema. No action/service layer beyond what the spike itself
 needed. No Qwen/Ollama, no GPT/Luna. M3 not started.
 
-Companion documents: `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`
+Companion documents: `docs/reports/R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md`
 (now corrected in place per Phase A below), `docs/LIFEOS_SPEC.md` §5.
 
 ---

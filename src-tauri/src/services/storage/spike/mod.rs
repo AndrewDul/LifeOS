@@ -3,7 +3,7 @@
 //!
 //! **Compiled for tests only - never part of a release build.**
 //! `spike_records` is NOT the real LifeOS schema; see
-//! `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for what this
+//! `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` for what this
 //! originally proved (encrypted creation, restart persistence, wrong-key
 //! rejection, encrypted-at-rest, migration, rekey, backup/restore,
 //! corruption handling, OS keyring round trip, Windows release build).

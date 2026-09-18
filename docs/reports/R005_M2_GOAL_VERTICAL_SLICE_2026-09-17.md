@@ -1,4 +1,4 @@
-# M2 Goal Vertical Slice: Storage Hardening + First Real Domain
+# R005 — M2 Goal Vertical Slice: Storage Hardening + First Real Domain
 
 Date: 2026-09-17
 Scope: Part A (storage foundation cleanup for production use) + Part B
@@ -12,10 +12,10 @@ Luna. No M3 UI wiring. M1 UI untouched.
 ## 1. Pre-run state
 
 M1 accepted and closed. M2 architecture frozen
-(`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`, corrected
+(`docs/reports/R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md`, corrected
 same day per its own errata). SQLCipher via `rusqlite`'s
 `bundled-sqlcipher` feature proven as the M2 storage candidate
-(`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`), but only as an
+(`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`), but only as an
 isolated `spike_records` proof - no production schema, no domain code,
 no action layer existed. `src-tauri/.cargo/config.toml` hardcoded this
 machine's OpenSSL path as committed repository config.
@@ -40,7 +40,7 @@ machine's OpenSSL path as committed repository config.
   a fresh production database and queries `sqlite_master` for a
   `spike_records` table - asserts it does not exist. **PASS.**
 - The spike's own 10-requirement regression suite
-  (`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`) was moved,
+  (`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`) was moved,
   unmodified in behavior, into
   `services::storage::spike::tests` (`#[cfg(test)]`-only) - see §14.
   All 9 still pass.

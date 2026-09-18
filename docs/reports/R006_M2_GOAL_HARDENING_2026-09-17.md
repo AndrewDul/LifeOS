@@ -1,7 +1,7 @@
-# REPORT — M2 Goal Hardening
+# R006 — M2 Goal Hardening
 
 **Date:** 2026-09-17
-**Scope:** Harden the Goal vertical slice (`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`)
+**Scope:** Harden the Goal vertical slice (`docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`)
 before its pattern is copied to `Project` or any other domain entity.
 Explicitly **not** in scope: `GoalRelation`, `Project`, M3, any UI change,
 Qwen/GPT/Luna.
@@ -399,7 +399,7 @@ All commands run from `D:\Dev\LiFeOS\src-tauri` unless noted, PowerShell,
 - `docs/PROJECT_STATE.md` - updated for this run (§4b corrected, new
   §4c, renumbered §4d, file tree, test counts, commit list, known
   problems).
-- `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md` - this report.
+- `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md` - this report.
 
 No changes to: `Cargo.toml`/`Cargo.lock` (no dependency changes),
 `src-tauri/migrations/V1__create_goals.sql` (schema unchanged - all

@@ -4,7 +4,7 @@
 //! corrected M2 module-boundary enforcement (`docs/LIFEOS_SPEC.md`
 //! §5.6): nothing outside this file can reach `services::storage`,
 //! proven by deliberately attempting it and capturing the compiler's
-//! rejection (`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`).
+//! rejection (`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`).
 //! `services` is the only module allowed to call `storage`; `domain`
 //! and `actions` are pure and never touch SQL. Nothing outside this
 //! crate calls any of this yet - there is no Tauri command layer this
@@ -331,8 +331,8 @@ pub(crate) fn get_goal(conn: &Connection, id: GoalId) -> Result<Option<Goal>, ru
 // added 2026-09-17, M2 UpdateProject implementation) --------------------
 //
 // Same atomic-mutation-plus-audit, typed-`CoreError`, module-boundary
-// pattern as Goal above - see `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
-// and `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`.
+// pattern as Goal above - see `docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
+// and `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`.
 // `CreateProject`, `UpdateProject`, and `UpdateProgress` are all
 // implemented now - `AddMilestone`/`AddTask` live under their own
 // entities (`add_milestone`/`add_task` below), not here.
@@ -623,7 +623,7 @@ pub(crate) fn get_project(
 // implemented - it is the entire frozen action for this graph, there is
 // no separate `CreateGoalRelation`. Same atomic-mutation-plus-audit,
 // typed-`CoreError` pattern as Goal/Project above - see
-// `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+// `docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
 
 /// `LinkGoals`'s confirmation floor is `EXPLICIT_ADD` per the
 /// architecture-freeze report §F's confirmation table. Validation order
@@ -753,7 +753,7 @@ pub(crate) fn get_goal_relations_for_goal(
 // implemented - Task is explicitly out of scope for this slice. Same
 // atomic-mutation-plus-audit, typed-`CoreError` pattern as every entity
 // above - see
-// `docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
+// `docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md`.
 
 /// `AddMilestone`'s confirmation floor is `EXPLICIT_ADD` per the
 /// architecture-freeze report §F's confirmation table. Validation order
@@ -976,7 +976,7 @@ pub(crate) fn get_milestones_for_project(
 // RecurringRule/Calendar/Reminder/Challenge/Personal Knowledge are all
 // explicitly out of scope for this slice. Same atomic-mutation-plus-
 // audit, typed-`CoreError` pattern as every entity above - see
-// `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
+// `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md`.
 
 /// `AddTask`'s confirmation floor is `EXPLICIT_ADD` per the
 /// architecture-freeze report §F's confirmation table / the M2 Project

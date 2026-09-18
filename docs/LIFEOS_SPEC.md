@@ -316,13 +316,13 @@ built directly with the twice-hardened pattern) — the rest of the
 domain model (Task, Calendar, Personal Knowledge, Goal Intelligence
 *reasoning*) is not yet started. Full reasoning, tradeoffs, and evidence
 behind every decision in this section:
-`docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
-`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`,
-`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
-`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`,
-`docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
-`docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`, and
-`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md`,
+`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`,
+`docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`,
+`docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`, and
+`docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
 Original research: `RESEARCH_DECISIONS.md` §4.
 
 The canonical user database is local SQLite, with an encryption layer and
@@ -345,7 +345,7 @@ OS-native key storage.
   the freeze called out — a real Windows Tauri *release* build
   (`cargo build --release` and `npm run tauri build`, producing actual
   MSI and NSIS installers, not just `cargo check`). Full evidence:
-  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`.
+  `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`.
 - **Known Windows build-time dependency, confirmed *not* a runtime one
   (corrected 2026-09-17, Goal vertical slice report Part A2):**
   `bundled-sqlcipher` links against an *external* OpenSSL rather than
@@ -474,7 +474,7 @@ considered and rejected — see the freeze report §3 for the reasoning).
 `progress` alone, floor `EXPLICIT_ADD`, unchanged; `UpdateProject` never
 touches `progress`, proven by a dedicated regression test. **This is no
 longer documentation-only** — `UpdateProject` is real, tested code (see
-`docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md`), closing the gap
+`docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`), closing the gap
 in both design and code.
 
 **Project child action set (Milestone, Task) — both implemented
@@ -558,9 +558,9 @@ nullable → `FieldPatch<T>`, already correctly stated there).
   add that later if needed.
 
 Full reasoning for every point above:
-`docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` (the
+`docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` (the
 freeze) and
-`docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` (the
+`docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` (the
 `order_index` uniqueness resolution and the patch-semantics correction
 above, plus the full `AddMilestone`/`UpdateMilestone` implementation
 evidence).
@@ -634,7 +634,7 @@ direction rather than writing a second `CHILD_OF` row (that value
 remains valid and storable for a caller who deliberately requests it
 directly - the freeze keeps it, `LinkGoals` simply never auto-generates
 it). Full evidence:
-`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`.
 
 The *intelligence* — proposing priorities, surfacing conflicts,
 reasoning about dependencies, graph traversal, cycle detection — is
@@ -797,7 +797,7 @@ case a future edit ever changes the module declaration itself.
 **Verified for real** during the M2 storage spike by deliberately adding
 an illegal `services::storage::...` call from outside `services` and
 capturing the exact compiler rejection — see
-`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the literal
+`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` for the literal
 error output, not just this description.
 
 **Re-verified after a deeper nesting (Goal vertical slice, 2026-09-17).**
@@ -815,7 +815,7 @@ illegal access, capture the compiler error, remove it" proof was
 re-run against this deeper shape (not assumed to still hold after the
 refactor) and produced the same `error[E0603]: module 'storage' is
 private` result — see
-`docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
+`docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`.
 
 `capability/` is the thin, stable surface that Tauri commands, the cloud
 LLM's tool-handlers, and (later) NeXa all sit behind — it calls only
@@ -1170,24 +1170,24 @@ reordered against `PROJECT_STATE.md`'s current reality).
   architecture. No fake backend functionality. **End of M1: the user must
   be able to launch and see the real app.**
 - **M2 — LifeOS Core + encrypted storage.** Architecture frozen
-  2026-09-17 (§5.1-§5.6, `docs/reports/REPORT_M2_ARCHITECTURE_FREEZE_2026-09-17.md`).
+  2026-09-17 (§5.1-§5.6, `docs/reports/R003_M2_ARCHITECTURE_FREEZE_2026-09-17.md`).
   Storage layer PROVEN 2026-09-17 (SQLCipher via `rusqlite`
   `bundled-sqlcipher`, not `sqlite3mc` — see §5 and
-  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`) and hardened for
+  `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`) and hardened for
   production use the same day (spike/production separation, no
   committed machine-specific config; SQLite foreign-key enforcement
   genuinely enabled in a later hardening pass —
-  `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`).
+  `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`).
   `Goal` is implemented **and** hardened (atomic mutation+audit, typed
   `CoreError`, `FieldPatch` semantics —
-  `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
-  `docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`). `Project` is
+  `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+  `docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`). `Project` is
   also implemented (`CreateProject`/`UpdateProgress`, its `goal_id` link
-  to `Goal` proven — `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`),
+  to `Goal` proven — `docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`),
   built directly with the hardened pattern. `GoalRelation` is also
   implemented (`LinkGoals`, its 11-value relation-type enum and
   direction convention proven —
-  `docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`),
+  `docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`),
   the first relationship-*graph* structure, built directly with the
   twice-hardened pattern. The remainder of the M2 domain model is still
   in progress — a fourth entity is next (`docs/PROJECT_STATE.md` §9).
@@ -1254,7 +1254,7 @@ These are genuinely unresolved and should not be treated as decided:
 - **Resolved 2026-09-17:** `sqlite3mc` had no mature native-Rust
   integration to test; SQLCipher (via `rusqlite`'s `bundled-sqlcipher`)
   was substituted and is now PROVEN for M2 on Windows — see §5 and
-  `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`. Still open:
+  `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`. Still open:
   whether to invest in fixing this machine's Perl to unlock
   `bundled-sqlcipher-vendored-openssl` and drop the machine-specific
   external-OpenSSL build dependency `bundled-sqlcipher` currently needs.

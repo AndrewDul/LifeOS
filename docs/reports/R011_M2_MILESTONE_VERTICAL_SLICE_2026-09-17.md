@@ -1,4 +1,4 @@
-# REPORT — M2 Milestone Vertical Slice (2026-09-17)
+# R011 — M2 Milestone Vertical Slice (2026-09-17)
 
 Fourth real M2 domain entity, and the first required-parent child entity.
 Implements `AddMilestone`/`UpdateMilestone` end to end through
@@ -13,12 +13,12 @@ other domain entity remain out of scope for this run.
 
 - M1 accepted, unchanged.
 - M2: `Goal`, `Project`, `GoalRelation` all implemented and hardened
-  (see `REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
-  `REPORT_M2_GOAL_HARDENING_2026-09-17.md`,
-  `REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
-  `REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`,
-  `REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`).
-- `REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` (documentation
+  (see `R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+  `R006_M2_GOAL_HARDENING_2026-09-17.md`,
+  `R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`,
+  `R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md`,
+  `R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md`).
+- `R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` (documentation
   only, zero source changes) froze `UpdateProject`/`UpdateMilestone`/
   `UpdateTask`'s action-set decisions ahead of implementation, and left
   `Milestone.order_index` uniqueness as an explicit open question.
@@ -54,7 +54,7 @@ genuinely nullable. This same rule now also governs the still-
 unimplemented `UpdateProject`.
 
 Fixed in `docs/LIFEOS_SPEC.md` (§5.1's action-set bullet, §13's open-
-questions list) and `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
+questions list) and `docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
 (a "Correction note" addendum after its §6 — the original text is kept,
 not silently rewritten).
 
@@ -87,7 +87,7 @@ exact mistake the Goal terminal-status rule made.
 
 Updated `docs/LIFEOS_SPEC.md` §5.1 (open question → resolved) and §13
 (same), and added a "Resolved" addendum to
-`REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` §11.
+`R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` §11.
 
 ---
 
@@ -397,7 +397,7 @@ again against the new module.
 New:
 - `src-tauri/migrations/V4__create_milestones.sql`
 - `src-tauri/src/services/storage/milestone_repo.rs`
-- `docs/reports/REPORT_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` (this
+- `docs/reports/R011_M2_MILESTONE_VERTICAL_SLICE_2026-09-17.md` (this
   file)
 
 Modified:
@@ -405,7 +405,7 @@ Modified:
   (§2/§3 above)
 - `docs/PROJECT_STATE.md` — full Milestone implementation status (this
   update)
-- `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` —
+- `docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` —
   two addenda (correction note, resolved note), original text preserved
 - `src-tauri/src/domain/mod.rs` — `MilestoneId`, `MilestoneStatus`,
   `OrderIndex`/`ORDER_INDEX_MIN`, `Milestone`
@@ -457,7 +457,7 @@ probe (§16) and restored to its exact prior state before this run ends
 
 ## 20. Recommended next M2 slice
 
-**`Task`.** Same frozen order as `REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
+**`Task`.** Same frozen order as `R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
 already decided (§g of that report) — `Milestone` first (done, this
 report), `Task` next, then reassess. `Task`'s action set
 (`AddTask`/`UpdateTask`), patch semantics (`title: Option<String>`;

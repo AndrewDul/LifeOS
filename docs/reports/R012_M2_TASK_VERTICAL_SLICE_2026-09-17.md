@@ -1,4 +1,4 @@
-# REPORT — M2 Task Vertical Slice (2026-09-17)
+# R012 — M2 Task Vertical Slice (2026-09-17)
 
 Fifth real M2 domain entity, and the first entity with two independent,
 both-nullable parent references. Implements `AddTask`/`UpdateTask` end
@@ -17,7 +17,7 @@ UI, and any LLM integration all remain out of scope for this run.
 - M2: `Goal`, `Project`, `GoalRelation`, `Milestone` all implemented and
   proven (see the Goal/Project/GoalRelation/Milestone vertical-slice and
   hardening reports).
-- `REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` had already
+- `R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md` had already
   frozen `UpdateTask` (floor `EXPLICIT_ADD`) and Task's ownership/FK/
   delete/creation-default policy ahead of implementation.
 - 148/148 automated tests passing. Local checkpoint `05f02db`. Clean
@@ -253,7 +253,7 @@ bypasses (`req_t43`/`req_t44`, §14).
 > report's own claim was stronger than the implementation, not that
 > invalid data could reach the database. Fixed in the dedicated
 > hardening pass immediately following this report - see
-> `REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` for the
+> `R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` for the
 > full before/after and new test evidence (`req_tpv_a` through
 > `req_tpv_f`). Both checks now always run when both parents are
 > supplied, and both errors are returned together in stable
@@ -404,7 +404,7 @@ temporary `services::storage::task_repo::get_task` reference added to
 New:
 - `src-tauri/migrations/V5__create_tasks.sql`
 - `src-tauri/src/services/storage/task_repo.rs`
-- `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md` (this file)
+- `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md` (this file)
 
 Modified:
 - `docs/PROJECT_STATE.md` — full Task implementation status

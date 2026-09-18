@@ -1,4 +1,4 @@
-# REPORT — M2 Project Child Action Freeze
+# R010 — M2 Project Child Action Freeze
 
 **Date:** 2026-09-17
 **Scope:** Architecture / action-set clarification only. **Zero source-
@@ -412,7 +412,7 @@ done, not assumed now.
 ## 14. Files changed
 
 **New:**
-- `docs/reports/REPORT_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
+- `docs/reports/R010_M2_PROJECT_CHILD_ACTION_FREEZE_2026-09-17.md`
   (this report).
 
 **Modified (documentation only):**

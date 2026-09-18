@@ -1,4 +1,4 @@
-# M2 Architecture Freeze: LifeOS Core + Encrypted Local Storage
+# R003 — M2 Architecture Freeze: LifeOS Core + Encrypted Local Storage
 
 Date: 2026-09-17
 Scope: architecture design only. No implementation. No database created.
@@ -18,7 +18,7 @@ options considered, and the tradeoffs behind each decision.
 > visibility rules as originally written, and §E/§F's `ForgetMemory`
 > classification conflated it with ordinary soft-deletes. Both are
 > corrected in §E/§F/§G directly; see
-> `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the verified
+> `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` for the verified
 > proof of the corrected module boundary (a real compiler error was
 > captured, not just reasoned about) and for the storage-candidate
 > verification (§B below) that this same run's Phase B also required.
@@ -364,7 +364,7 @@ src-tauri/src/
 > report's Phase B) - SQLCipher, always the documented fallback below,
 > was substituted and is now **PROVEN** against every item in this
 > section's checklist, including the Windows Tauri release-build check.
-> See `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` for the full
+> See `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` for the full
 > evidence and `docs/LIFEOS_SPEC.md` §5 for the updated canonical
 > decision. The target design below is otherwise unchanged.
 

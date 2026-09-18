@@ -1,4 +1,4 @@
-# REPORT — M2 Task Parent-Validation Hardening (2026-09-17)
+# R013 — M2 Task Parent-Validation Hardening (2026-09-17)
 
 A small, focused correctness hardening pass on the M2 Task vertical
 slice (`ace5ab1`). Fixes a validation-order mismatch found during
@@ -191,11 +191,11 @@ single-failure case).
 - `src-tauri/src/services/tests.rs` — 6 new integration tests (`req_tpv_a`
   through `req_tpv_f`), inserted between the existing `req_t12` and
   `req_t13_14_to_21` tests.
-- `docs/reports/REPORT_M2_TASK_VERTICAL_SLICE_2026-09-17.md` — a
+- `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md` — a
   "Correction note" addendum added after §10, explaining the inaccuracy
   and pointing to this report; the original §10 text is preserved
   unchanged above the addendum, not silently rewritten.
-- `docs/reports/REPORT_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`
+- `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md`
   — this file.
 - `docs/PROJECT_STATE.md` — test count and Task-entity description
   updated to reflect the fix and the new test count.

@@ -1,8 +1,8 @@
-# REPORT — M2 Project Vertical Slice
+# R007 — M2 Project Vertical Slice
 
 **Date:** 2026-09-17
 **Scope:** Implement the second real M2 domain entity, `Project`, reusing
-the hardened `Goal` pattern exactly (`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`).
+the hardened `Goal` pattern exactly (`docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`).
 Explicitly **not** in scope this run: `GoalRelation`, `Milestone`, `Task`,
 `Calendar`, `Challenge`, Personal Knowledge/Fact/Memory, a `capability/`
 transport, M3 UI, Qwen, GPT/Luna.
@@ -16,8 +16,8 @@ storage proven and hardened; `Goal` vertical slice implemented and then
 hardened (atomic mutation+audit, typed `CoreError`, `FieldPatch`
 tri-state patch semantics, no invented terminal-status rule, direct
 action-layer unit tests, `Provenance::Inferred` proven end-to-end); 42
-tests passing. Full detail: `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
-`docs/reports/REPORT_M2_GOAL_HARDENING_2026-09-17.md`.
+tests passing. Full detail: `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`,
+`docs/reports/R006_M2_GOAL_HARDENING_2026-09-17.md`.
 
 Two pre-existing documentation inconsistencies were corrected **before**
 any implementation, per this run's explicit instruction:
@@ -443,7 +443,7 @@ All commands run from `D:\Dev\LiFeOS\src-tauri` unless noted, PowerShell,
 **New:**
 - `src-tauri/migrations/V2__create_projects.sql`
 - `src-tauri/src/services/storage/project_repo.rs`
-- `docs/reports/REPORT_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
+- `docs/reports/R007_M2_PROJECT_VERTICAL_SLICE_2026-09-17.md`
 
 **Modified:**
 - `src-tauri/src/domain/mod.rs` - added `ProjectId`, `Project`.

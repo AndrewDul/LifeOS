@@ -1,4 +1,4 @@
-# REPORT — M2 UpdateProject Implementation (2026-09-17)
+# R014 — M2 UpdateProject Implementation (2026-09-17)
 
 Implements `UpdateProject`, the last already-frozen, shovel-ready action
 on an existing M2 core entity — closing the Project action-set gap
@@ -271,7 +271,7 @@ completely unaffected by either operation — `Project.goal_id` and
 New:
 - `src-tauri/migrations/V6__widen_project_audit_log_action_types.sql`
   (unplanned, added after user authorization — see §3a)
-- `docs/reports/REPORT_M2_UPDATE_PROJECT_2026-09-17.md` (this file)
+- `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` (this file)
 
 Modified:
 - `docs/PROJECT_STATE.md` — full UpdateProject implementation status

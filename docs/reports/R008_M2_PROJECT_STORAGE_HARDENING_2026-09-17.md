@@ -1,4 +1,4 @@
-# REPORT — M2 Project / Storage Integrity Hardening
+# R008 — M2 Project / Storage Integrity Hardening
 
 **Date:** 2026-09-17
 **Scope:** A focused hardening pass on the storage/type layer shared by
@@ -306,7 +306,7 @@ All commands run from `D:\Dev\LiFeOS\src-tauri` unless noted, PowerShell,
 **New:**
 - `src-tauri/src/domain/tests.rs` - 3 `LifecycleStatus` round-trip unit
   tests.
-- `docs/reports/REPORT_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` -
+- `docs/reports/R008_M2_PROJECT_STORAGE_HARDENING_2026-09-17.md` -
   this report.
 
 **Modified:**
@@ -416,6 +416,6 @@ distinct things:
    all.
 
 `GoalRelation` was always safe to start on this specific point - see
-`docs/reports/REPORT_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md` for
+`docs/reports/R009_M2_GOAL_RELATION_VERTICAL_SLICE_2026-09-17.md` for
 the vertical slice that implements it against the frozen enum exactly
 as listed above.

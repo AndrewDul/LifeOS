@@ -4,7 +4,7 @@
 //! Matches `LIFEOS_SPEC.md` §5's target design: a random 256-bit master
 //! key, generated once, stored via the OS credential store, never
 //! logged, never written to plaintext config. Proven functionally in
-//! the storage spike (`docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md`
+//! the storage spike (`docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md`
 //! requirement 10) - this module gives it the real, stable identity
 //! LifeOS itself will use, in place of the spike's throwaway naming.
 

@@ -7,9 +7,9 @@
 //! or future capability layer. Every function here is additionally
 //! `pub(super)` (visible only to `services/mod.rs` itself) as defense
 //! in depth. Verified for real, not just claimed - see
-//! `docs/reports/REPORT_M2_STORAGE_SPIKE_2026-09-17.md` (original
+//! `docs/reports/R004_M2_STORAGE_SPIKE_2026-09-17.md` (original
 //! compiler-error proof) and
-//! `docs/reports/REPORT_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
+//! `docs/reports/R005_M2_GOAL_VERTICAL_SLICE_2026-09-17.md`
 //! (re-verified after this restructuring).
 //!
 //! `open_encrypted`/`verify_key`/`rekey`/`integrity_check` are generic
