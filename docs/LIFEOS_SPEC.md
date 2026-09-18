@@ -35,7 +35,15 @@ report). The rest of the M2 domain model (Calendar, `RecurringRule`,
 Personal Knowledge, Goal Intelligence *reasoning* over the graph
 GoalRelation now makes available) is still in progress - not
 implemented yet; the frozen v0.1 action set on existing entities is now
-fully implemented.
+fully implemented. **(2026-09-18)** A dedicated M2 Storage and Audit
+Safety Hardening pass (R015) closed two safety gaps without changing
+any product/action semantics: the production master-key lifecycle now
+follows a canonical four-state DB/key matrix (an existing database with
+a missing credential fails safely instead of silently generating a
+replacement key), and every mandatory audit `previous_snapshot` across
+all five update actions can no longer silently disappear on a
+serialization failure. See `PROJECT_STATE.md` §4m and
+`docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -376,7 +384,12 @@ OS-native key storage.
   password/recovery-key-wrapped portable backup key is a target design
   for later (not built at M2) — the backup format must not preclude it.
   No plaintext secrets (keys, sensitive field values) may ever appear in
-  logs.
+  logs. **Lifecycle hardened 2026-09-18** (M2 Storage and Audit Safety
+  Hardening, R015): "created on first run" is now precisely a
+  four-state DB/key matrix, not a blind "generate if the credential is
+  missing" rule - an existing database with a missing credential fails
+  safely with a typed recovery-required error rather than silently
+  generating a replacement key. See `PROJECT_STATE.md` §4m for detail.
 - **Driver/migrations**: `rusqlite` 0.37.0 (pinned — `refinery-core`
   0.9.0's `rusqlite` feature caps at `<=0.37`, confirmed via a real
   dependency-resolution failure against the latest 0.40.2) + `refinery`

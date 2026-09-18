@@ -5,19 +5,25 @@ Current engineering truth. Read this first, before `LIFEOS_SPEC.md` or
 whenever project state actually changes (`CLAUDE.md`, Documentation
 policy) — not only as an end-of-run formality.
 
-Last updated: 2026-09-17 (M2 UpdateProject implementation — the last
-already-frozen, shovel-ready action on an existing core entity:
-`title`/`description`/`status`/`priority`/`goal_id` now all have a
-working update path, floor `IMPORTANT_CHANGE`, `progress` remains
-exclusively `UpdateProgress`'s. Required an unplanned V6 migration
-(`project_audit_log.action_type`'s CHECK constraint didn't allow
-`'UpdateProject'` - flagged to the user, who authorized the minimal
-fix) - see the dedicated report §3a. Closes the Project action-set gap
-both in design and in code. On top of the same day's Goal vertical
-slice/storage hardening, Goal hardening pass, Project vertical slice,
-Project/storage integrity hardening, GoalRelation vertical slice,
-Project Child Action Freeze pass, Milestone vertical slice, Task
-vertical slice, and Task parent-validation hardening).
+Last updated: 2026-09-18 (M2 Storage and Audit Safety Hardening, R015 -
+a dedicated safety-infrastructure pass, **not** a new entity/action.
+Closes two known risks found by direct code inspection: (1) the
+production master-key lifecycle could silently generate a replacement
+key for an existing, now-undecryptable database - replaced with a
+canonical four-state DB/key matrix and a typed
+`MasterKeyMissingForExistingDatabase` recovery-required error, plus
+safe orphan-credential cleanup; (2) every mandatory audit
+`previous_snapshot` used `serde_json::to_string(&existing).ok()`,
+silently able to turn a serialization failure into a missing audit
+record - replaced with a `serialize_required_snapshot` helper that
+returns a typed `CoreError` and guarantees zero mutation on failure,
+applied to all five update actions (`UpdateGoal`/`UpdateProject`/
+`UpdateProgress`/`UpdateMilestone`/`UpdateTask`). See §4m. On top of
+2026-09-17's Goal vertical slice/storage hardening, Goal hardening
+pass, Project vertical slice, Project/storage integrity hardening,
+GoalRelation vertical slice, Project Child Action Freeze pass,
+Milestone vertical slice, Task vertical slice, Task parent-validation
+hardening, and UpdateProject implementation).
 
 ---
 
@@ -27,7 +33,7 @@ vertical slice, and Task parent-validation hardening).
 |---|---|
 | M0 — Environment ready | **DONE** (§5) |
 | M1 — Visual shell | **ACCEPTED BY USER on 2026-09-17** (§3) |
-| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); rest of domain model not started |
+| M2 — LifeOS Core + encrypted storage | Architecture frozen; storage PROVEN + hardened; **Goal, Project, GoalRelation, Milestone, and Task all implemented; the Project action-set gap is now fully closed (`UpdateProject` implemented)** 2026-09-17 (§4); **master-key lifecycle + mandatory audit-snapshot safety hardened** 2026-09-18 (§4m); rest of domain model not started |
 | M3-M10 | Not started |
 
 **M1 is closed** — unchanged, not touched this run.
@@ -148,7 +154,7 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-233 automated tests prove all of this (9 storage-spike regression, 17
+250 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
@@ -158,12 +164,19 @@ numbered requirements, 17 direct Milestone/`AddMilestone`/
 `UpdateMilestone` action-layer unit, 3 direct `MilestoneStatus` unit, 28
 Task integration covering 52 numbered requirements, 15 direct
 Task/`AddTask`/`UpdateTask` action-layer unit, 3 direct `TaskStatus`
-unit, 6 Task parent-validation-hardening integration tests, 14 new
+unit, 6 Task parent-validation-hardening integration tests, 14
 UpdateProject integration functions covering 33 numbered requirements
-plus an unplanned V6 migration-compatibility proof, and 19 new direct
-`UpdateProject` action-layer unit tests). **Not wired into the running
-app yet** - no Tauri command layer exists, so the UI cannot create/see
-real goals, projects, relations, milestones, or tasks yet.
+plus an unplanned V6 migration-compatibility proof, 19 direct
+`UpdateProject` action-layer unit tests, and (R015, 2026-09-18) 17 new
+M2 Storage and Audit Safety Hardening tests - 10 key-lifecycle
+(`req_kl1`-`req_kl10`, all four DB/key-existence cases, orphan-
+credential cleanup, and a static scan confirming no test touches the
+real production credential identity), 1 production-bootstrap
+regression test, and 6 snapshot-deserialization regression tests
+(`req_snap1`-`req_snap6`, one per mandatory-snapshot update action).
+**Not wired into the running app yet** - no Tauri command layer
+exists, so the UI cannot create/see real goals, projects, relations,
+milestones, or tasks yet.
 
 Repository contents as of this run:
 
@@ -188,6 +201,7 @@ LiFeOS/
 │                    R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md
 │                    R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md
 │                    R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md
+│                    R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md
 ├── index.html, vite.config.ts, tsconfig*.json, package.json
 ├── public/, src/    (React frontend - M1, accepted, untouched)
 └── src-tauri/
@@ -237,20 +251,31 @@ LiFeOS/
     │   │                            Project, 5 LinkGoals, 17 AddMilestone/
     │   │                            UpdateMilestone, 15 AddTask/UpdateTask, 19 new
     │   │                            UpdateProject)
-    │   ├── security/mod.rs        OS-keyring master-key lifecycle
+    │   ├── security/mod.rs        OS-keyring master-key lifecycle - narrow
+    │   │                          pub(crate) primitives (get_existing_key/
+    │   │                          generate_and_store_key/delete_key, R015) compose into
+    │   │                          services::resolve_master_key's four-state DB/key
+    │   │                          matrix; the old DB-existence-blind
+    │   │                          get_or_create_production_master_key is removed
     │   └── services/
-    │       ├── mod.rs              bootstrap_production_db, create_goal/update_goal,
-    │       │                       create_project/update_project (new)/
-    │       │                       update_progress/get_project, link_goals/
-    │       │                       get_goal_relation/get_goal_relations_for_goal,
-    │       │                       add_milestone/update_milestone/get_milestone/
+    │       ├── mod.rs              bootstrap_production_db (R015: now
+    │       │                       bootstrap_db_with_key_lifecycle - resolve_master_key
+    │       │                       + orphan-credential cleanup on init failure),
+    │       │                       create_goal/update_goal, create_project/
+    │       │                       update_project/update_progress/get_project,
+    │       │                       link_goals/get_goal_relation/
+    │       │                       get_goal_relations_for_goal, add_milestone/
+    │       │                       update_milestone/get_milestone/
     │       │                       get_milestones_for_project, add_task/update_task/
     │       │                       get_task/get_tasks_for_project/get_tasks_for_goal
     │       │                       - all atomic (&mut Connection + rusqlite
-    │       │                       transaction) - capability API contract's names, no
+    │       │                       transaction); all 5 update_* actions' previous_snapshot
+    │       │                       now via serialize_required_snapshot (R015 - typed
+    │       │                       CoreError + zero mutation on failure, never a silent
+    │       │                       .ok()) - capability API contract's names, no
     │       │                       dedicated capability/module yet (LIFEOS_SPEC.md
     │       │                       §5.6/§10.1)
-    │       ├── tests.rs            130 integration test functions against a real
+    │       ├── tests.rs            147 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
     │       │                       storage integrity, 23 GoalRelation functions covering
     │       │                       26 numbered requirements, 24 Milestone functions
@@ -263,11 +288,17 @@ LiFeOS/
     │       │                       the temporary recurring_rule_id IS NULL CHECK), 2
     │       │                       raw hard-DELETE RESTRICT proofs for Project/Goal, 6
     │       │                       Task parent-validation-hardening functions
-    │       │                       (req_tpv_a-f), and 14 new UpdateProject functions
-    │       │                       (req_up*) covering 33 numbered requirements plus an
-    │       │                       unplanned V5-to-V6 migration-compatibility proof -
-    │       │                       incl. the progress-preservation regression test and
-    │       │                       the GoalRelation non-side-effect proof)
+    │       │                       (req_tpv_a-f), 14 UpdateProject functions (req_up*)
+    │       │                       covering 33 numbered requirements plus an unplanned
+    │       │                       V5-to-V6 migration-compatibility proof, and (R015,
+    │       │                       2026-09-18) 17 new functions: 10 key-lifecycle
+    │       │                       (req_kl1-req_kl10, all four DB/key cases + orphan-
+    │       │                       cleanup + static production-identity scan), 1
+    │       │                       production-bootstrap regression test, and 6
+    │       │                       snapshot-deserialization regression tests
+    │       │                       (req_snap1-req_snap6) - incl. the progress-
+    │       │                       preservation regression test and the GoalRelation
+    │       │                       non-side-effect proof)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
@@ -1023,6 +1054,104 @@ frozen by the M2 Project Child Action Freeze report) and now in code:
 Full evidence, exact SQL, and every test result:
 `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md`.
 
+### 4m. M2 Storage and Audit Safety Hardening (2026-09-18, R015, dedicated follow-up run)
+
+A focused safety-infrastructure pass - **not** a new domain entity or
+action, and no product/action semantics changed (confirmation floors,
+`FieldPatch` behavior, status transition policy, entity schemas,
+`Project.progress` ownership, `Task` ownership, `GoalRelation`
+semantics, `Milestone` ordering, and action names are all unchanged).
+Closes two known risks found by direct inspection of the actual
+current code (not assumed from any prior report):
+
+1. **Production master-key lifecycle hardened.** The previous
+   `security::get_or_create_production_master_key()` always generated
+   and stored a fresh key whenever the OS credential store had no
+   matching entry - with no awareness of whether the production
+   database file already existed. If a user's credential were ever
+   lost (OS reinstall, credential-store reset, migration to a new
+   machine) while their encrypted database remained on disk, this
+   would have silently generated an unusable replacement key and
+   opened the existing file under it - turning a recoverable situation
+   into a confusing one. **Removed entirely**, replaced with a
+   canonical, frozen four-state DB/key matrix:
+   - DB absent + credential absent (Case A, normal first run) → generate
+     + store a fresh 256-bit key, initialize the DB with it.
+   - DB exists + credential exists (Case B) → reuse the existing key,
+     never replace it.
+   - DB exists + credential absent (Case C, **critical**) → typed
+     `BootstrapError::MasterKeyMissingForExistingDatabase` recovery-
+     required error; no replacement key is ever generated or stored,
+     and the existing database file is never touched in any way.
+   - DB absent + credential exists (Case D) → reuse the existing
+     credential for the new DB; never replaced merely because the file
+     happens to be absent (intentional deletion, restore prep,
+     interrupted setup are all legitimate).
+   New narrow primitives in `security/mod.rs`
+   (`get_existing_key`/`generate_and_store_key`/`delete_key`, all
+   `pub(crate)`) replace the single opaque get-or-create call; the
+   state machine itself (`resolve_master_key`/
+   `bootstrap_db_with_key_lifecycle`, in `services/mod.rs`) tracks via
+   a `ResolvedMasterKey::{Reused, FreshlyGenerated}` enum whether *this
+   invocation* created the credential, so that if database
+   initialization subsequently fails, only a credential this same call
+   just created is cleaned up (best-effort, never masking the original
+   error) - a pre-existing credential is never touched by cleanup.
+   `services::production_db_path()` remains the single, uncompeting
+   database-existence check every part of this shares.
+2. **Mandatory audit `previous_snapshot` can no longer silently
+   disappear.** `serde_json::to_string(&existing).ok()` - previously
+   used at all five mandatory-audit update call sites
+   (`update_goal`/`update_project`/`update_progress`/
+   `update_milestone`/`update_task`, found by searching the whole
+   repository, not just the one call site R014 had flagged for
+   `UpdateProject`) - is replaced by a new
+   `serialize_required_snapshot::<T: Serialize>(&T) -> Result<String,
+   CoreError>` helper. A serialization failure now returns a typed
+   `CoreErrorKind::Internal` error with **zero mutation and zero audit
+   write** (it runs before the mutation transaction starts, same
+   position the old code already used) - never silently continuing
+   with `previous_snapshot = None`. `Create*` actions are unaffected -
+   they still legitimately pass `None` (no previous entity exists).
+3. **CoreError/logging secret-leak review performed, nothing needed
+   fixing.** Verified by direct inspection (not redesigned): no key
+   material or serialized personal snapshot content flows into any
+   `Display`/`Debug`/error-metadata path anywhere touched by this pass
+   - `KeyError`/`BootstrapError`/`CoreError` all derive their
+   diagnostic text only from the underlying driver's own safe error
+   text; `serialize_required_snapshot`'s error text is
+   `serde_json::Error`'s own structural-failure description, never the
+   serialized values.
+4. **17 new tests** (250 total, up from 233; all 233 prior tests
+   remain green, unmodified): 10 key-lifecycle tests (`req_kl1`-
+   `req_kl10`, one per required proof - all four DB/key cases, the
+   generated key is exactly the key that encrypts the DB, a
+   present-but-wrong key still fails normally with no replacement,
+   orphan-credential cleanup only for a freshly-created credential,
+   repeated reopen stability, and a static source scan confirming no
+   test touches the real production credential identity), 1 production
+   bootstrap regression test (first bootstrap creates the encrypted DB,
+   second bootstrap reopens the same DB with the same key across a real
+   close, no plaintext SQLite header), and 6 snapshot-deserialization
+   regression tests (one per mandatory-snapshot update action,
+   deserializing the stored `previous_snapshot` back into its real
+   domain struct and asserting full structural equality against the
+   captured pre-update state - stronger than the pre-existing
+   title-substring checks) plus a dedicated snapshot-serialization-
+   failure test using a test-only `AlwaysFailsToSerialize` type (no
+   production domain struct distorted). All tests use isolated
+   `tempfile` database paths and a distinct `"LifeOS-test"` keyring
+   service identity - never the real production database or
+   credential.
+5. **No schema migration** - `src-tauri/migrations/` untouched
+   (verified: zero diff), matching the pass's "no V7 unless genuinely
+   unavoidable" instruction. **No `services::storage` visibility
+   change** - the private module boundary is untouched, so no
+   illegal-access probe was needed this run.
+
+Full evidence, exact code, and every test result:
+`docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`.
+
 ### Next implementation step (M2)
 
 With `UpdateProject` implemented, every frozen, shovel-ready CRUD action
@@ -1106,9 +1235,10 @@ No live NeXa git repository accessible — unchanged, `RESEARCH_DECISIONS.md` §
   19. `feat: implement M2 Milestone vertical slice`
   20. `feat: implement M2 Task vertical slice`
   21. `fix: validate both Task parent references`
-  22. (this run) `feat: implement M2 UpdateProject action` — see this
-      run's report and chat reply for the exact hash.
-- Pushed to `origin/main` through commit 7. **Commits 8-22 were not
+  22. `feat: implement M2 UpdateProject action`
+  23. (this run) `fix: harden M2 key lifecycle and audit snapshots` —
+      see this run's report and chat reply for the exact hash.
+- Pushed to `origin/main` through commit 7. **Commits 8-23 were not
   pushed** — not authorized in any of those runs' instructions.
 
 ### Note on an incident in an earlier run (kept for reference)
@@ -1124,7 +1254,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 233 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 250 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -1165,10 +1295,21 @@ status transitions in sequence), `goal_id` Set/Clear proven to never
 touch `Goal`/`GoalRelation`, atomic rollback/audit proven, and a
 V5-to-V6 migration-compatibility check for the unplanned audit-CHECK
 widening (14 integration test functions covering 33 numbered
-requirements + 19 direct action-layer unit tests, §4l) - all passing
-against temp databases, never the user's real data. **Test count rose
-from 200 to 233 this run** (+33: 14 integration functions, 19 direct
-action-layer unit) - all 200 prior tests remain green, unmodified.
+requirements + 19 direct action-layer unit tests, §4l), and (as of
+2026-09-18, R015, §4m) a hardened production master-key lifecycle -
+all four DB/key existence cases proven deterministically, including
+that an existing database with a missing credential now fails safely
+with a typed recovery-required error instead of silently generating a
+replacement key, and that orphan-credential cleanup only ever touches
+a credential the same failed bootstrap invocation just created - plus
+every mandatory-audit update action's `previous_snapshot` now
+provably cannot silently disappear on a serialization failure (17 new
+tests: 10 key-lifecycle + 1 bootstrap regression + 6 snapshot-
+deserialization regression) - all passing against temp databases and
+an isolated test credential identity, never the user's real data or
+real credential. **Test count rose from 200 to 233 to 250 across this
+day's runs** (233→250 this run, +17) - all 233 prior tests remain
+green, unmodified.
 
 ---
 
@@ -1177,12 +1318,15 @@ action-layer unit) - all 200 prior tests remain green, unmodified.
 See §4l's "Next implementation step" for the exact reasoning (this
 duplicates it so it is visible without scrolling past the M2 detail
 section). With Goal/Project/GoalRelation/Milestone/Task all
-implemented, and `UpdateProject` now closing out the last frozen,
-shovel-ready action, what remains needs its own planning/freeze pass
-first: **`RecurringRule`** (deliberately deferred, §4j) or the
-**Personal Knowledge Layer** (the next real net-new entity family). A
-direct implementation slice is not recommended for either without that
-planning pass first, the way Milestone/Task both got one.
+implemented, `UpdateProject` closing out the last frozen, shovel-ready
+action, and (2026-09-18, R015, §4m) the master-key lifecycle and
+mandatory audit-snapshot safety gaps both closed, what remains needs
+its own planning/freeze pass first: **`RecurringRule`** (deliberately
+deferred, §4j) or the **Personal Knowledge Layer** (the next real
+net-new entity family). A direct implementation slice is not
+recommended for either without that planning pass first, the way
+Milestone/Task both got one. M2 is safe to proceed into that next
+planning/freeze decision - see R015 §18.
 
 ---
 
@@ -1244,7 +1388,29 @@ planning pass first, the way Milestone/Task both got one.
   capability layer must format `CoreError` for any external caller via
   `Display`/`kind()`, never `{:?}`, or the "no arbitrary database string
   as the authoritative error" guarantee leaks back in through the side
-  door.
+  door. **Reviewed again 2026-09-18 (R015 §14): confirmed no key
+  material or serialized personal snapshot content can ever reach that
+  `diagnostic` string either** - this caveat about `{:?}` vs. `Display`
+  remains the only reason to stay disciplined about it, not a sign
+  something is currently leaking.
+- **RESOLVED (2026-09-18, M2 Storage and Audit Safety Hardening, R015
+  §4m above): the production master-key lifecycle could silently
+  generate a replacement key for an existing, now-undecryptable
+  database.** `security::get_or_create_production_master_key()` (the
+  unsafe, DB-existence-blind helper) is removed; replaced by a frozen
+  four-state DB/key matrix (`services::resolve_master_key`) - an
+  existing database with a missing credential now fails safely with a
+  typed `BootstrapError::MasterKeyMissingForExistingDatabase` recovery-
+  required error, never a silent replacement key.
+- **RESOLVED (2026-09-18, M2 Storage and Audit Safety Hardening, R015
+  §4m above): every mandatory audit `previous_snapshot` used
+  `serde_json::to_string(&existing).ok()`, which could have silently
+  turned a serialization failure into a missing audit record.**
+  Replaced with `serialize_required_snapshot`, which returns a typed
+  `CoreError` and guarantees zero mutation on failure, applied to all
+  five update actions (`UpdateGoal`/`UpdateProject`/`UpdateProgress`/
+  `UpdateMilestone`/`UpdateTask`) - not just the one call site R014 had
+  originally flagged for `UpdateProject`.
 - **`PRAGMA foreign_keys = ON` enforcement depends on every connection
   going through `storage::open_encrypted`** — true today (production
   bootstrap, version-targeted migration tests, and the storage spike all
@@ -1313,5 +1479,6 @@ summaries - open the file for full reasoning.
 | R012 | M2 Task Vertical Slice | `docs/reports/R012_M2_TASK_VERTICAL_SLICE_2026-09-17.md` |
 | R013 | M2 Task Parent-Validation Hardening | `docs/reports/R013_M2_TASK_PARENT_VALIDATION_HARDENING_2026-09-17.md` |
 | R014 | M2 UpdateProject Implementation | `docs/reports/R014_M2_UPDATE_PROJECT_IMPLEMENTATION_2026-09-17.md` |
+| R015 | M2 Storage and Audit Safety Hardening | `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md` |
 
-Next report allocated will be **R015**.
+Next report allocated will be **R016**.

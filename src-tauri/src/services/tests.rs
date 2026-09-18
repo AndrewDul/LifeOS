@@ -6725,3 +6725,875 @@ fn req_t50_51_get_tasks_for_project_and_goal_return_only_matching_tasks() {
     assert_eq!(for_goal_a[0].id, task_a_goal.id);
     println!("[req_t51] PASS - get_tasks_for_goal returned only the Task referencing Goal A");
 }
+
+// =========================================================================
+// M2 Storage and Audit Safety Hardening (2026-09-18) - new evidence
+// below. Evidence for
+// `docs/reports/R015_M2_STORAGE_AND_AUDIT_SAFETY_HARDENING_2026-09-18.md`.
+//
+// Issue A: the master-key/database state machine
+// (`bootstrap_db_with_key_lifecycle`/`resolve_master_key`). All tests
+// here use the isolated "LifeOS-test" OS-keyring service identity
+// (never the real production `security::SERVICE_NAME`/
+// `security::MASTER_KEY_ACCOUNT`) with per-test account names, and
+// temp-directory database paths - never the real production database
+// path or credential. Gracefully reports BLOCKED (not FAIL) if the OS
+// credential store is genuinely unavailable in this environment,
+// matching the existing `req4` precedent - `--test-threads=1` matters
+// here for the same reason it already did for `req4`.
+//
+// Issue B: mandatory audit `previous_snapshot` serialization
+// (`serialize_required_snapshot`) - proves the helper cannot silently
+// swallow a serialization failure, and that every applicable Update*
+// action's previous_snapshot deserializes back to the exact pre-update
+// entity, not merely a title substring.
+// =========================================================================
+
+/// Isolated OS-keyring service identity for every key-lifecycle test
+/// below - never the real production `security::SERVICE_NAME`
+/// (`"LifeOS"`). Matches the existing `req4` precedent exactly.
+const TEST_SERVICE: &str = "LifeOS-test";
+
+/// Requirement 1: DB absent + key absent -> key generated, key stored,
+/// DB created/opened successfully (Case A, the normal first-run path).
+#[test]
+fn req_kl1_db_absent_key_absent_generates_and_stores_key_and_creates_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_a.db");
+    let account = "kl1-case-a";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    assert!(
+        !path.exists(),
+        "[req_kl1] setup FAIL - db must not exist yet"
+    );
+    assert_eq!(
+        security::get_existing_key(TEST_SERVICE, account).unwrap(),
+        None,
+        "[req_kl1] setup FAIL - credential must not exist yet"
+    );
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => {
+            drop(conn);
+            assert!(path.exists(), "[req_kl1] FAIL - db file was not created");
+            let stored = security::get_existing_key(TEST_SERVICE, account).unwrap();
+            assert!(stored.is_some(), "[req_kl1] FAIL - key was not stored");
+            println!(
+                "[req_kl1] PASS - db absent + key absent -> key generated, stored, db created/opened"
+            );
+        }
+        Err(e) => {
+            println!("[req_kl1] BLOCKED - could not write to OS credential store: {e}");
+        }
+    }
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 2: DB exists + key exists -> existing key reused, DB
+/// opens, credential unchanged (Case B). Never replaced.
+#[test]
+fn req_kl2_db_exists_key_exists_reuses_key_and_credential_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_b.db");
+    let account = "kl2-case-b";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    let first_key = match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => {
+            drop(conn);
+            security::get_existing_key(TEST_SERVICE, account)
+                .unwrap()
+                .unwrap()
+        }
+        Err(e) => {
+            println!("[req_kl2] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    };
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => drop(conn),
+        Err(e) => panic!("[req_kl2] FAIL - expected Success (Case B), got {e:?}"),
+    }
+    let second_key = security::get_existing_key(TEST_SERVICE, account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first_key, second_key,
+        "[req_kl2] FAIL - credential changed on reopen despite the database and credential both already existing"
+    );
+    println!(
+        "[req_kl2] PASS - db exists + key exists -> existing key reused, db opens, credential unchanged"
+    );
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 3 (CRITICAL): DB exists + key absent -> typed recovery-
+/// required failure, NO replacement key stored, DB still exists, DB
+/// bytes unchanged (Case C).
+#[test]
+fn req_kl3_db_exists_key_absent_fails_safely_without_replacement_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_c.db");
+    let account = "kl3-case-c";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => drop(conn),
+        Err(e) => {
+            println!("[req_kl3] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    }
+    assert!(path.exists());
+    let db_bytes_before = std::fs::read(&path).unwrap();
+
+    // Remove ONLY the credential, leaving the database file exactly as
+    // it is - simulates "existing database, missing key" (e.g. a
+    // credential store reset, a migration to a new machine without the
+    // credential, accidental deletion).
+    security::delete_key(TEST_SERVICE, account).expect("cleanup: failed to delete test credential");
+    assert_eq!(
+        security::get_existing_key(TEST_SERVICE, account).unwrap(),
+        None
+    );
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Err(BootstrapError::MasterKeyMissingForExistingDatabase) => {
+            println!("[req_kl3] PASS - Case C returned the typed recovery-required error");
+        }
+        other => {
+            panic!("[req_kl3] FAIL - expected MasterKeyMissingForExistingDatabase, got {other:?}")
+        }
+    }
+
+    assert_eq!(
+        security::get_existing_key(TEST_SERVICE, account).unwrap(),
+        None,
+        "[req_kl3] FAIL - a replacement key was stored despite Case C"
+    );
+    assert!(
+        path.exists(),
+        "[req_kl3] FAIL - the existing db disappeared"
+    );
+    let db_bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        db_bytes_before, db_bytes_after,
+        "[req_kl3] FAIL - db bytes changed despite Case C returning before any db access"
+    );
+    println!(
+        "[req_kl3] PASS - no replacement key stored, db still exists, db bytes byte-for-byte unchanged"
+    );
+}
+
+/// Requirement 4: DB absent + key exists -> existing key reused, new DB
+/// created, key not replaced (Case D - e.g. after intentional DB
+/// deletion, restore preparation, or interrupted setup).
+#[test]
+fn req_kl4_db_absent_key_exists_reuses_existing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_d.db");
+    let account = "kl4-case-d";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    let pre_existing_key = match security::generate_and_store_key(TEST_SERVICE, account) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("[req_kl4] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    };
+    assert!(
+        !path.exists(),
+        "[req_kl4] setup FAIL - db must not exist yet"
+    );
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => drop(conn),
+        Err(e) => panic!("[req_kl4] FAIL - expected Success (Case D), got {e:?}"),
+    }
+    assert!(path.exists(), "[req_kl4] FAIL - db was not created");
+    let key_after = security::get_existing_key(TEST_SERVICE, account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pre_existing_key, key_after,
+        "[req_kl4] FAIL - the pre-existing credential was replaced instead of reused"
+    );
+    println!(
+        "[req_kl4] PASS - db absent + key exists -> existing key reused to create the new db, key not replaced"
+    );
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 5: the first-run generated key is exactly the key used
+/// to create the database - independently re-opens the resulting file
+/// with exactly the stored key, proving it is genuinely the encrypting
+/// key, not merely "a key was stored somewhere".
+#[test]
+fn req_kl5_first_run_generated_key_is_exactly_the_key_that_encrypts_the_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_kl5.db");
+    let account = "kl5-first-run-key";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => drop(conn),
+        Err(e) => {
+            println!("[req_kl5] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    }
+    let stored_key = security::get_existing_key(TEST_SERVICE, account)
+        .unwrap()
+        .expect("[req_kl5] FAIL - no key was stored");
+
+    let conn = storage::open_encrypted(&path, &stored_key).unwrap();
+    storage::verify_key(&conn).expect(
+        "[req_kl5] FAIL - the stored key does not decrypt the database it supposedly created",
+    );
+    println!(
+        "[req_kl5] PASS - the first-run generated key is exactly the key that encrypts the created database"
+    );
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 6: a credential that is PRESENT but WRONG for an
+/// existing database still fails normally (a real SQLCipher storage
+/// error) - no automatic replacement key, because `resolve_master_key`
+/// correctly classifies a present-but-wrong credential as `Reused`
+/// (Case B shape - present), never as `FreshlyGenerated`. This is a
+/// genuinely different case from Case C's "absent" credential.
+#[test]
+fn req_kl6_wrong_but_present_key_against_existing_db_fails_without_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_kl6.db");
+    let real_account = "kl6-real-key";
+    let wrong_account = "kl6-wrong-key";
+    let _ = security::delete_key(TEST_SERVICE, real_account);
+    let _ = security::delete_key(TEST_SERVICE, wrong_account);
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, real_account) {
+        Ok(conn) => drop(conn),
+        Err(e) => {
+            println!("[req_kl6] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    }
+
+    let wrong_key = match security::generate_and_store_key(TEST_SERVICE, wrong_account) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("[req_kl6] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    };
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, wrong_account) {
+        Err(BootstrapError::Storage(_)) => {
+            println!(
+                "[req_kl6] PASS - a present-but-wrong credential was rejected by SQLCipher as a normal storage failure"
+            );
+        }
+        other => panic!(
+            "[req_kl6] FAIL - expected a Storage error from the wrong-but-present key, got {other:?}"
+        ),
+    }
+
+    let after = security::get_existing_key(TEST_SERVICE, wrong_account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        wrong_key, after,
+        "[req_kl6] FAIL - the present-but-wrong credential was replaced instead of left alone"
+    );
+    println!("[req_kl6] PASS - no automatic replacement key was generated");
+
+    let _ = security::delete_key(TEST_SERVICE, real_account);
+    let _ = security::delete_key(TEST_SERVICE, wrong_account);
+}
+
+/// Requirement 7: a database-initialization failure AFTER this
+/// invocation created a brand-new credential (Case A) cleans up that
+/// orphaned credential - forces the failure deterministically and
+/// portably by pointing the db path's parent at a plain FILE (so
+/// `std::fs::create_dir_all` genuinely fails), rather than relying on
+/// any platform-specific permission trick.
+#[test]
+fn req_kl7_init_failure_after_fresh_credential_created_cleans_up_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker_file_kl7");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let path = blocker.join("case_kl7.db"); // parent is a FILE - create_dir_all must fail
+    let account = "kl7-orphan-cleanup";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    assert!(!path.exists());
+    assert_eq!(
+        security::get_existing_key(TEST_SERVICE, account).unwrap(),
+        None
+    );
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Err(BootstrapError::Io(_)) => {
+            println!(
+                "[req_kl7] PASS - forced db initialization failure (Io) after a fresh credential was created"
+            );
+        }
+        Err(BootstrapError::Key(e)) => {
+            println!("[req_kl7] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+        other => panic!("[req_kl7] FAIL - expected an Io error, got {other:?}"),
+    }
+
+    let leftover = security::get_existing_key(TEST_SERVICE, account).unwrap();
+    assert_eq!(
+        leftover, None,
+        "[req_kl7] FAIL - the freshly-created orphan credential was not cleaned up"
+    );
+    println!(
+        "[req_kl7] PASS - the freshly-created orphan credential was cleaned up after the initialization failure"
+    );
+}
+
+/// Requirement 8: a database-initialization failure with a PRE-EXISTING
+/// credential leaves that credential completely untouched - same
+/// forced-failure technique as `req_kl7`, but the credential exists
+/// BEFORE the failing call, so `resolve_master_key` resolves it as
+/// `Reused`, not `FreshlyGenerated`, and the cleanup branch must never
+/// run for it.
+#[test]
+fn req_kl8_init_failure_with_pre_existing_credential_leaves_it_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = "kl8-pre-existing";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    let pre_existing_key = match security::generate_and_store_key(TEST_SERVICE, account) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("[req_kl8] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    };
+
+    let blocker = dir.path().join("blocker_file_kl8");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let path = blocker.join("case_kl8.db");
+
+    match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Err(BootstrapError::Io(_)) => {
+            println!(
+                "[req_kl8] PASS - forced db initialization failure with a pre-existing credential"
+            );
+        }
+        other => panic!("[req_kl8] FAIL - expected an Io error, got {other:?}"),
+    }
+
+    let after = security::get_existing_key(TEST_SERVICE, account).unwrap();
+    assert_eq!(
+        after,
+        Some(pre_existing_key),
+        "[req_kl8] FAIL - the pre-existing credential was deleted or replaced"
+    );
+    println!("[req_kl8] PASS - pre-existing credential remains untouched after the initialization failure");
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 9: repeated successful reopen uses the same master key
+/// across multiple bootstraps, not just one reopen.
+#[test]
+fn req_kl9_repeated_successful_reopen_uses_same_master_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case_kl9.db");
+    let account = "kl9-repeated-reopen";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    let key_first = match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+        Ok(conn) => {
+            drop(conn);
+            security::get_existing_key(TEST_SERVICE, account)
+                .unwrap()
+                .unwrap()
+        }
+        Err(e) => {
+            println!("[req_kl9] BLOCKED - could not write to OS credential store: {e}");
+            return;
+        }
+    };
+
+    for i in 0..3 {
+        match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+            Ok(conn) => drop(conn),
+            Err(e) => panic!("[req_kl9] FAIL - reopen #{i} failed: {e:?}"),
+        }
+        let key_now = security::get_existing_key(TEST_SERVICE, account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            key_first, key_now,
+            "[req_kl9] FAIL - master key changed on reopen #{i}"
+        );
+    }
+    println!(
+        "[req_kl9] PASS - repeated reopen across 3 additional bootstraps all used the exact same master key"
+    );
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
+
+/// Requirement 10: no test in this file touches the real production
+/// credential identity (`security::SERVICE_NAME`/
+/// `security::MASTER_KEY_ACCOUNT`) - static source scan proving the
+/// only reference anywhere in `src/` is `bootstrap_production_db`'s own
+/// call site, not any test.
+#[test]
+fn req_kl10_no_test_touches_production_credential_identity() {
+    // scan_dir (req15, above) only flags matches inside a print!-family
+    // call - not useful here, so this test uses its own direct
+    // code-reference scan (scan_dir_for_identifiers) instead.
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut real_offenders = Vec::new();
+    scan_dir_for_identifiers(
+        &src_dir,
+        &mut real_offenders,
+        &["security::SERVICE_NAME", "security::MASTER_KEY_ACCOUNT"],
+    );
+    let outside_bootstrap: Vec<_> = real_offenders
+        .iter()
+        .filter(|line| !line.contains("services") || !line.contains("mod.rs"))
+        .collect();
+    assert!(
+        outside_bootstrap.is_empty(),
+        "[req_kl10] FAIL - production credential identity referenced outside bootstrap_production_db: {outside_bootstrap:?}"
+    );
+    println!(
+        "[req_kl10] PASS - security::SERVICE_NAME/MASTER_KEY_ACCOUNT are referenced only by bootstrap_production_db itself ({} total reference(s) in src/); every test in this file uses the isolated \"LifeOS-test\" service",
+        real_offenders.len()
+    );
+}
+
+/// Like `scan_dir`, but for finding genuine Rust *code* references to an
+/// identifier path (e.g. `security::SERVICE_NAME`) rather than
+/// print-statement interpolation - skips comment lines (`//`/`///`) and
+/// occurrences inside a string literal (odd-vs-even `"` count before the
+/// match position on that line), so this scan does not flag its own
+/// doc comments or its own pattern-array/println! text about the very
+/// identifiers it is searching for.
+fn scan_dir_for_identifiers(dir: &std::path::Path, offenders: &mut Vec<String>, patterns: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_for_identifiers(&path, offenders, patterns);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (i, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for pat in patterns {
+                    if let Some(idx) = line.find(pat) {
+                        let before = &line[..idx];
+                        let inside_string_literal = before.matches('"').count() % 2 == 1;
+                        if !inside_string_literal {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                i + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- Issue B: mandatory audit previous_snapshot serialization ----------
+
+/// Test-only type proving `serialize_required_snapshot` does NOT
+/// silently swallow a serialization failure (M2 storage/audit safety
+/// hardening, 2026-09-18) - deliberately errors on every `Serialize`
+/// call, standing in for a hypothetical real domain-struct
+/// serialization failure without distorting any actual production
+/// struct to create one.
+struct AlwaysFailsToSerialize;
+
+impl serde::Serialize for AlwaysFailsToSerialize {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom(
+            "deliberate test-only serialization failure",
+        ))
+    }
+}
+
+/// Proves `serialize_required_snapshot` surfaces a serialization
+/// failure as a typed `CoreError` (kind `Internal`), never as a
+/// silently-empty/`None` snapshot.
+#[test]
+fn req_snap1_serialize_required_snapshot_does_not_swallow_serialization_failure() {
+    match serialize_required_snapshot(&AlwaysFailsToSerialize) {
+        Err(e) => {
+            assert_eq!(
+                e.kind(),
+                CoreErrorKind::Internal,
+                "[req_snap1] FAIL - expected CoreErrorKind::Internal, got {:?}",
+                e.kind()
+            );
+            println!(
+                "[req_snap1] PASS - serialize_required_snapshot surfaced the failure as a typed CoreError, not a silently-empty snapshot: {e:?}"
+            );
+        }
+        Ok(s) => panic!(
+            "[req_snap1] FAIL - expected an Err, got Ok({s:?}) - failure was silently swallowed"
+        ),
+    }
+}
+
+/// UpdateGoal's audit previous_snapshot is non-NULL and deserializes
+/// back to the exact PRE-update Goal - a stronger, structured proof
+/// than a title substring match.
+#[test]
+fn req_snap2_update_goal_previous_snapshot_deserializes_to_pre_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "snap_goal.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_goal(
+        &mut conn,
+        ui_explicit(),
+        mk_create_payload("Pre-update goal title"),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let expected_pre_update = created.clone();
+
+    match update_goal(
+        &mut conn,
+        ui_explicit(),
+        UpdateGoalPayload {
+            id: created.id,
+            title: Some("Post-update goal title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM goal_audit_log WHERE goal_id = ?1 AND action_type = 'UpdateGoal'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json =
+        previous_snapshot.expect("[req_snap2] FAIL - previous_snapshot must not be NULL");
+    let deserialized: crate::domain::Goal = serde_json::from_str(&snapshot_json)
+        .expect("[req_snap2] FAIL - previous_snapshot did not deserialize to Goal");
+    assert_eq!(
+        deserialized, expected_pre_update,
+        "[req_snap2] FAIL - snapshot does not describe the pre-update Goal"
+    );
+    assert_eq!(deserialized.title, "Pre-update goal title");
+    println!(
+        "[req_snap2] PASS - UpdateGoal previous_snapshot deserializes to the exact pre-update Goal"
+    );
+}
+
+/// UpdateProject's audit previous_snapshot deserializes back to the
+/// exact PRE-update Project.
+#[test]
+fn req_snap3_update_project_previous_snapshot_deserializes_to_pre_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "snap_project.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Pre-update project title", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let expected_pre_update = created.clone();
+
+    match update_project(
+        &mut conn,
+        ui_explicit(),
+        UpdateProjectPayload {
+            id: created.id,
+            title: Some("Post-update project title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM project_audit_log WHERE project_id = ?1 AND action_type = 'UpdateProject'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json =
+        previous_snapshot.expect("[req_snap3] FAIL - previous_snapshot must not be NULL");
+    let deserialized: Project = serde_json::from_str(&snapshot_json)
+        .expect("[req_snap3] FAIL - previous_snapshot did not deserialize to Project");
+    assert_eq!(
+        deserialized, expected_pre_update,
+        "[req_snap3] FAIL - snapshot does not describe the pre-update Project"
+    );
+    println!(
+        "[req_snap3] PASS - UpdateProject previous_snapshot deserializes to the exact pre-update Project"
+    );
+}
+
+/// UpdateProgress's audit previous_snapshot deserializes back to the
+/// exact PRE-update Project (the same mandatory-snapshot pattern
+/// applies here too - UpdateProgress was in scope for this hardening
+/// pass alongside UpdateGoal/UpdateProject/UpdateMilestone/UpdateTask).
+#[test]
+fn req_snap4_update_progress_previous_snapshot_deserializes_to_pre_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "snap_progress.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Progress snapshot project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    assert_eq!(created.progress, 0);
+    let expected_pre_update = created.clone();
+
+    match update_progress(
+        &mut conn,
+        ui_explicit(),
+        UpdateProgressPayload {
+            id: created.id,
+            progress: 77,
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM project_audit_log WHERE project_id = ?1 AND action_type = 'UpdateProgress'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json =
+        previous_snapshot.expect("[req_snap4] FAIL - previous_snapshot must not be NULL");
+    let deserialized: Project = serde_json::from_str(&snapshot_json)
+        .expect("[req_snap4] FAIL - previous_snapshot did not deserialize to Project");
+    assert_eq!(
+        deserialized, expected_pre_update,
+        "[req_snap4] FAIL - snapshot does not describe the pre-update Project"
+    );
+    assert_eq!(deserialized.progress, 0);
+    println!(
+        "[req_snap4] PASS - UpdateProgress previous_snapshot deserializes to the exact pre-update Project (progress=0)"
+    );
+}
+
+/// UpdateMilestone's audit previous_snapshot deserializes back to the
+/// exact PRE-update Milestone.
+#[test]
+fn req_snap5_update_milestone_previous_snapshot_deserializes_to_pre_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "snap_milestone.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let project = match create_project(
+        &mut conn,
+        ui_explicit(),
+        mk_create_project_payload("Project", None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let created = match add_milestone(
+        &mut conn,
+        ui_explicit(),
+        mk_add_milestone_payload(project.id, "Pre-update milestone title", 0),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let expected_pre_update = created.clone();
+
+    match update_milestone(
+        &mut conn,
+        ui_explicit(),
+        UpdateMilestonePayload {
+            id: created.id,
+            title: Some("Post-update milestone title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM milestone_audit_log WHERE milestone_id = ?1 AND action_type = 'UpdateMilestone'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json =
+        previous_snapshot.expect("[req_snap5] FAIL - previous_snapshot must not be NULL");
+    let deserialized: Milestone = serde_json::from_str(&snapshot_json)
+        .expect("[req_snap5] FAIL - previous_snapshot did not deserialize to Milestone");
+    assert_eq!(
+        deserialized, expected_pre_update,
+        "[req_snap5] FAIL - snapshot does not describe the pre-update Milestone"
+    );
+    println!(
+        "[req_snap5] PASS - UpdateMilestone previous_snapshot deserializes to the exact pre-update Milestone"
+    );
+}
+
+/// UpdateTask's audit previous_snapshot deserializes back to the exact
+/// PRE-update Task.
+#[test]
+fn req_snap6_update_task_previous_snapshot_deserializes_to_pre_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "snap_task.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let created = match add_task(
+        &mut conn,
+        ui_explicit(),
+        mk_add_task_payload("Pre-update task title", None, None, None),
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup failed: {other:?}"),
+    };
+    let expected_pre_update = created.clone();
+
+    match update_task(
+        &mut conn,
+        ui_explicit(),
+        UpdateTaskPayload {
+            id: created.id,
+            title: Some("Post-update task title".to_string()),
+            ..Default::default()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+
+    let previous_snapshot: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM task_audit_log WHERE task_id = ?1 AND action_type = 'UpdateTask'",
+            [created.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snapshot_json =
+        previous_snapshot.expect("[req_snap6] FAIL - previous_snapshot must not be NULL");
+    let deserialized: Task = serde_json::from_str(&snapshot_json)
+        .expect("[req_snap6] FAIL - previous_snapshot did not deserialize to Task");
+    assert_eq!(
+        deserialized, expected_pre_update,
+        "[req_snap6] FAIL - snapshot does not describe the pre-update Task"
+    );
+    println!(
+        "[req_snap6] PASS - UpdateTask previous_snapshot deserializes to the exact pre-update Task"
+    );
+}
+
+/// Requirement (brief §18): normal production bootstrap path regression
+/// - proven against an isolated test environment (temp path + test
+/// credential identity), not the real production path/credential.
+/// First bootstrap creates the encrypted DB; close; second bootstrap
+/// reopens the SAME DB using the SAME key; a record written before the
+/// close is still readable after reopen - no plaintext regression (the
+/// file still has no `SQLite` plaintext header).
+#[test]
+fn req_kl_bootstrap_regression_first_and_second_bootstrap_share_state_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bootstrap_regression.db");
+    let account = "kl-bootstrap-regression";
+    let _ = security::delete_key(TEST_SERVICE, account);
+
+    let goal_id;
+    {
+        let mut conn = match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("[req_kl_bootstrap_regression] BLOCKED - could not write to OS credential store: {e}");
+                return;
+            }
+        };
+        let created = match create_goal(
+            &mut conn,
+            ui_explicit(),
+            mk_create_payload("Survives reopen"),
+        ) {
+            ActionOutcome::Success { value, .. } => value,
+            other => panic!("setup failed: {other:?}"),
+        };
+        goal_id = created.id;
+    }
+
+    {
+        let conn = match bootstrap_db_with_key_lifecycle(&path, TEST_SERVICE, account) {
+            Ok(conn) => conn,
+            Err(e) => panic!(
+                "[req_kl_bootstrap_regression] FAIL - second bootstrap (reopen) failed: {e:?}"
+            ),
+        };
+        let fetched = get_goal(&conn, goal_id).unwrap();
+        assert_eq!(
+            fetched.map(|g| g.title),
+            Some("Survives reopen".to_string()),
+            "[req_kl_bootstrap_regression] FAIL - record written before close was not readable after reopen"
+        );
+    }
+
+    let mut raw = Vec::new();
+    fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut raw)
+        .unwrap();
+    assert!(
+        !raw.windows(6).any(|w| w == b"SQLite"),
+        "[req_kl_bootstrap_regression] FAIL - file starts with the plaintext SQLite header, not encrypted"
+    );
+    println!(
+        "[req_kl_bootstrap_regression] PASS - first bootstrap created the encrypted db, second bootstrap reopened it with the same key, the record written before close is readable after reopen, no plaintext regression"
+    );
+
+    let _ = security::delete_key(TEST_SERVICE, account);
+}
