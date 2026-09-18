@@ -173,7 +173,7 @@ connection `open_encrypted` produces - not just declared in schema and
 left unenforced, §4e), on top of the already-proven SQLCipher encryption
 and keyring master-key lifecycle.
 
-285 automated tests prove all of this (9 storage-spike regression, 17
+293 automated tests prove all of this (9 storage-spike regression, 17
 Goal-slice/hardening integration, 16 direct Goal action-layer unit, 14
 Project integration, 10 direct Project action-layer unit, 4 Project/
 storage integrity integration, 3 direct `LifecycleStatus` unit, 23
@@ -348,7 +348,7 @@ LiFeOS/
     │       │                       NOT into the test-only bootstrap_db_at_version),
     │       │                       get_entity/get_fact - no AddMemory/CorrectMemory/
     │       │                       ConfirmMemory/ForgetMemory exists yet
-    │       ├── tests.rs            182 integration test functions against a real
+    │       ├── tests.rs            190 integration test functions against a real
     │       │                       encrypted DB (17 Goal, 14 Project, 4 Project/
     │       │                       storage integrity, 23 GoalRelation functions covering
     │       │                       26 numbered requirements, 24 Milestone functions
@@ -387,7 +387,21 @@ LiFeOS/
     │       │                       (20+ sub-assertions, incl. proving Relation.
     │       │                       relation_type is genuinely open), 1 table-driven
     │       │                       length-bound proof (all 15 constants), 2 get_entity/
-    │       │                       get_fact read-round-trip proofs)
+    │       │                       get_fact read-round-trip proofs, and (post-run
+    │       │                       verification hardening, same date) 8 more functions
+    │       │                       completing join-table FK/duplicate coverage for
+    │       │                       relation_evidence/episode_evidence/episode_entities,
+    │       │                       2 ON DELETE RESTRICT matrices proven via a real
+    │       │                       parent DELETE attempt (14 relationships total,
+    │       │                       matching the operation a future ForgetMemory's
+    │       │                       deletion order depends on), fact_audit_log's own
+    │       │                       constraints (incl. proving fact_id genuinely accepts
+    │       │                       a nonexistent FactId, since it is deliberately not an
+    │       │                       FK), 3 table-driven proofs that every Sensitivity/
+    │       │                       MemoryType/EpistemicState value round-trips and is
+    │       │                       DB-accepted, and a strengthened encryption-at-rest
+    │       │                       proof that a distinctive Personal Knowledge value is
+    │       │                       absent from the raw file, not just the SQLite header)
     │       └── storage/            PRIVATE (mod storage; - no pub at all)
     │           ├── mod.rs           generic encrypted-SQLite primitives + prod migrations;
     │           │                    open_encrypted calls enable_foreign_keys (sets +
@@ -1837,6 +1851,29 @@ otherwise unedited.
   probe was re-run against the new `personal_knowledge_repo` submodule
   (`error[E0603]: module 'storage' is private`, confirmed, then
   removed - never left in the tree).
+- **Post-run verification hardening (same date, R020 report's own
+  labelled addendum, no new numbered report):** a dedicated review of
+  R020's own test coverage before Slice B found four verification gaps
+  - not evidence of a production defect, confirmed since every new test
+  passes against the unchanged `V7` schema/Slice A code - and closed
+  them with **8 more tests (293 total, up from 285)**: completed
+  join-table FK/duplicate coverage for `relation_evidence`/
+  `episode_evidence`/`episode_entities` (previously only
+  `fact_evidence` had been proven); `ON DELETE RESTRICT` proven via an
+  actual parent `DELETE` attempt for all 14 non-join and join-table
+  parent-child relationships (previously only inferred from failed
+  child `INSERT`s - directly relevant to a future `ForgetMemory`'s
+  explicit deletion order); `fact_audit_log`'s own constraints proven,
+  including that `fact_id` genuinely accepts a nonexistent `FactId`
+  (confirming it is not an FK, the exact property a future
+  `ForgetMemory` depends on); every `Sensitivity`/`MemoryType`/
+  `EpistemicState` value proven to round-trip and be DB-accepted (not
+  merely rejection of an invalid value); and the encryption-at-rest
+  regression strengthened to prove a distinctive Personal Knowledge
+  value (not just the SQLite header) is absent from the raw file. No
+  `V7` migration change - the `is_self IN (0, 1)` `CHECK` this pass
+  also proved was already present in the originally-committed
+  migration.
 - **No schema outside the frozen 11-table list; V1-V6 untouched.** No
   new dependency. One incidental naming alignment (not a semantic
   change): `fact_audit_log`'s timestamp column is `occurred_at`,
@@ -1958,7 +1995,7 @@ M1 scaffold. Restored via `git checkout`, no data lost.
 Launch the real app (`npm run tauri dev`) and use the accepted M1 shell -
 unchanged, no real goals, projects, relations, milestones, or tasks
 visible there yet (no Tauri command wiring). Separately,
-`cd src-tauri && cargo test -- --test-threads=1` runs 285 tests proving:
+`cd src-tauri && cargo test -- --test-threads=1` runs 293 tests proving:
 the storage foundation (9, regression from the spike), a full
 CreateGoal/UpdateGoal/get_active_goals lifecycle including atomic-
 rollback-under-forced-failure and tri-state patch semantics (17
@@ -2036,9 +2073,20 @@ defense-in-depth matrix across all six Personal Knowledge tables
 self-edge rejection, and Personal Knowledge `Relation.relation_type`
 proven genuinely open by accepting a value far outside `GoalRelation`'s
 11 closed values), all 15 frozen length bounds, and `get_entity`/
-`get_fact` full round-trips (23 new tests). **Test count rose from 200
-to 233 to 250 to 262 to 285 across these two days' runs** (262→285
-this run, +23) - all previously-covered behavior remains green.
+`get_fact` full round-trips (23 new tests), then (post-run verification
+hardening, same date) that all four `V7` join tables reject nonexistent
+parents/duplicate links (not only `fact_evidence`), that `ON DELETE
+RESTRICT` genuinely rejects a real parent `DELETE` for all 14
+non-join/join relationships (not merely inferred from failed child
+inserts), that `fact_audit_log` accepts a valid marker with `fact_id`
+pointing at a nonexistent Fact (proving it is deliberately not an FK)
+while rejecting invalid `action_type`/`actor`/`provenance`, that every
+`Sensitivity`/`MemoryType`/`EpistemicState` value round-trips and is
+DB-accepted, and that a distinctive Personal Knowledge value (not just
+the SQLite header) is absent from the raw encrypted file (8 more
+tests). **Test count rose from 200 to 233 to 250 to 262 to 285 to 293
+across these two days' runs** (285→293 this run, +8) - all
+previously-covered behavior remains green.
 
 ---
 
@@ -2061,7 +2109,8 @@ deletion" claim now correctly split into a logical guarantee and an
 honestly-evaluated forensic-storage guarantee), and **Slice A (the full
 11-table `V7` foundation, `ensure_self_entity` bootstrap, narrow
 `get_entity`/`get_fact` reads, `secure_delete = ON` storage hardening)
-is now actually implemented and proven (285/285 tests)**, the
+is now actually implemented and proven (293/293 tests after post-run
+verification hardening)**, the
 recommended next step is **Slice B (`AddMemory`)** - R020 §24's exact
 recommendation - ready to implement directly since Slice A's foundation
 is done and proven, not merely designed. `RecurringRule` remains
@@ -2165,7 +2214,8 @@ into implementation - see R016 §15 and R019 §23.
 - **RESOLVED in part (2026-09-18, M2 Personal Knowledge Slice A
   Foundation, R020 §4r above): the `V7` schema, `SELF` bootstrap, and
   narrow `get_entity`/`get_fact` reads are now real, implemented, and
-  tested (285/285).** `Entity`/`Source`/`Evidence`/`Fact`/`Relation`/
+  tested (293/293, after post-run verification hardening the same
+  date).** `Entity`/`Source`/`Evidence`/`Fact`/`Relation`/
   `Episode` all exist as real tables now (`Relation`/`Episode` schema
   only, no write path). **Still not implemented: `AddMemory`/
   `CorrectMemory`/`ConfirmMemory`/`ForgetMemory`** - no Personal

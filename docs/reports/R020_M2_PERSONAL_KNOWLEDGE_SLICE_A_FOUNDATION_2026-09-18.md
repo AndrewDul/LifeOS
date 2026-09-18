@@ -481,3 +481,87 @@ one Memory action with no dependency on another Memory action already
 existing (`CorrectMemory`/`ConfirmMemory`/`ForgetMemory` all require an
 existing Fact to target) — the correct next real implementation step.
 **`AddMemory` does not exist after this run.**
+
+---
+
+## Post-run verification hardening (2026-09-18)
+
+A dedicated review of this report's own test coverage, conducted before
+Slice B, found four verification gaps — **gaps in evidence, not
+evidence of a production defect**, confirmed by every new test below
+passing against the existing, unmodified `V7` schema and Slice A code
+exactly as originally implemented:
+
+- **Join-table coverage only exercised `fact_evidence`.** §15/§20 above
+  describe `req_pk_join_defense_matrix` proving nonexistent-parent
+  rejection and duplicate-link rejection — but only for `fact_evidence`,
+  not `relation_evidence`/`episode_evidence`/`episode_entities`, the
+  other three of `V7`'s four join tables. A new test,
+  `req_pk_join_relation_episode_defense_matrix`, completes the same
+  nonexistent-left-parent/nonexistent-right-parent/valid-link/
+  duplicate-link matrix for all three, seeding `Relation`/`Episode` rows
+  via deliberate raw SQL only (no `insert_relation`/`insert_episode`
+  production function was added — R019 §13's schema-only safety rule is
+  unchanged).
+- **`ON DELETE RESTRICT` had never been directly exercised.** Every
+  existing FK proof in this report (§15/§20) forced a failing child
+  `INSERT` (a nonexistent parent id) — none attempted to `DELETE` a
+  real, currently-referenced parent row, which is the actual operation
+  a future `ForgetMemory`'s explicit deletion order depends on (R019
+  §8-§11). Two new tests, `req_pk_restrict_core_matrix` (`Source ->
+  Evidence`, `Entity -> Fact.subject`, `Entity -> Fact.object`, a Fact's
+  own `superseded_by_fact_id` reference, `Entity -> Relation.from`,
+  `Entity -> Relation.to` — 6 relationships) and
+  `req_pk_restrict_join_matrix` (`Fact`/`Evidence -> fact_evidence`,
+  `Relation`/`Evidence -> relation_evidence`, `Episode`/
+  `Evidence -> episode_evidence`, `Episode`/`Entity ->
+  episode_entities` — 8 relationships), each create a valid parent+child
+  fixture, attempt a real `DELETE` on the referenced parent, confirm the
+  real database rejects it, and confirm both rows remain intact
+  afterward — 14 relationships proven by actual deletion attempt, not
+  inferred from insert-side FK behavior.
+- **The encryption-at-rest regression checked only the SQLite file
+  header**, never a distinctive Personal Knowledge plaintext value. A
+  new test, `req_pkenc1_personal_knowledge_content_encrypted_at_rest`,
+  inserts a real `Entity.canonical_name` containing the marker
+  `R020_PK_PLAINTEXT_MARKER_SHOULD_NOT_APPEAR`, closes the connection,
+  and proves that exact byte sequence is absent from the raw encrypted
+  file — not just the `SQLite` header — while a correct-key reopen still
+  reads the marker back normally and a wrong key still fails. This
+  proves actual Personal Knowledge *content* is encrypted, not only
+  that the file doesn't look like a plaintext SQLite database.
+- **Closed-enum mapping completeness and `fact_audit_log`'s own
+  constraints had no direct proof before Slice B** — the table Slice
+  B's `AddMemory` will be the first production code to ever write to.
+  Three new table-driven tests (`req_pkenum1`/`req_pkenum2`/
+  `req_pkenum3`) prove every one of `Sensitivity`'s 4, `MemoryType`'s
+  11, and `EpistemicState`'s 5 values round-trips exactly through
+  `as_str()`/`parse()`, that `parse()` of an invalid string returns
+  `None`, and that the real DB `CHECK` accepts every valid value (not
+  merely one or two, as the pre-existing defense-matrix tests already
+  did for the *invalid* case). A new test,
+  `req_pk_fact_audit_log_defense_matrix`, proves a valid `AddMemory`
+  marker can be inserted with `previous_snapshot = NULL`, that
+  `previous_snapshot` may also hold real serialized text, that invalid
+  `action_type`/`actor`/`provenance` are each rejected, and — the
+  property a future `ForgetMemory` structurally depends on (R017 §20) —
+  that a syntactically valid but nonexistent `FactId` is genuinely
+  *accepted* as `fact_id`, confirming it is not an enforced foreign key.
+- One narrow, low-risk in-place addition: `req_pk_entity_defense_matrix`
+  (§15 above) gained one more assertion proving `is_self = 2` is
+  rejected by the real `CHECK (is_self IN (0, 1))` constraint — the
+  constraint was already present in the originally-committed `V7`
+  migration (confirmed by direct inspection before writing this test;
+  no migration change was needed or made).
+
+**No production Rust code or `V7` schema was changed by this pass** —
+every new/extended test passes against the exact same migration and
+Slice A implementation this report originally measured. **This
+report's original §20 test count (285) and every other measured result
+above remain this report's historical record, unchanged.** The
+strengthened final count — **293** (285 + 8 new test functions) — is
+recorded here as this pass's own measured result, not a retroactive
+edit to §20.
+
+See `docs/PROJECT_STATE.md` for whether/where this strengthened count
+is reflected going forward.

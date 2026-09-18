@@ -8837,7 +8837,20 @@ fn req_pk_entity_defense_matrix() {
         "[req_pk_entity] FAIL - duplicate (domain_ref_type, domain_ref_id) should be rejected"
     );
 
-    println!("[req_pk_entity] PASS - invalid sensitivity, half-populated domain_ref, and duplicate domain_ref are all rejected by real DB constraints");
+    // invalid is_self boolean representation (post-run verification
+    // hardening - only `0`/`1` are valid; the DB CHECK
+    // `is_self IN (0, 1)` must reject anything else)
+    let result = conn.execute(
+        "INSERT INTO entities (id, entity_type, canonical_name, is_self, sensitivity, domain_ref_type, domain_ref_id, created_at, updated_at)
+         VALUES (?1, 'person', 'Invalid Boolean', 2, 'INTERNAL', NULL, NULL, ?2, ?2)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), now],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_entity] FAIL - is_self = 2 should be rejected by the real DB CHECK (is_self IN (0, 1))"
+    );
+
+    println!("[req_pk_entity] PASS - invalid sensitivity, half-populated domain_ref, duplicate domain_ref, and an invalid is_self boolean value are all rejected by real DB constraints");
 }
 
 /// Source: invalid sensitivity.
@@ -9384,6 +9397,768 @@ fn req_pk_join_defense_matrix() {
     );
 
     println!("[req_pk_join] PASS - fact_evidence rejects nonexistent fact_id/evidence_id and duplicate links");
+}
+
+// =========================================================================
+// Post-run verification hardening (2026-09-18) - closes test/evidence gaps
+// left open by R020's own Slice A implementation, found during a dedicated
+// review before Slice B: `req_pk_join_defense_matrix` above only exercised
+// `fact_evidence`, not the other three join tables; FK/RESTRICT integrity
+// was only proven via failed child INSERTs, never a real parent DELETE
+// attempt (the exact operation a future `ForgetMemory`'s explicit deletion
+// order depends on); the encryption-at-rest regression checked only the
+// SQLite header, not a distinctive Personal Knowledge plaintext marker;
+// closed-enum mapping completeness and `fact_audit_log`'s own constraints
+// (the first table Slice B's `AddMemory` will actually write to) had no
+// direct proof. These are verification gaps found by review, not evidence
+// of a production defect - every test below passes against the existing,
+// unmodified V7 schema and Slice A code.
+// =========================================================================
+
+/// Completes join-table coverage: `relation_evidence`/`episode_evidence`/
+/// `episode_entities` each get the same nonexistent-left-parent/
+/// nonexistent-right-parent/valid-link/duplicate-link matrix
+/// `req_pk_join_defense_matrix` above already proved for `fact_evidence`.
+/// `Relation`/`Episode` rows are seeded via deliberate raw SQL only - no
+/// `insert_relation`/`insert_episode` production function is added,
+/// preserving R019 §13's schema-only safety rule.
+#[test]
+fn req_pk_join_relation_episode_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkjoinre.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+
+    let source = mk_pk_source("USER_INPUT", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let evidence = mk_pk_evidence(source.id, Some("shared evidence"), Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_evidence(&conn, &evidence).unwrap();
+    let from_entity = mk_pk_entity("person", "Relation Evidence From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from_entity).unwrap();
+    let to_entity = mk_pk_entity("person", "Relation Evidence To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to_entity).unwrap();
+
+    // Raw-SQL-seeded Relation and Episode fixtures - deliberately not via
+    // a production repo function (none exists, R019 §13).
+    let relation_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at)
+         VALUES (?1, ?2, ?3, 'CUSTOM_TYPE', NULL, 'OBSERVED', NULL, 'INTERNAL', ?4, NULL, ?4)",
+        rusqlite::params![relation_id, from_entity.id.to_string(), to_entity.id.to_string(), now_str],
+    )
+    .unwrap();
+    let episode_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO episodes (id, title, summary, started_at, ended_at, sensitivity, created_at, updated_at)
+         VALUES (?1, NULL, 'episode summary', ?2, NULL, 'INTERNAL', ?2, ?2)",
+        rusqlite::params![episode_id, now_str],
+    )
+    .unwrap();
+
+    // --- relation_evidence ---
+    let result = conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            uuid::Uuid::now_v7().to_string(),
+            evidence.id.to_string(),
+            now_str
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent relation_id in relation_evidence should be rejected"
+    );
+
+    let result = conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![relation_id, uuid::Uuid::now_v7().to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent evidence_id in relation_evidence should be rejected"
+    );
+
+    conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![relation_id, evidence.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![relation_id, evidence.id.to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - a duplicate (relation_id, evidence_id) link should be rejected"
+    );
+
+    // --- episode_evidence ---
+    let result = conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            uuid::Uuid::now_v7().to_string(),
+            evidence.id.to_string(),
+            now_str
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent episode_id in episode_evidence should be rejected"
+    );
+
+    let result = conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, uuid::Uuid::now_v7().to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent evidence_id in episode_evidence should be rejected"
+    );
+
+    conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, evidence.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, evidence.id.to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - a duplicate (episode_id, evidence_id) link should be rejected"
+    );
+
+    // --- episode_entities ---
+    let result = conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            uuid::Uuid::now_v7().to_string(),
+            from_entity.id.to_string(),
+            now_str
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent episode_id in episode_entities should be rejected"
+    );
+
+    let result = conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, uuid::Uuid::now_v7().to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - nonexistent entity_id in episode_entities should be rejected"
+    );
+
+    conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, from_entity.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, from_entity.id.to_string(), now_str],
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_join_re] FAIL - a duplicate (episode_id, entity_id) link should be rejected"
+    );
+
+    println!("[req_pk_join_re] PASS - relation_evidence/episode_evidence/episode_entities each reject nonexistent left/right parents and duplicate links, matching fact_evidence's already-proven behavior");
+}
+
+/// Proves the actual `ON DELETE RESTRICT` behavior (not merely that an
+/// invalid child INSERT fails) for the six non-join-table parent-child
+/// relationships: `Source -> Evidence`, `Entity -> Fact.subject`,
+/// `Entity -> Fact.object`, a Fact's own `superseded_by_fact_id` pointing
+/// at another Fact, `Entity -> Relation.from`, `Entity -> Relation.to`.
+/// For each: valid parent+child fixture state is created, the referenced
+/// parent's real deletion is attempted, the real DB rejects it, and both
+/// rows remain intact afterward - directly exercising the same operation
+/// a future `ForgetMemory`'s explicit deletion order depends on.
+#[test]
+fn req_pk_restrict_core_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrestrictcore.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    // Source -> Evidence
+    let source = mk_pk_source("USER_INPUT", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let evidence = mk_pk_evidence(source.id, Some("restrict content"), Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_evidence(&conn, &evidence).unwrap();
+    let result = conn.execute(
+        "DELETE FROM sources WHERE id = ?1",
+        rusqlite::params![source.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting a Source still referenced by Evidence should be rejected");
+    let source_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sources WHERE id = ?1",
+            rusqlite::params![source.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source_count, 1,
+        "[req_pk_restrict_core] FAIL - Source row must remain intact after the rejected delete"
+    );
+
+    // Entity -> Fact.subject
+    let subject = mk_pk_entity("person", "Restrict Subject", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    let subject_fact = mk_pk_fact(
+        subject.id,
+        "restrict_subject_predicate",
+        FactValue::Scalar("1".to_string()),
+        MemoryType::Fact,
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &subject_fact).unwrap();
+    let result = conn.execute(
+        "DELETE FROM entities WHERE id = ?1",
+        rusqlite::params![subject.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting an Entity still referenced as Fact.subject_entity_id should be rejected");
+    assert!(
+        get_entity(&conn, subject.id).unwrap().is_some(),
+        "[req_pk_restrict_core] FAIL - subject Entity row must remain intact"
+    );
+
+    // Entity -> Fact.object
+    let object = mk_pk_entity("vehicle", "Restrict Object", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &object).unwrap();
+    let object_fact = mk_pk_fact(
+        subject.id,
+        "restrict_object_predicate",
+        FactValue::EntityRef(object.id),
+        MemoryType::Fact,
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &object_fact).unwrap();
+    let result = conn.execute(
+        "DELETE FROM entities WHERE id = ?1",
+        rusqlite::params![object.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting an Entity still referenced as Fact.object_entity_id should be rejected");
+    assert!(
+        get_entity(&conn, object.id).unwrap().is_some(),
+        "[req_pk_restrict_core] FAIL - object Entity row must remain intact"
+    );
+
+    // Fact successor <- predecessor.superseded_by_fact_id
+    let successor = mk_pk_fact(
+        subject.id,
+        "restrict_supersession_predicate",
+        FactValue::Scalar("2".to_string()),
+        MemoryType::Fact,
+        EpistemicState::UserConfirmed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &successor).unwrap();
+    let mut predecessor = mk_pk_fact(
+        subject.id,
+        "restrict_supersession_predicate",
+        FactValue::Scalar("1".to_string()),
+        MemoryType::Fact,
+        EpistemicState::Stale,
+        Sensitivity::Internal,
+    );
+    predecessor.superseded_by_fact_id = Some(successor.id);
+    storage::personal_knowledge_repo::insert_fact(&conn, &predecessor).unwrap();
+    let result = conn.execute(
+        "DELETE FROM facts WHERE id = ?1",
+        rusqlite::params![successor.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting a Fact still referenced by another Fact's superseded_by_fact_id should be rejected");
+    assert!(
+        get_fact(&conn, successor.id).unwrap().is_some(),
+        "[req_pk_restrict_core] FAIL - successor Fact row must remain intact"
+    );
+    assert!(
+        get_fact(&conn, predecessor.id).unwrap().is_some(),
+        "[req_pk_restrict_core] FAIL - predecessor Fact row must remain intact"
+    );
+
+    // Entity -> Relation.from / Entity -> Relation.to
+    let rel_from = mk_pk_entity("person", "Restrict Relation From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &rel_from).unwrap();
+    let rel_to = mk_pk_entity("person", "Restrict Relation To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &rel_to).unwrap();
+    let now_str = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at)
+         VALUES (?1, ?2, ?3, 'RESTRICT_TEST_TYPE', NULL, 'OBSERVED', NULL, 'INTERNAL', ?4, NULL, ?4)",
+        rusqlite::params![uuid::Uuid::now_v7().to_string(), rel_from.id.to_string(), rel_to.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "DELETE FROM entities WHERE id = ?1",
+        rusqlite::params![rel_from.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting an Entity still referenced as Relation.from_entity_id should be rejected");
+    let result = conn.execute(
+        "DELETE FROM entities WHERE id = ?1",
+        rusqlite::params![rel_to.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_core] FAIL - deleting an Entity still referenced as Relation.to_entity_id should be rejected");
+    assert!(get_entity(&conn, rel_from.id).unwrap().is_some());
+    assert!(get_entity(&conn, rel_to.id).unwrap().is_some());
+
+    println!("[req_pk_restrict_core] PASS - all 6 core ON DELETE RESTRICT relationships genuinely reject a real parent DELETE, with both parent and child rows left intact");
+}
+
+/// Same reasoning as `req_pk_restrict_core_matrix`, for the eight
+/// join-table parent relationships: `Fact`/`Evidence -> fact_evidence`,
+/// `Relation`/`Evidence -> relation_evidence`, `Episode`/
+/// `Evidence -> episode_evidence`, `Episode`/`Entity -> episode_entities`.
+#[test]
+fn req_pk_restrict_join_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkrestrictjoin.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+
+    let source = mk_pk_source("USER_INPUT", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_source(&conn, &source).unwrap();
+    let subject = mk_pk_entity("person", "Restrict Join Subject", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    let fact = mk_pk_fact(
+        subject.id,
+        "restrict_join_predicate",
+        FactValue::Scalar("1".to_string()),
+        MemoryType::Fact,
+        EpistemicState::Observed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_fact(&conn, &fact).unwrap();
+
+    // Fact -> fact_evidence, Evidence -> fact_evidence
+    let fe_evidence = mk_pk_evidence(
+        source.id,
+        Some("fact_evidence restrict content"),
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_evidence(&conn, &fe_evidence).unwrap();
+    storage::personal_knowledge_repo::insert_fact_evidence_link(
+        &conn,
+        fact.id,
+        fe_evidence.id,
+        now,
+    )
+    .unwrap();
+    let result = conn.execute(
+        "DELETE FROM facts WHERE id = ?1",
+        rusqlite::params![fact.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting a Fact still linked via fact_evidence should be rejected");
+    let result = conn.execute(
+        "DELETE FROM evidence WHERE id = ?1",
+        rusqlite::params![fe_evidence.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting Evidence still linked via fact_evidence should be rejected");
+
+    // Relation -> relation_evidence, Evidence -> relation_evidence
+    let rel_from = mk_pk_entity("person", "Restrict Join Rel From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &rel_from).unwrap();
+    let rel_to = mk_pk_entity("person", "Restrict Join Rel To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &rel_to).unwrap();
+    let relation_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO relations (id, from_entity_id, to_entity_id, relation_type, note, epistemic_state, confidence, sensitivity, valid_from, valid_until, created_at)
+         VALUES (?1, ?2, ?3, 'RESTRICT_JOIN_TYPE', NULL, 'OBSERVED', NULL, 'INTERNAL', ?4, NULL, ?4)",
+        rusqlite::params![relation_id, rel_from.id.to_string(), rel_to.id.to_string(), now_str],
+    )
+    .unwrap();
+    let re_evidence = mk_pk_evidence(
+        source.id,
+        Some("relation_evidence restrict content"),
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_evidence(&conn, &re_evidence).unwrap();
+    conn.execute(
+        "INSERT INTO relation_evidence (relation_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![relation_id, re_evidence.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "DELETE FROM relations WHERE id = ?1",
+        rusqlite::params![relation_id],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting a Relation still linked via relation_evidence should be rejected");
+    let result = conn.execute(
+        "DELETE FROM evidence WHERE id = ?1",
+        rusqlite::params![re_evidence.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting Evidence still linked via relation_evidence should be rejected");
+
+    // Episode -> episode_evidence, Evidence -> episode_evidence
+    let episode_id = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "INSERT INTO episodes (id, title, summary, started_at, ended_at, sensitivity, created_at, updated_at)
+         VALUES (?1, NULL, 'restrict episode summary', ?2, NULL, 'INTERNAL', ?2, ?2)",
+        rusqlite::params![episode_id, now_str],
+    )
+    .unwrap();
+    let ee_evidence = mk_pk_evidence(
+        source.id,
+        Some("episode_evidence restrict content"),
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_evidence(&conn, &ee_evidence).unwrap();
+    conn.execute(
+        "INSERT INTO episode_evidence (episode_id, evidence_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, ee_evidence.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "DELETE FROM episodes WHERE id = ?1",
+        rusqlite::params![episode_id.clone()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting an Episode still linked via episode_evidence should be rejected");
+    let result = conn.execute(
+        "DELETE FROM evidence WHERE id = ?1",
+        rusqlite::params![ee_evidence.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting Evidence still linked via episode_evidence should be rejected");
+
+    // Episode -> episode_entities, Entity -> episode_entities
+    let ee_entity = mk_pk_entity(
+        "person",
+        "Restrict Join Episode Entity",
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_entity(&conn, &ee_entity).unwrap();
+    conn.execute(
+        "INSERT INTO episode_entities (episode_id, entity_id, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![episode_id, ee_entity.id.to_string(), now_str],
+    )
+    .unwrap();
+    let result = conn.execute(
+        "DELETE FROM episodes WHERE id = ?1",
+        rusqlite::params![episode_id],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting an Episode still linked via episode_entities should be rejected");
+    let result = conn.execute(
+        "DELETE FROM entities WHERE id = ?1",
+        rusqlite::params![ee_entity.id.to_string()],
+    );
+    assert!(result.is_err(), "[req_pk_restrict_join] FAIL - deleting an Entity still linked via episode_entities should be rejected");
+
+    println!("[req_pk_restrict_join] PASS - all 8 join-table ON DELETE RESTRICT relationships genuinely reject a real parent DELETE");
+}
+
+/// `fact_audit_log`: the first table Slice B's `AddMemory` will actually
+/// write to. Proves its frozen schema before any production code touches
+/// it: a valid marker can be inserted; invalid `action_type`/`actor`/
+/// `provenance` are each rejected; `previous_snapshot` may be `NULL` or
+/// contain real serialized text; and - the property a future
+/// `ForgetMemory` structurally depends on (R017 §20) - `fact_id` is
+/// genuinely NOT a foreign key, so a syntactically valid but nonexistent
+/// `FactId` is accepted, not rejected.
+#[test]
+fn req_pk_fact_audit_log_defense_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkauditlog.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let now = Utc::now().to_rfc3339();
+
+    let insert = |id: String,
+                  fact_id: String,
+                  action_type: &str,
+                  actor: &str,
+                  provenance: &str,
+                  previous_snapshot: Option<&str>| {
+        conn.execute(
+            "INSERT INTO fact_audit_log (id, fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'EXPLICIT_ADD', ?6, ?7)",
+            rusqlite::params![id, fact_id, action_type, actor, provenance, previous_snapshot, now],
+        )
+    };
+
+    // fact_id is NOT a foreign key - a syntactically valid but
+    // nonexistent FactId must be ACCEPTED, not rejected (the exact
+    // property a future ForgetMemory's residual marker depends on).
+    let nonexistent_fact_id = FactId::new().to_string();
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        nonexistent_fact_id.clone(),
+        "AddMemory",
+        "UI",
+        "Explicit",
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "[req_pk_audit] FAIL - a valid AddMemory marker with previous_snapshot = NULL and a nonexistent (but syntactically valid) fact_id should be ACCEPTED, since fact_id is deliberately not an FK: {result:?}"
+    );
+
+    // previous_snapshot MAY contain real serialized text (e.g. for a
+    // future CorrectMemory/ConfirmMemory marker).
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        nonexistent_fact_id.clone(),
+        "CorrectMemory",
+        "UI",
+        "Explicit",
+        Some(r#"{"predicate":"example","value_json":"1"}"#),
+    );
+    assert!(
+        result.is_ok(),
+        "[req_pk_audit] FAIL - a valid marker with non-NULL previous_snapshot should be accepted: {result:?}"
+    );
+
+    // invalid action_type
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        nonexistent_fact_id.clone(),
+        "NotARealMemoryAction",
+        "UI",
+        "Explicit",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_audit] FAIL - invalid action_type should be rejected"
+    );
+
+    // invalid actor
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        nonexistent_fact_id.clone(),
+        "AddMemory",
+        "NotARealActor",
+        "Explicit",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_audit] FAIL - invalid actor should be rejected"
+    );
+
+    // invalid provenance
+    let result = insert(
+        uuid::Uuid::now_v7().to_string(),
+        nonexistent_fact_id,
+        "AddMemory",
+        "UI",
+        "NotARealProvenance",
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "[req_pk_audit] FAIL - invalid provenance should be rejected"
+    );
+
+    println!("[req_pk_audit] PASS - fact_audit_log accepts valid markers (NULL or real previous_snapshot, and a nonexistent fact_id since it is deliberately not an FK) and rejects invalid action_type/actor/provenance");
+}
+
+// --- Enum round-trip completeness (post-run verification hardening) -----
+
+/// All 4 `Sensitivity` values: `as_str()`/`parse()` round-trip exactly,
+/// `parse` of an invalid string returns `None`, and the real DB `CHECK`
+/// accepts every one of the 4 values (not merely one or two plus
+/// rejection of an invalid value, which `req_pk_entity_defense_matrix`
+/// already proved).
+#[test]
+fn req_pkenum1_sensitivity_round_trip_and_db_accepts_all_values() {
+    let values = [
+        (Sensitivity::Public, "PUBLIC"),
+        (Sensitivity::Internal, "INTERNAL"),
+        (Sensitivity::Sensitive, "SENSITIVE"),
+        (Sensitivity::NeverLeavesDevice, "NEVER_LEAVES_DEVICE"),
+    ];
+    assert_eq!(
+        values.len(),
+        4,
+        "[req_pkenum1] FAIL - expected exactly 4 Sensitivity values"
+    );
+    for (variant, expected_str) in values {
+        assert_eq!(variant.as_str(), expected_str);
+        assert_eq!(Sensitivity::parse(expected_str), Some(variant));
+    }
+    assert_eq!(Sensitivity::parse("NOT_A_REAL_VALUE"), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkenum1.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    for (i, (_, s)) in values.iter().enumerate() {
+        let e = mk_pk_entity(
+            "concept",
+            &format!("Sensitivity DB test {i}"),
+            Sensitivity::parse(s).unwrap(),
+        );
+        storage::personal_knowledge_repo::insert_entity(&conn, &e).unwrap_or_else(|err| {
+            panic!("[req_pkenum1] FAIL - DB rejected valid sensitivity {s}: {err:?}")
+        });
+    }
+    println!(
+        "[req_pkenum1] PASS - all 4 Sensitivity values round-trip exactly and are DB-accepted"
+    );
+}
+
+/// All 11 `MemoryType` values, same proof shape as `req_pkenum1`.
+#[test]
+fn req_pkenum2_memory_type_round_trip_and_db_accepts_all_values() {
+    let values = [
+        (MemoryType::Fact, "FACT"),
+        (MemoryType::Preference, "PREFERENCE"),
+        (MemoryType::Experience, "EXPERIENCE"),
+        (MemoryType::Decision, "DECISION"),
+        (MemoryType::Observation, "OBSERVATION"),
+        (MemoryType::Hypothesis, "HYPOTHESIS"),
+        (MemoryType::EffectiveSolution, "EFFECTIVE_SOLUTION"),
+        (MemoryType::IneffectiveSolution, "INEFFECTIVE_SOLUTION"),
+        (MemoryType::Skill, "SKILL"),
+        (MemoryType::Habit, "HABIT"),
+        (MemoryType::CurrentState, "CURRENT_STATE"),
+    ];
+    assert_eq!(
+        values.len(),
+        11,
+        "[req_pkenum2] FAIL - expected exactly 11 MemoryType values"
+    );
+    for (variant, expected_str) in values {
+        assert_eq!(variant.as_str(), expected_str);
+        assert_eq!(MemoryType::parse(expected_str), Some(variant));
+    }
+    assert_eq!(MemoryType::parse("NOT_A_REAL_VALUE"), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkenum2.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let subject = mk_pk_entity(
+        "person",
+        "MemoryType DB Test Subject",
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    for (variant, s) in values {
+        let f = mk_pk_fact(
+            subject.id,
+            "memory_type_db_test_predicate",
+            FactValue::Scalar("1".to_string()),
+            variant,
+            EpistemicState::Observed,
+            Sensitivity::Internal,
+        );
+        storage::personal_knowledge_repo::insert_fact(&conn, &f).unwrap_or_else(|err| {
+            panic!("[req_pkenum2] FAIL - DB rejected valid memory_type {s}: {err:?}")
+        });
+    }
+    println!(
+        "[req_pkenum2] PASS - all 11 MemoryType values round-trip exactly and are DB-accepted"
+    );
+}
+
+/// All 5 `EpistemicState` values, same proof shape as `req_pkenum1`.
+#[test]
+fn req_pkenum3_epistemic_state_round_trip_and_db_accepts_all_values() {
+    let values = [
+        (EpistemicState::UserConfirmed, "USER_CONFIRMED"),
+        (EpistemicState::Observed, "OBSERVED"),
+        (EpistemicState::Inferred, "INFERRED"),
+        (EpistemicState::Disputed, "DISPUTED"),
+        (EpistemicState::Stale, "STALE"),
+    ];
+    assert_eq!(
+        values.len(),
+        5,
+        "[req_pkenum3] FAIL - expected exactly 5 EpistemicState values"
+    );
+    for (variant, expected_str) in values {
+        assert_eq!(variant.as_str(), expected_str);
+        assert_eq!(EpistemicState::parse(expected_str), Some(variant));
+    }
+    assert_eq!(EpistemicState::parse("NOT_A_REAL_VALUE"), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkenum3.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let subject = mk_pk_entity(
+        "person",
+        "EpistemicState DB Test Subject",
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_entity(&conn, &subject).unwrap();
+    for (variant, s) in values {
+        let f = mk_pk_fact(
+            subject.id,
+            "epistemic_state_db_test_predicate",
+            FactValue::Scalar("1".to_string()),
+            MemoryType::Fact,
+            variant,
+            Sensitivity::Internal,
+        );
+        storage::personal_knowledge_repo::insert_fact(&conn, &f).unwrap_or_else(|err| {
+            panic!("[req_pkenum3] FAIL - DB rejected valid epistemic_state {s}: {err:?}")
+        });
+    }
+    println!(
+        "[req_pkenum3] PASS - all 5 EpistemicState values round-trip exactly and are DB-accepted"
+    );
+}
+
+// --- Encryption-at-rest, Personal Knowledge content marker ---------------
+
+/// Strengthens R020's encryption-at-rest regression (which only checked
+/// for the absence of the plaintext `SQLite` file header) by inserting a
+/// distinctive, real Personal Knowledge value (an `Entity.canonical_name`)
+/// and proving that exact marker text is absent from the raw encrypted
+/// file bytes too - proving actual Personal Knowledge CONTENT is
+/// encrypted, not only the database header. Correct-key reopen still
+/// reads the marker back normally; a wrong key still fails. No real user
+/// data, no production credential, the raw test key is never printed.
+#[test]
+fn req_pkenc1_personal_knowledge_content_encrypted_at_rest() {
+    const MARKER: &str = "R020_PK_PLAINTEXT_MARKER_SHOULD_NOT_APPEAR";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "pkenc1.db");
+
+    let entity_id;
+    {
+        let conn = bootstrap_db_at(&path, &key).unwrap();
+        let entity = mk_pk_entity("concept", MARKER, Sensitivity::Sensitive);
+        entity_id = entity.id;
+        storage::personal_knowledge_repo::insert_entity(&conn, &entity).unwrap();
+    }
+
+    let mut raw = Vec::new();
+    fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut raw)
+        .unwrap();
+    assert!(
+        !raw.windows(6).any(|w| w == b"SQLite"),
+        "[req_pkenc1] FAIL - file starts with the plaintext SQLite header"
+    );
+    assert!(
+        !raw.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+        "[req_pkenc1] FAIL - the distinctive Personal Knowledge marker was found in plaintext in the raw encrypted file"
+    );
+
+    // Correct key reopen - the marker reads back normally.
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+    let fetched = get_entity(&conn, entity_id)
+        .unwrap()
+        .expect("[req_pkenc1] FAIL - marker entity not found after correct-key reopen");
+    assert_eq!(fetched.canonical_name, MARKER);
+
+    // Wrong key still fails (unchanged behavior).
+    let wrong_key = generate_test_key_hex();
+    let wrong_conn = storage::open_encrypted(&path, &wrong_key).unwrap();
+    assert!(
+        storage::verify_key(&wrong_conn).is_err(),
+        "[req_pkenc1] FAIL - a wrong key should still fail verify_key"
+    );
+
+    println!("[req_pkenc1] PASS - a distinctive Personal Knowledge marker (Entity.canonical_name) is absent from the raw encrypted file bytes; correct key reads it back normally, wrong key still fails");
 }
 
 // --- Length-bound tests (R020 §32) ---------------------------------------
