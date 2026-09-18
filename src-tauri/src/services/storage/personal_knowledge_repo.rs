@@ -466,3 +466,44 @@ pub(in crate::services) fn update_fact_as_superseded(
     }
     Ok(())
 }
+
+/// `ConfirmMemory`'s ONLY mutation path (M2 Personal Knowledge Slice D,
+/// 2026-09-18) - the same narrow-storage-function discipline
+/// `update_fact_as_superseded` established: its SQL touches exactly
+/// `epistemic_state` (a literal `'USER_CONFIRMED'`, not a parameter -
+/// this function has exactly one purpose and it is always this
+/// transition) and `updated_at`. `subject_entity_id`/`predicate`/
+/// `value`/`memory_type`/`confidence`/`sensitivity`/`valid_from`/
+/// `valid_until`/`superseded_by_fact_id`/`created_at` are structurally
+/// impossible to touch through this function's parameter list.
+///
+/// The `WHERE` clause re-checks, at mutation time, both preconditions
+/// `services::confirm_memory` already checked at preflight - active
+/// (`valid_until IS NULL AND epistemic_state <> 'STALE'`) and not
+/// already confirmed (`epistemic_state <> 'USER_CONFIRMED'`) - as
+/// defense-in-depth, matching `update_fact_as_superseded`'s exact
+/// precedent. `changed != 1` (0 rows: missing id, inactive, or already
+/// confirmed; >1 structurally impossible against a primary key) is a
+/// real runtime error in every build profile, never a `debug_assert!`.
+/// The diagnostic is fixed and carries no Fact content.
+pub(in crate::services) fn confirm_fact_epistemic_state(
+    conn: &Connection,
+    fact_id: FactId,
+    confirmed_at: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE facts SET epistemic_state = 'USER_CONFIRMED', updated_at = ?2
+         WHERE id = ?1 AND valid_until IS NULL AND epistemic_state <> 'STALE' AND epistemic_state <> 'USER_CONFIRMED'",
+        params![fact_id.to_string(), confirmed_at.to_rfc3339()],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(
+                "ConfirmMemory update did not affect exactly one row - Fact missing, no longer active, or already confirmed"
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}

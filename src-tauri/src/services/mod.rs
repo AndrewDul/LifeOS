@@ -19,9 +19,9 @@ mod storage;
 
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
-    AddMilestonePayload, AddTaskPayload, ConfirmationClass, CorrectMemoryPayload,
-    CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch,
-    LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
+    AddMilestonePayload, AddTaskPayload, ConfirmMemoryPayload, ConfirmationClass,
+    CorrectMemoryPayload, CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput,
+    FieldPatch, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
     UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
@@ -2221,6 +2221,130 @@ pub(crate) fn correct_memory(
 
     ActionOutcome::Success {
         value: successor,
+        confirmation_class: class,
+    }
+}
+
+/// `ConfirmMemory` - the third production Personal Knowledge mutation
+/// (M2 Personal Knowledge Slice D, 2026-09-18). "The semantic assertion
+/// already stored in this Fact is correct according to the user" - a
+/// pure epistemic confirmation, never a semantic-value correction,
+/// never a new/successor Fact, never a contradiction-resolution
+/// workflow, never an Evidence-creation operation. Mutates the SAME
+/// `Fact` row in place: exactly `epistemic_state` (always to
+/// `UserConfirmed`) and `updated_at`.
+///
+/// Execution order (matches the R021/R022 safety boundary exactly):
+/// (1) pure structural validation (`actions::validate_confirm_memory` -
+/// trivial, the payload is one `FactId`); (2) `effective_class`
+/// computed against the `ExplicitAdd` floor; (3) the confirmation gate -
+/// **no Personal-Knowledge-specific overlay is needed here** (unlike
+/// `CorrectMemory`'s `ImportantChange` floor): the generic
+/// `effective_class(ExplicitAdd, Inferred) = InferredChange` already
+/// dominates and `blocks_until_confirmed` already returns `true` for
+/// it, the same reason `AddMemory` needed no overlay; (4) only once
+/// confirmation is satisfied does the target Fact get read - a missing
+/// target returns `ActionOutcome::NotFound` (matching `CorrectMemory`'s
+/// precedent for a missing update target), never reached while
+/// unconfirmed; (5) `domain::is_active_fact` rejects an inactive
+/// target (`FactNotActive`, reused unchanged from `CorrectMemory`); an
+/// active target already `UserConfirmed` is rejected as a no-op
+/// (`FactAlreadyUserConfirmed`) rather than silently returning
+/// `Success` with zero writes; (6) the mandatory `previous_snapshot` of
+/// the target's PRE-confirmation state is serialized
+/// (`serialize_required_snapshot`, never `.ok()`-downgraded) before (7)
+/// the atomic transaction opens.
+///
+/// `INFERRED`/`OBSERVED`/`DISPUTED` are all confirmable (R018) -
+/// `DISPUTED` confirms only the ONE targeted Fact; no sibling Fact
+/// sharing the same subject+predicate is ever read, searched, changed,
+/// or globally "resolved" - `ConfirmMemory` confirms exactly one
+/// assertion, never a contradiction set.
+///
+/// `provenance` in the audit row is never rewritten - a confirmed
+/// `Inferred` proposal's audit row keeps `provenance = "Inferred"`
+/// while the Fact's own `epistemic_state` becomes `UserConfirmed`
+/// (confirmation and provenance remain distinct concepts, matching
+/// `AddMemory`/`CorrectMemory`'s identical guarantee).
+///
+/// Transaction order: the guarded `confirm_fact_epistemic_state` update
+/// -> one `fact_audit_log` row for the same Fact -> `COMMIT`. Any
+/// failure rolls back the Fact update too - no partial confirmation.
+/// Creates no Entity/Source/Evidence/`fact_evidence` row, and never
+/// writes to `relations`/`episodes`/`relation_evidence`/
+/// `episode_evidence`/`episode_entities`.
+pub(crate) fn confirm_memory(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: ConfirmMemoryPayload,
+) -> ActionOutcome<Fact> {
+    let normalized = match crate::actions::validate_confirm_memory(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let target = match storage::personal_knowledge_repo::get_fact(conn, normalized.fact_id) {
+        Ok(Some(f)) => f,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if !is_active_fact(&target) {
+        return ActionOutcome::ValidationFailed(vec![ValidationError::FactNotActive]);
+    }
+    if target.epistemic_state == EpistemicState::UserConfirmed {
+        return ActionOutcome::ValidationFailed(vec![ValidationError::FactAlreadyUserConfirmed]);
+    }
+
+    let previous_snapshot = match serialize_required_snapshot(&target) {
+        Ok(s) => s,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) =
+        storage::personal_knowledge_repo::confirm_fact_epistemic_state(&tx, target.id, now)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_fact_audit_log(
+        &tx,
+        target.id,
+        "ConfirmMemory",
+        meta.actor,
+        meta.provenance,
+        class,
+        Some(previous_snapshot),
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    let confirmed = Fact {
+        epistemic_state: EpistemicState::UserConfirmed,
+        updated_at: now,
+        ..target
+    };
+
+    ActionOutcome::Success {
+        value: confirmed,
         confirmation_class: class,
     }
 }

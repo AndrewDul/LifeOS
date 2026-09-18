@@ -968,13 +968,16 @@ pub(crate) enum FactValue {
 /// table to `Evidence.source_id` to `Source` (R017 §5 item 4).
 ///
 /// **Mutability contract (R017 §5, clarified R022 post-run hardening,
-/// 2026-09-18)**: `subject_entity_id`, `predicate`, `value`,
+/// then R023, 2026-09-18)**: `subject_entity_id`, `predicate`, `value`,
 /// `memory_type`, and `created_at` are immutable for the life of the
 /// row, always - no implemented or planned action ever changes them
 /// after creation. Exactly two mutation paths exist for the rest:
 ///
-/// - a future `ConfirmMemory` (Slice D, not implemented this run):
-///   `epistemic_state` only.
+/// - `ConfirmMemory` (M2 Personal Knowledge Slice D, 2026-09-18, via
+///   `storage::personal_knowledge_repo::confirm_fact_epistemic_state`,
+///   never a generic Fact patch): `epistemic_state` (always to
+///   `UserConfirmed`) and `updated_at` only - mutates the SAME Fact row
+///   in place, never creates a successor.
 /// - `CorrectMemory`'s predecessor side-effect (M2 Personal Knowledge
 ///   Slice C, 2026-09-18, via `storage::personal_knowledge_repo::
 ///   update_fact_as_superseded`, never a generic Fact patch):

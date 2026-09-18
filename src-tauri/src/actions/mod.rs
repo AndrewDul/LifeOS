@@ -340,8 +340,17 @@ pub(crate) enum ValidationError {
     /// closed - `valid_until` set - or already `Stale`) - needs a
     /// database read, so `services::correct_memory` performs it and
     /// reports it here (M2 Personal Knowledge Slice C, 2026-09-18).
-    /// `CorrectMemory` never revives a historical Fact.
+    /// `CorrectMemory` never revives a historical Fact. Reused unchanged
+    /// by `ConfirmMemory` (Slice D) for the exact same target-inactive
+    /// case.
     FactNotActive,
+    /// `ConfirmMemory`'s target `Fact` is active but already
+    /// `epistemic_state = USER_CONFIRMED` - confirming it again is a
+    /// no-op, rejected explicitly rather than silently returning
+    /// `Success` with zero writes (M2 Personal Knowledge Slice D,
+    /// 2026-09-18). Needs a database read, so `services::confirm_memory`
+    /// performs it and reports it here.
+    FactAlreadyUserConfirmed,
 }
 
 #[derive(Debug, Clone)]
@@ -1500,6 +1509,58 @@ pub(crate) fn validate_correct_memory(
         sensitivity: payload.sensitivity,
         source: source.expect("validated above"),
         evidence: evidence.expect("validated above"),
+    })
+}
+
+// --- Personal Knowledge: ConfirmMemory (M2 Personal Knowledge Slice D,
+// 2026-09-18) -------------------------------------------------------------
+//
+// "The semantic assertion already stored in this Fact is correct
+// according to the user" - a pure EPISTEMIC confirmation, never a
+// semantic-value correction, never a new/successor Fact, never a
+// contradiction-resolution workflow, never an Evidence-creation
+// operation. Mutates the SAME Fact row in place: exactly
+// `epistemic_state` (always to `UserConfirmed`) and `updated_at`.
+//
+// Type floor is `ExplicitAdd` - the same floor `AddMemory` has, and for
+// the same reason its generic `effective_class` formula alone already
+// blocks `Provenance::Inferred` (`InferredChange`, severity 2, dominates
+// `ExplicitAdd`, severity 1) - no Personal-Knowledge-specific override
+// is needed here (unlike `CorrectMemory`'s `ImportantChange` floor).
+
+/// The frozen `ConfirmMemory` payload - a single typed `FactId`, nothing
+/// else. No `value`/`subject`/`predicate`/`confidence`/`sensitivity`/
+/// `memory_type`/`Source`/`Evidence`/`epistemic_state`/timestamp field
+/// exists - Core decides the one permitted state transition
+/// unconditionally (`UserConfirmed`); there is nothing else for a caller
+/// to supply.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConfirmMemoryPayload {
+    pub fact_id: FactId,
+}
+
+/// `validate_confirm_memory`'s success output - identical shape to
+/// `ConfirmMemoryPayload` (there is nothing to normalize: a `FactId` is
+/// already a validated typed value by construction). Kept as its own
+/// type only for consistency with every other Memory action's
+/// validate/normalize split.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NormalizedConfirmMemory {
+    pub fact_id: FactId,
+}
+
+/// Pure structural validation for `ConfirmMemory` - deliberately
+/// minimal, since the payload carries only a typed `FactId` with no
+/// further structure to check here. A syntactically valid `FactId` may
+/// still not reference an existing row, or may reference an inactive or
+/// already-confirmed one - both are database-dependent checks
+/// `services::confirm_memory` performs after the confirmation gate, not
+/// invented fake rules here.
+pub(crate) fn validate_confirm_memory(
+    payload: &ConfirmMemoryPayload,
+) -> Result<NormalizedConfirmMemory, Vec<ValidationError>> {
+    Ok(NormalizedConfirmMemory {
+        fact_id: payload.fact_id,
     })
 }
 

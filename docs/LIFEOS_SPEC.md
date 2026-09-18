@@ -91,29 +91,39 @@ always-new Evidence, the `fact_evidence` link, one audit row) in a
 single atomic transaction, with authoritative `domain_ref` validation
 against `Goal`/`Project`/`Milestone`/`Task` and two-layer duplicate-
 domain-ref detection. **(2026-09-18, R022)** Slice C - `CorrectMemory`,
-the second production Personal Knowledge mutation - is now also
-implemented and tested (356/356 tests): replaces one active predecessor
-Fact with a new successor Fact (inheriting `subject_entity_id`/
-`predicate` exactly), closing the predecessor to `Stale` with no gap or
-overlap between `predecessor.valid_until` and `successor.valid_from`,
-using a Personal-Knowledge-specific confirmation overlay
+the second production Personal Knowledge mutation - was implemented and
+tested (356/356, then 361/361 after R022's own post-run temporal-
+integrity/audit hardening replaced a `debug_assert!` with real runtime
+enforcement): replaces one active predecessor Fact with a new successor
+Fact (inheriting `subject_entity_id`/`predicate` exactly), closing the
+predecessor to `Stale` with no gap or overlap between
+`predecessor.valid_until` and `successor.valid_from`, using a Personal-
+Knowledge-specific confirmation overlay
 (`memory_action_requires_confirmation`) since `CorrectMemory`'s
 `ImportantChange` floor does not block an inferred correction the way
-`AddMemory`'s floor does. `ConfirmMemory`/`ForgetMemory` still do not
-exist (Slice D+), and no Tauri command wires `AddMemory`/`CorrectMemory`
-into the running app yet. See `PROJECT_STATE.md` §4o-§4t,
+`AddMemory`'s floor does. **(2026-09-18, R023)** Slice D -
+`ConfirmMemory`, the third production Personal Knowledge mutation - is
+now also implemented and tested (375/375 tests): a pure epistemic
+confirmation mutating the SAME Fact row in place (`epistemic_state ->
+UserConfirmed` and `updated_at` only, never a successor), needing no
+confirmation overlay since its `ExplicitAdd` floor is already dominated
+generically the same way `AddMemory`'s is. `ForgetMemory` still does not
+exist (Slice E+), and no Tauri command wires `AddMemory`/
+`CorrectMemory`/`ConfirmMemory` into the running app yet. See
+`PROJECT_STATE.md` §4o-§4u,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
 `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`,
+`docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`,
 and
-`docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`.
+`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
-Milestone, Task, and now the Personal Knowledge Slices A/B/C).
+Milestone, Task, and now the Personal Knowledge Slices A/B/C/D).
 
 ---
 
@@ -873,19 +883,30 @@ predecessor `Fact` with a new successor `Fact` (inheriting
 `subject_entity_id`/`predicate` exactly, `epistemic_state` always
 `USER_CONFIRMED`), closing the predecessor to `Stale` with a mandatory
 `previous_snapshot` and no temporal gap or overlap, validated and
-tested end-to-end (356/356 tests). **`ConfirmMemory`/`ForgetMemory`
-still do NOT exist**, and no Tauri command wires `AddMemory`/
-`CorrectMemory` into the running app yet — no Personal Knowledge data
-can be created or corrected through the UI, only through direct Core
-calls; Slice D (`ConfirmMemory`) is the recommended next step (R022
-§32). See `docs/PROJECT_STATE.md` §4o-§4t,
+tested end-to-end (356/356, then 361/361 after R022's own post-run
+temporal-integrity/audit hardening). **As of 2026-09-18 (R023), Slice D
+is also real, implemented code**: `ConfirmMemory` — the third
+production Personal Knowledge mutation — a pure epistemic confirmation
+mutating the SAME Fact row in place (`epistemic_state -> USER_CONFIRMED`
+and `updated_at` only, never a successor Fact, never a new Entity/
+Source/Evidence), rejecting an already-`USER_CONFIRMED` Fact as a
+no-op and an inactive Fact via the reused `is_active_fact` predicate,
+never touching a sibling `DISPUTED` Fact sharing the same subject/
+predicate, validated and tested end-to-end (375/375 tests).
+**`ForgetMemory` still does NOT exist**, and no Tauri command wires
+`AddMemory`/`CorrectMemory`/`ConfirmMemory` into the running app yet —
+no Personal Knowledge data can be created, corrected, or confirmed
+through the UI, only through direct Core calls; Slice E
+(`ForgetMemory`) is the recommended next step (R023 §30). See
+`docs/PROJECT_STATE.md` §4o-§4u,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
 `docs/reports/R019_M2_PERSONAL_KNOWLEDGE_PRIVACY_AND_FOUNDATION_FINALIZATION_2026-09-18.md`,
 `docs/reports/R020_M2_PERSONAL_KNOWLEDGE_SLICE_A_FOUNDATION_2026-09-18.md`,
 `docs/reports/R021_M2_PERSONAL_KNOWLEDGE_ADDMEMORY_SLICE_B_2026-09-18.md`,
+`docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`,
 and
-`docs/reports/R022_M2_PERSONAL_KNOWLEDGE_CORRECTMEMORY_SLICE_C_2026-09-18.md`
+`docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`
 for full detail.
 
 ### 5.4 Action layer (frozen, M2)

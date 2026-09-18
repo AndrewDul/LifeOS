@@ -1924,3 +1924,22 @@ fn correct_memory_normalized_output_has_no_subject_or_predicate_field() {
         validate_correct_memory(&base_correct_memory_payload()).expect("baseline should validate");
     let _: FactId = normalized.predecessor_fact_id;
 }
+
+// --- ConfirmMemory (M2 Personal Knowledge Slice D, 2026-09-18) ---------
+//
+// `ConfirmMemoryPayload` carries a single typed `FactId` and nothing
+// else - `validate_confirm_memory` is intentionally trivial (no
+// database read, no structural rule to invent), so this file's only
+// job is to document that it always succeeds and passes the `FactId`
+// through unchanged. Database-dependent behavior (target existence/
+// activeness/already-confirmed checks, confirmation-gate wiring,
+// mutation, audit, rollback) is covered by `services::tests` instead.
+
+#[test]
+fn confirm_memory_payload_validates_trivially_and_passes_fact_id_through() {
+    let fact_id = FactId::new();
+    let payload = ConfirmMemoryPayload { fact_id };
+    let normalized =
+        validate_confirm_memory(&payload).expect("ConfirmMemoryPayload should always validate");
+    assert_eq!(normalized.fact_id, fact_id);
+}

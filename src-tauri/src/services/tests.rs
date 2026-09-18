@@ -7,9 +7,9 @@
 
 use super::*;
 use crate::actions::{
-    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmationClass, CorrectMemoryPayload,
-    EntityInputRef, FactValueInput, FieldPatch, NewEntityData, NewEvidenceData, NewSourceData,
-    Provenance, SourceRef, ValidationError,
+    ActionMeta, ActionOutcome, Actor, AddMemoryPayload, ConfirmMemoryPayload, ConfirmationClass,
+    CorrectMemoryPayload, EntityInputRef, FactValueInput, FieldPatch, NewEntityData,
+    NewEvidenceData, NewSourceData, Provenance, SourceRef, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
@@ -12980,5 +12980,593 @@ fn req_cm_no_relation_episode_side_effects() {
         relation_episode_side_effect_counts(&conn),
         (0, 0, 0, 0, 0),
         "[req_cm_no_side] FAIL - CorrectMemory must never write to relations/episodes/relation_evidence/episode_evidence/episode_entities"
+    );
+}
+
+// =========================================================================
+// M2 Personal Knowledge Slice D - ConfirmMemory (2026-09-18)
+//
+// Evidence for
+// `docs/reports/R023_M2_PERSONAL_KNOWLEDGE_CONFIRMMEMORY_SLICE_D_2026-09-18.md`.
+// The third production Personal Knowledge mutation - a pure epistemic
+// confirmation of one existing Fact in place, never a new/successor
+// Fact. Database-dependent behavior only - pure `validate_confirm_
+// memory` is trivial and tested directly in `actions::tests` instead.
+// =========================================================================
+
+fn mk_cfm_payload(fact_id: FactId) -> ConfirmMemoryPayload {
+    ConfirmMemoryPayload { fact_id }
+}
+
+/// Creates a fresh, active target `Fact` with a caller-chosen
+/// `epistemic_state`, via `add_memory` with `Provenance::Explicit` (an
+/// explicit call persists exactly the requested `epistemic_state`
+/// unchanged, per R018 §5 - the standard fixture every `ConfirmMemory`
+/// test starts from).
+fn mk_cfm_target(conn: &mut Connection, epistemic_state: EpistemicState) -> Fact {
+    let payload = AddMemoryPayload {
+        epistemic_state,
+        ..mk_am_payload()
+    };
+    match add_memory(conn, ui_explicit(), payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[cfm target setup] FAIL - add_memory failed: {other:?}"),
+    }
+}
+
+// --- Confirmation matrix (R023 §19/§24) ---------------------------------
+
+#[test]
+fn req_cfm_conf_a_explicit_unconfirmed_executes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd);
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed);
+            assert_eq!(value.id, target.id);
+        }
+        other => panic!("[req_cfm_conf_a] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// The generic `effective_class`/`blocks_until_confirmed` ladder alone
+/// already blocks an inferred, unconfirmed proposal at `ConfirmMemory`'s
+/// `ExplicitAdd` floor - no Personal-Knowledge-specific overlay exists
+/// for it (unlike `CorrectMemory`'s `ImportantChange` floor). Uses a
+/// NONEXISTENT `FactId` to prove the gate precedes the target lookup
+/// entirely.
+#[test]
+fn req_cfm_conf_b_inferred_unconfirmed_blocks_before_fact_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let nonexistent = FactId::new();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match confirm_memory(&mut conn, meta, mk_cfm_payload(nonexistent)) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+        }
+        other => panic!(
+            "[req_cfm_conf_b] FAIL - expected ConfirmationRequired (gate must precede the Fact lookup), got {other:?}"
+        ),
+    }
+    assert_eq!(
+        am_full_table_snapshot(&conn),
+        (1, 0, 0, 0, 0, 0),
+        "[req_cfm_conf_b] FAIL - zero writes, only the bootstrap SELF entity should exist"
+    );
+}
+
+#[test]
+fn req_cfm_conf_c_inferred_confirmed_executes_and_audit_provenance_remains_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Observed);
+
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    let confirmed = match confirm_memory(&mut conn, meta, mk_cfm_payload(target.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            value
+        }
+        other => panic!("[req_cfm_conf_c] FAIL - expected Success, got {other:?}"),
+    };
+    assert_eq!(confirmed.epistemic_state, EpistemicState::UserConfirmed);
+
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_cfm_conf_c] FAIL - confirming an inferred proposal must never silently rewrite provenance to Explicit"
+    );
+}
+
+#[test]
+fn req_cfm_conf_d_explicit_missing_fact_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(FactId::new())) {
+        ActionOutcome::NotFound => {}
+        other => panic!("[req_cfm_conf_d] FAIL - expected NotFound, got {other:?}"),
+    }
+}
+
+// --- State transition matrix (R023 §7/§8/§9/§20/§25) --------------------
+
+/// `INFERRED`/`OBSERVED`/`DISPUTED` are all confirmable; already-
+/// `USER_CONFIRMED` is rejected as a no-op; `STALE` and a closed
+/// active-looking raw fixture are both rejected via `is_active_fact`.
+#[test]
+fn req_cfm_state_transition_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_transition.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for state in [
+        EpistemicState::Inferred,
+        EpistemicState::Observed,
+        EpistemicState::Disputed,
+    ] {
+        let target = mk_cfm_target(&mut conn, state);
+        match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(
+                    value.epistemic_state,
+                    EpistemicState::UserConfirmed,
+                    "{state:?} should confirm to UserConfirmed"
+                );
+                assert_eq!(value.id, target.id, "no new Fact id should be produced");
+            }
+            other => panic!("[req_cfm_transition] FAIL for {state:?}, got {other:?}"),
+        }
+    }
+
+    let already_confirmed = mk_cfm_target(&mut conn, EpistemicState::UserConfirmed);
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(already_confirmed.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactAlreadyUserConfirmed));
+        }
+        other => panic!(
+            "[req_cfm_transition] FAIL - already-confirmed should be rejected as a no-op, got {other:?}"
+        ),
+    }
+
+    let stale_target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    conn.execute(
+        "UPDATE facts SET epistemic_state = 'STALE' WHERE id = ?1",
+        rusqlite::params![stale_target.id.to_string()],
+    )
+    .unwrap();
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(stale_target.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive));
+        }
+        other => panic!("[req_cfm_transition] FAIL - STALE should be rejected, got {other:?}"),
+    }
+
+    let closed_target = mk_cfm_target(&mut conn, EpistemicState::Observed);
+    conn.execute(
+        "UPDATE facts SET valid_until = ?2 WHERE id = ?1",
+        rusqlite::params![closed_target.id.to_string(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(closed_target.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(errors.contains(&ValidationError::FactNotActive));
+        }
+        other => panic!(
+            "[req_cfm_transition] FAIL - closed active-looking fixture should be rejected, got {other:?}"
+        ),
+    }
+}
+
+// --- Identity / no temporal successor (R023 §21) ------------------------
+
+#[test]
+fn req_cfm_identity_no_temporal_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_identity.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    let facts_before = am_fact_row_count(&conn);
+
+    let confirmed = match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cfm_identity] FAIL, got {other:?}"),
+    };
+
+    assert_eq!(confirmed.id, target.id);
+    assert_eq!(
+        am_fact_row_count(&conn),
+        facts_before,
+        "[req_cfm_identity] FAIL - no successor Fact should be created"
+    );
+    assert_eq!(confirmed.valid_from, target.valid_from);
+    assert_eq!(confirmed.valid_until, target.valid_until);
+    assert_eq!(
+        confirmed.superseded_by_fact_id,
+        target.superseded_by_fact_id
+    );
+}
+
+// --- Mutation contract full-field proof (R023 §10) ----------------------
+
+#[test]
+fn req_cfm_mutation_contract_full_field_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_mutation.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Disputed);
+    let target_before = target.clone();
+
+    let confirmed = match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cfm_mutation] FAIL, got {other:?}"),
+    };
+
+    let read_back = get_fact(&conn, target.id).unwrap().unwrap();
+    assert_eq!(read_back, confirmed);
+
+    assert_eq!(confirmed.id, target_before.id);
+    assert_eq!(confirmed.subject_entity_id, target_before.subject_entity_id);
+    assert_eq!(confirmed.predicate, target_before.predicate);
+    assert_eq!(confirmed.value, target_before.value);
+    assert_eq!(confirmed.memory_type, target_before.memory_type);
+    assert_eq!(confirmed.confidence, target_before.confidence);
+    assert_eq!(confirmed.sensitivity, target_before.sensitivity);
+    assert_eq!(confirmed.valid_from, target_before.valid_from);
+    assert_eq!(confirmed.valid_until, target_before.valid_until);
+    assert_eq!(
+        confirmed.superseded_by_fact_id,
+        target_before.superseded_by_fact_id
+    );
+    assert_eq!(confirmed.created_at, target_before.created_at);
+
+    assert_ne!(confirmed.epistemic_state, target_before.epistemic_state);
+    assert_ne!(confirmed.updated_at, target_before.updated_at);
+    assert_eq!(confirmed.epistemic_state, EpistemicState::UserConfirmed);
+}
+
+// --- No Entity/Source/Evidence side effects (R023 §22) ------------------
+
+#[test]
+fn req_cfm_no_entity_source_evidence_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_no_side.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    let snapshot_before = am_full_table_snapshot(&conn);
+
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cfm_no_side] FAIL, got {other:?}"),
+    }
+
+    let snapshot_after = am_full_table_snapshot(&conn);
+    assert_eq!(snapshot_after.0, snapshot_before.0, "entities unchanged");
+    assert_eq!(snapshot_after.1, snapshot_before.1, "sources unchanged");
+    assert_eq!(snapshot_after.2, snapshot_before.2, "evidence unchanged");
+    assert_eq!(
+        snapshot_after.3, snapshot_before.3,
+        "facts row count unchanged - in-place mutation, no successor"
+    );
+    assert_eq!(
+        snapshot_after.4, snapshot_before.4,
+        "fact_evidence unchanged"
+    );
+    assert_eq!(
+        snapshot_after.5,
+        snapshot_before.5 + 1,
+        "exactly one new audit row"
+    );
+}
+
+// --- No Relation/Episode side effects (R023 §23) ------------------------
+
+#[test]
+fn req_cfm_no_relation_episode_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_no_rel_side.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup failed: {other:?}"),
+    }
+    assert_eq!(
+        relation_episode_side_effect_counts(&conn),
+        (0, 0, 0, 0, 0),
+        "[req_cfm_no_rel_side] FAIL - ConfirmMemory must never write to relations/episodes/relation_evidence/episode_evidence/episode_entities"
+    );
+}
+
+// --- Audit fields, mandatory snapshot exactness, timestamp proof -------
+// (R023 §14/§19/§29/§30)
+
+#[test]
+fn req_cfm_audit_fields_and_previous_snapshot_exactness() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_audit.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    let target_pre_confirmation = target.clone();
+
+    let requested_at: chrono::DateTime<chrono::Utc> = "2026-09-18T21:15:00Z"
+        .parse()
+        .expect("valid RFC3339 literal");
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Explicit,
+        requested_at,
+        confirmed: false,
+    };
+    match confirm_memory(&mut conn, meta, mk_cfm_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cfm_audit] FAIL, got {other:?}"),
+    }
+
+    let (
+        fact_id,
+        action_type,
+        actor,
+        provenance,
+        confirmation_class,
+        previous_snapshot,
+        occurred_at,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT fact_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at
+             FROM fact_audit_log WHERE action_type = 'ConfirmMemory'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap();
+
+    assert_eq!(fact_id, target.id.to_string());
+    assert_eq!(action_type, "ConfirmMemory");
+    assert_eq!(
+        actor, "CloudLLM",
+        "[req_cfm_audit] FAIL - audit actor must match the exact ActionMeta.actor supplied"
+    );
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    assert_eq!(
+        occurred_at,
+        requested_at.to_rfc3339(),
+        "[req_cfm_audit] FAIL - occurred_at must equal ActionMeta.requested_at exactly"
+    );
+
+    let snapshot_json = previous_snapshot
+        .expect("[req_cfm_audit] FAIL - previous_snapshot must be non-NULL for ConfirmMemory");
+    let deserialized: Fact =
+        serde_json::from_str(&snapshot_json).expect("snapshot must deserialize as a Fact");
+    assert_eq!(
+        deserialized, target_pre_confirmation,
+        "[req_cfm_audit] FAIL - previous_snapshot must deserialize exactly to the PRE-confirmation Fact"
+    );
+
+    let current = get_fact(&conn, target.id).unwrap().unwrap();
+    assert_eq!(current.epistemic_state, EpistemicState::UserConfirmed);
+    assert_eq!(
+        current.updated_at, requested_at,
+        "[req_cfm_audit] FAIL - updated_at must equal ActionMeta.requested_at exactly"
+    );
+}
+
+// --- DISPUTED sibling proof (R023 §9/§31) -------------------------------
+
+/// R018's critical clarification: confirming one `DISPUTED` Fact never
+/// touches a sibling Fact sharing the same subject+predicate - no
+/// contradiction detection, no global "resolution" of a contradiction
+/// set. `ConfirmMemory` confirms exactly one assertion.
+#[test]
+fn req_cfm_disputed_sibling_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_sibling.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let fact_a = mk_cfm_target(&mut conn, EpistemicState::Disputed);
+    let fact_b_payload = AddMemoryPayload {
+        subject: EntityInputRef::Existing(fact_a.subject_entity_id),
+        predicate: fact_a.predicate.clone(),
+        value: FactValueInput::ScalarJson("\"a different value\"".to_string()),
+        epistemic_state: EpistemicState::Disputed,
+        ..mk_am_payload()
+    };
+    let fact_b = match add_memory(&mut conn, ui_explicit(), fact_b_payload) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup fact_b failed: {other:?}"),
+    };
+    assert_eq!(fact_a.subject_entity_id, fact_b.subject_entity_id);
+    assert_eq!(fact_a.predicate, fact_b.predicate);
+    assert_ne!(fact_a.value, fact_b.value);
+    let fact_b_before = fact_b.clone();
+
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(fact_a.id)) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed);
+        }
+        other => panic!("[req_cfm_sibling] FAIL, got {other:?}"),
+    }
+
+    let fact_b_after = get_fact(&conn, fact_b.id).unwrap().unwrap();
+    assert_eq!(
+        fact_b_before, fact_b_after,
+        "[req_cfm_sibling] FAIL - a sibling DISPUTED Fact sharing subject+predicate must remain byte-for-byte unchanged - ConfirmMemory does not globally resolve a contradiction"
+    );
+}
+
+// --- Full atomic rollback (R023 - central acceptance proof, §17/§21) ---
+
+/// Mandatory central proof: forces the `fact_audit_log` insert to fail
+/// (the same reused trigger `AddMemory`/`CorrectMemory` already use)
+/// inside a real `confirm_memory` call, and proves the Fact update
+/// rolls back completely - no partial confirmation.
+#[test]
+fn req_cfm_rollback_forced_audit_failure_rolls_back_fact_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_rollback1.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    let target_before = target.clone();
+
+    install_fact_audit_failure_trigger(&conn);
+    match confirm_memory(&mut conn, ui_explicit(), mk_cfm_payload(target.id)) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_cfm_rollback1] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_fact_audit_failure_trigger(&conn);
+
+    let target_after = get_fact(&conn, target.id).unwrap().unwrap();
+    assert_eq!(
+        target_after, target_before,
+        "[req_cfm_rollback1] FAIL - Fact must remain exactly unchanged after rollback, including epistemic_state and updated_at"
+    );
+
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_audit_log WHERE fact_id = ?1 AND action_type = 'ConfirmMemory'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_count, 0,
+        "[req_cfm_rollback1] FAIL - no ConfirmMemory audit row should exist"
+    );
+
+    match add_memory(&mut conn, ui_explicit(), mk_am_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!(
+            "[req_cfm_rollback1] FAIL - connection should remain usable after rollback, got {other:?}"
+        ),
+    }
+}
+
+// --- Guarded-update direct repo-level test matrix (R023 §11/§12/§18) ---
+//
+// `confirm_fact_epistemic_state`'s own `Result`-returning behavior,
+// proven directly (not only through `confirm_memory`) - matches R022's
+// `update_fact_as_superseded` repo-level proof precedent exactly. A
+// genuine service-level "guard fires mid-transaction" race proof (R022
+// §22's style) is not attempted here: `ConfirmMemory`'s transaction has
+// only two steps (the guarded update, then the audit insert) with no
+// earlier insert to hook a same-transaction trigger onto before the
+// guarded update runs, unlike `CorrectMemory`'s six-step transaction -
+// there is no legitimate seam for it. The forced-audit-failure rollback
+// test above remains this action's mandatory central rollback proof.
+#[test]
+fn req_cfm_repo_confirm_fact_epistemic_state_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cfm_repo_matrix.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for state in [
+        EpistemicState::Inferred,
+        EpistemicState::Observed,
+        EpistemicState::Disputed,
+    ] {
+        let target = mk_cfm_target(&mut conn, state);
+        let result = storage::personal_knowledge_repo::confirm_fact_epistemic_state(
+            &conn,
+            target.id,
+            Utc::now(),
+        );
+        assert!(
+            result.is_ok(),
+            "[req_cfm_repo_matrix] FAIL - {state:?} should succeed, got {result:?}"
+        );
+        let after = get_fact(&conn, target.id).unwrap().unwrap();
+        assert_eq!(after.epistemic_state, EpistemicState::UserConfirmed);
+    }
+
+    let already_confirmed = mk_cfm_target(&mut conn, EpistemicState::UserConfirmed);
+    let before = get_fact(&conn, already_confirmed.id).unwrap().unwrap();
+    let result = storage::personal_knowledge_repo::confirm_fact_epistemic_state(
+        &conn,
+        already_confirmed.id,
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cfm_repo_matrix] FAIL - USER_CONFIRMED should be rejected, got {result:?}"
+    );
+    assert_eq!(
+        get_fact(&conn, already_confirmed.id).unwrap().unwrap(),
+        before
+    );
+
+    let stale_target = mk_cfm_target(&mut conn, EpistemicState::Inferred);
+    conn.execute(
+        "UPDATE facts SET epistemic_state = 'STALE' WHERE id = ?1",
+        rusqlite::params![stale_target.id.to_string()],
+    )
+    .unwrap();
+    let before = get_fact(&conn, stale_target.id).unwrap().unwrap();
+    let result = storage::personal_knowledge_repo::confirm_fact_epistemic_state(
+        &conn,
+        stale_target.id,
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cfm_repo_matrix] FAIL - STALE should be rejected, got {result:?}"
+    );
+    assert_eq!(get_fact(&conn, stale_target.id).unwrap().unwrap(), before);
+
+    let closed_target = mk_cfm_target(&mut conn, EpistemicState::Observed);
+    conn.execute(
+        "UPDATE facts SET valid_until = ?2 WHERE id = ?1",
+        rusqlite::params![closed_target.id.to_string(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    let before = get_fact(&conn, closed_target.id).unwrap().unwrap();
+    let result = storage::personal_knowledge_repo::confirm_fact_epistemic_state(
+        &conn,
+        closed_target.id,
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cfm_repo_matrix] FAIL - closed active-looking fixture should be rejected, got {result:?}"
+    );
+    assert_eq!(get_fact(&conn, closed_target.id).unwrap().unwrap(), before);
+
+    let result = storage::personal_knowledge_repo::confirm_fact_epistemic_state(
+        &conn,
+        FactId::new(),
+        Utc::now(),
+    );
+    assert!(
+        result.is_err(),
+        "[req_cfm_repo_matrix] FAIL - missing FactId should be rejected, not silently Ok, got {result:?}"
     );
 }
