@@ -2215,3 +2215,140 @@ fn add_relation_confidence_out_of_bounds_rejected() {
         }
     }
 }
+
+// =========================================================================
+// CorrectRelation (M2 Personal Knowledge CorrectRelation, R027,
+// 2026-09-19) - pure structural validation only, no I/O. Database-
+// dependent behavior (target existence, the active-Relation check,
+// mandatory previous-snapshot serialization) lives in `services::tests`
+// instead, same split as every other action.
+// =========================================================================
+
+fn base_correct_relation_payload() -> CorrectRelationPayload {
+    CorrectRelationPayload {
+        relation_id: RelationId::new(),
+        note: FieldPatch::Set("corrected".to_string()),
+        confidence: FieldPatch::Unchanged,
+        sensitivity: None,
+    }
+}
+
+#[test]
+fn correct_relation_valid_baseline_payload_is_accepted() {
+    assert!(validate_correct_relation(&base_correct_relation_payload()).is_ok());
+}
+
+#[test]
+fn correct_relation_inferred_provenance_effective_class_does_not_block_alone() {
+    // ImportantChange (severity 3) already dominates InferredChange
+    // (severity 2) in the generic ladder - the PK-specific
+    // memory_action_requires_confirmation overlay is what actually
+    // blocks, not effective_class/blocks_until_confirmed alone. This
+    // mirrors CorrectMemory's identical property.
+    let class = effective_class(ConfirmationClass::ImportantChange, Provenance::Inferred);
+    assert_eq!(class, ConfirmationClass::ImportantChange);
+    assert!(!blocks_until_confirmed(class));
+}
+
+/// The structural no-fields-to-correct rule (R027 §4): all three
+/// patches absent is rejected with the existing generic
+/// `NoFieldsToUpdate`, no new Relation-specific variant.
+#[test]
+fn correct_relation_all_fields_absent_rejected_as_no_fields_to_update() {
+    let payload = CorrectRelationPayload {
+        note: FieldPatch::Unchanged,
+        confidence: FieldPatch::Unchanged,
+        sensitivity: None,
+        ..base_correct_relation_payload()
+    };
+    match validate_correct_relation(&payload) {
+        Err(errors) => assert!(errors.contains(&ValidationError::NoFieldsToUpdate)),
+        Ok(_) => panic!("a payload with no requested patches should have been rejected"),
+    }
+}
+
+/// Any ONE field being a requested patch is sufficient - not a no-op.
+#[test]
+fn correct_relation_only_sensitivity_set_is_accepted() {
+    let payload = CorrectRelationPayload {
+        note: FieldPatch::Unchanged,
+        confidence: FieldPatch::Unchanged,
+        sensitivity: Some(Sensitivity::Public),
+        ..base_correct_relation_payload()
+    };
+    assert!(validate_correct_relation(&payload).is_ok());
+}
+
+#[test]
+fn correct_relation_note_clear_and_unchanged_always_valid() {
+    let clear = CorrectRelationPayload {
+        note: FieldPatch::Clear,
+        ..base_correct_relation_payload()
+    };
+    assert!(validate_correct_relation(&clear).is_ok());
+
+    let unchanged = CorrectRelationPayload {
+        note: FieldPatch::Unchanged,
+        confidence: FieldPatch::Set(0.5),
+        ..base_correct_relation_payload()
+    };
+    assert!(validate_correct_relation(&unchanged).is_ok());
+}
+
+#[test]
+fn correct_relation_note_over_max_len_rejected_but_empty_accepted() {
+    let too_long = CorrectRelationPayload {
+        note: FieldPatch::Set("n".repeat(RELATION_NOTE_MAX_LEN + 1)),
+        ..base_correct_relation_payload()
+    };
+    match validate_correct_relation(&too_long) {
+        Err(errors) => assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PersonalKnowledgeFieldTooLong { field, .. } if *field == "note"
+        ))),
+        Ok(_) => panic!("over-max-length note should have been rejected"),
+    }
+
+    let empty = CorrectRelationPayload {
+        note: FieldPatch::Set(String::new()),
+        ..base_correct_relation_payload()
+    };
+    assert!(
+        validate_correct_relation(&empty).is_ok(),
+        "empty note must be accepted, never trimmed-to-None or rejected"
+    );
+}
+
+#[test]
+fn correct_relation_confidence_set_out_of_bounds_rejected() {
+    for bad in [
+        -0.01f32,
+        1.01f32,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        let payload = CorrectRelationPayload {
+            confidence: FieldPatch::Set(bad),
+            ..base_correct_relation_payload()
+        };
+        match validate_correct_relation(&payload) {
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ConfidenceOutOfBounds { .. })),
+                "confidence {bad} should report ConfidenceOutOfBounds, got {errors:?}"
+            ),
+            Ok(_) => panic!("confidence {bad} should have been rejected"),
+        }
+    }
+}
+
+#[test]
+fn correct_relation_confidence_clear_always_valid_regardless_of_numeric_bounds() {
+    let payload = CorrectRelationPayload {
+        confidence: FieldPatch::Clear,
+        ..base_correct_relation_payload()
+    };
+    assert!(validate_correct_relation(&payload).is_ok());
+}

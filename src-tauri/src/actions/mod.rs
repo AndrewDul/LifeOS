@@ -20,8 +20,8 @@ use crate::core_error::CoreError;
 use crate::domain::{
     validate_personal_knowledge_text_len, DomainRef, EntityId, EpistemicState, FactId, Goal,
     GoalId, GoalRelationType, LifecycleStatus, MemoryType, Milestone, MilestoneId, MilestoneStatus,
-    OrderIndex, Priority, Progress, Project, ProjectId, Sensitivity, SourceId, Task, TaskId,
-    TaskStatus, CANONICAL_NAME_MAX_LEN, DESCRIPTION_MAX_LEN, DOMAIN_REF_ID_MAX_LEN,
+    OrderIndex, Priority, Progress, Project, ProjectId, RelationId, Sensitivity, SourceId, Task,
+    TaskId, TaskStatus, CANONICAL_NAME_MAX_LEN, DESCRIPTION_MAX_LEN, DOMAIN_REF_ID_MAX_LEN,
     DOMAIN_REF_TYPE_MAX_LEN, DOMAIN_TAG_MAX_LEN, ENTITY_TYPE_MAX_LEN, EVIDENCE_CONTENT_MAX_LEN,
     EVIDENCE_LOCATOR_MAX_LEN, ORDER_INDEX_MIN, PREDICATE_MAX_LEN, PRIORITY_MAX, PRIORITY_MIN,
     PROGRESS_MAX, PROGRESS_MIN, RELATION_NOTE_MAX_LEN, RELATION_TYPE_MAX_LEN, SOURCE_LABEL_MAX_LEN,
@@ -366,6 +366,17 @@ pub(crate) enum ValidationError {
     /// after both endpoints are resolved to concrete `EntityId`s - zero
     /// writes either way.
     SelfPersonalKnowledgeRelation,
+    /// `CorrectRelation`'s target `Relation` resolves to a real row, but
+    /// `domain::is_active_relation` returns `false` for it (already
+    /// closed - `valid_until` set - or already `Stale`) - needs a
+    /// database read, so `services::correct_relation` performs it and
+    /// reports it here (M2 Personal Knowledge CorrectRelation, R027,
+    /// 2026-09-19). Deliberately its own variant, never `FactNotActive`
+    /// - `Relation` and `Fact` are distinct domain types with distinct
+    /// active predicates, even though the two predicates are structurally
+    /// identical in shape. `CorrectRelation` never revives a historical
+    /// Relation.
+    RelationNotActive,
 }
 
 #[derive(Debug, Clone)]
@@ -1752,6 +1763,102 @@ pub(crate) fn validate_forget_memory(
 ) -> Result<NormalizedForgetMemory, Vec<ValidationError>> {
     Ok(NormalizedForgetMemory {
         fact_id: payload.fact_id,
+    })
+}
+
+// --- Personal Knowledge: CorrectRelation (M2 Personal Knowledge
+// CorrectRelation, R027, 2026-09-19) ---------------------------------------
+//
+// "The semantic Relation edge is still the same edge, but some metadata
+// attached to that assertion must be corrected" - an IN-PLACE metadata
+// correction, never a successor row. Relation identity is frozen as
+// `(from_entity_id, relation_type, to_entity_id)` (R025 §16) -
+// `CorrectRelation` never touches `id`/`from_entity_id`/`to_entity_id`/
+// `relation_type`; changing any of those is a different semantic edge
+// and belongs to `ForgetRelation` + `AddRelation`, never this action.
+// Only `note`/`confidence`/`sensitivity` are correctable.
+//
+// Type floor is `ImportantChange` (R025 §17), the same floor
+// `CorrectMemory` has, for the same reason: `effective_class(
+// ImportantChange, Inferred)` stays `ImportantChange` (severity 3
+// already dominates `InferredChange`'s severity 2), so the generic
+// ladder alone does NOT block an inferred, unconfirmed correction -
+// `memory_action_requires_confirmation` (already fully generic, no
+// Fact-specific logic inside it) restores the required block, reused
+// completely unmodified.
+
+/// The frozen `CorrectRelationPayload` (R025 §9, corrected by R025's own
+/// post-freeze patch-shape addendum). `note`/`confidence` are nullable
+/// `Relation` fields and use `FieldPatch<T>` (`Unchanged`/`Set`/
+/// `Clear`); `sensitivity` is `NOT NULL` in the live V7 schema and
+/// therefore uses `Option<Sensitivity>` (`None` = unchanged, `Some(v)` =
+/// replace - no `Clear` state exists for a non-nullable field),
+/// matching `CorrectMemoryPayload.sensitivity`'s precedent exactly. No
+/// `from`/`to`/`relation_type`/`epistemic_state`/`valid_from`/
+/// `valid_until`/`created_at`/`updated_at`/`Source`/`Evidence` field
+/// exists - none of those are ever touched by this action.
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectRelationPayload {
+    pub relation_id: RelationId,
+    pub note: FieldPatch<String>,
+    pub confidence: FieldPatch<f32>,
+    pub sensitivity: Option<Sensitivity>,
+}
+
+/// `validate_correct_relation`'s success output - identical shape to
+/// `CorrectRelationPayload` (there is nothing to normalize for `note`:
+/// free text is preserved exactly as supplied, matching R025/R026's
+/// frozen note policy - no trim, no empty-to-`None` collapsing).
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedCorrectRelation {
+    pub relation_id: RelationId,
+    pub note: FieldPatch<String>,
+    pub confidence: FieldPatch<f32>,
+    pub sensitivity: Option<Sensitivity>,
+}
+
+/// Pure structural validation for `CorrectRelation` - no database read
+/// (target existence, the active-Relation check, and the mandatory
+/// previous-snapshot serialization all need one; `services::
+/// correct_relation` performs them). Reuses `validate_pk_optional_field`/
+/// `confidence_out_of_bounds` unmodified - no Relation-specific copies.
+///
+/// The structural no-fields-to-correct rule (R027 §4): a payload where
+/// `note == FieldPatch::Unchanged` AND `confidence ==
+/// FieldPatch::Unchanged` AND `sensitivity == None` is rejected with the
+/// existing, generic `ValidationError::NoFieldsToUpdate` - the same
+/// variant `UpdateGoal`/`UpdateProject`/`UpdateMilestone`/`UpdateTask`
+/// already reuse, no new Relation-specific duplicate. This check is
+/// purely structural (was *any* patch requested?), never a
+/// database-dependent same-value optimization - a caller explicitly
+/// resupplying the Relation's current value for any one field still
+/// counts as a requested correction.
+pub(crate) fn validate_correct_relation(
+    payload: &CorrectRelationPayload,
+) -> Result<NormalizedCorrectRelation, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    if let FieldPatch::Set(note) = &payload.note {
+        validate_pk_optional_field("note", note, RELATION_NOTE_MAX_LEN, &mut errors);
+    }
+    validate_confidence_patch(&payload.confidence, &mut errors);
+
+    let touches_any_field = !payload.note.is_unchanged()
+        || !payload.confidence.is_unchanged()
+        || payload.sensitivity.is_some();
+    if !touches_any_field {
+        errors.push(ValidationError::NoFieldsToUpdate);
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(NormalizedCorrectRelation {
+        relation_id: payload.relation_id,
+        note: payload.note.clone(),
+        confidence: payload.confidence.clone(),
+        sensitivity: payload.sensitivity,
     })
 }
 

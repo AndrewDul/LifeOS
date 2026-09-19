@@ -147,8 +147,19 @@ before-DB-dependent-validation ordering verbatim from the Memory family;
 the only new logic is a two-layer self-edge defense (a pure structural
 fast path plus an authoritative post-resolution check) and one new
 `ValidationError::SelfPersonalKnowledgeRelation` variant.
-`CorrectRelation`/`ConfirmRelation`/`ForgetRelation` remain
-unimplemented. Episode
+**(2026-09-19, R027)** `CorrectRelation` - the second production
+Relation mutation - is real, implemented, and tested (492/492 tests):
+an IN-PLACE metadata correction of exactly `note`/`confidence`/
+`sensitivity`, never the frozen `(from_entity_id, relation_type,
+to_entity_id)` identity triple and never `epistemic_state` (reserved for
+`ConfirmRelation`). No schema change was needed - `relation_audit_log`'s
+existing R026 shape already covered it. Reuses
+`memory_action_requires_confirmation`/`serialize_required_snapshot`
+completely unmodified, matching `CorrectMemory`'s exact safety boundary,
+plus one new narrow guarded-update repo function
+(`update_relation_metadata_if_active`) and one new
+`ValidationError::RelationNotActive` variant. `ConfirmRelation`/
+`ForgetRelation` remain unimplemented. Episode
 actions and
 retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 §4o-§4v and §10,
@@ -162,13 +173,15 @@ retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 and
 `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`,
 `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`,
-`docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`.
+`docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`,
+`docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
 Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E plus
-the Relation Foundation/`AddRelation` slice, R026).
+the Relation Foundation/`AddRelation` slice (R026), and `CorrectRelation`
+(R027)).
 
 ---
 
@@ -957,6 +970,27 @@ cannot, e.g. `SelfEntity` + `Existing(actual SELF id)`) and one new
 pass (400 prior + 61 new). `CorrectRelation`/`ConfirmRelation`/
 `ForgetRelation` remain unimplemented — see
 `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`.
+
+**As of 2026-09-19 (R027), `CorrectRelation` is also real, implemented
+code.** `services::correct_relation` mutates the SAME `Relation` row in
+place — exactly `note`/`confidence`/`sensitivity` via a new narrow
+guarded-update repo function (`update_relation_metadata_if_active`,
+`WHERE id = ? AND valid_until IS NULL AND epistemic_state <> 'STALE'`,
+runtime `changed != 1` enforcement in every build profile, never
+`debug_assert!`) — and never touches the frozen `(from_entity_id,
+relation_type, to_entity_id)` identity triple or `epistemic_state`
+(reserved for the not-yet-implemented `ConfirmRelation`). No V9 was
+needed: `relation_audit_log`'s R026 schema already covered
+`CorrectRelation`'s audit row. It reuses
+`memory_action_requires_confirmation`/`serialize_required_snapshot`
+completely unmodified for the `ImportantChange` floor's inferred-
+blocking overlay and mandatory previous-snapshot, matching
+`CorrectMemory`'s exact safety boundary — proven directly with a
+nonexistent-`RelationId` gate-precedes-lookup test. One new
+`ValidationError::RelationNotActive` variant (never reused from
+`FactNotActive`). 492/492 tests pass (461 prior + 31 new). `ConfirmRelation`/
+`ForgetRelation` remain unimplemented — see
+`docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a

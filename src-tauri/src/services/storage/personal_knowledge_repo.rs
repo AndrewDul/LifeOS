@@ -882,3 +882,53 @@ pub(in crate::services) fn insert_relation_audit_log(
     )?;
     Ok(())
 }
+
+/// `CorrectRelation`'s ONLY mutation path (M2 Personal Knowledge
+/// CorrectRelation, R027, 2026-09-19) - the same narrow-storage-function
+/// discipline `update_fact_as_superseded`/`confirm_fact_epistemic_state`
+/// established: its SQL touches exactly `note`/`confidence`/
+/// `sensitivity`, nothing else. `id`/`from_entity_id`/`to_entity_id`/
+/// `relation_type`/`epistemic_state`/`valid_from`/`valid_until`/
+/// `created_at` are structurally impossible to touch through this
+/// function's parameter list - there is deliberately no
+/// `relations.updated_at` to set either (R025's post-freeze schema-scope
+/// addendum).
+///
+/// The `WHERE` clause re-checks the exact `domain::is_active_relation`
+/// predicate (`valid_until IS NULL AND epistemic_state <> 'STALE'`) at
+/// mutation time, as defense-in-depth alongside `services::
+/// correct_relation`'s own preflight check - a Relation that became
+/// inactive between the preflight and this statement (or a nonexistent
+/// id) cannot silently succeed. `changed != 1` (0 rows: missing id or
+/// no-longer-active target; >1 is structurally impossible against a
+/// primary key) is a real runtime error in every build profile, never a
+/// `debug_assert!`/`assert!`/`panic!`. The diagnostic is fixed and
+/// carries no Relation content.
+pub(in crate::services) fn update_relation_metadata_if_active(
+    conn: &Connection,
+    relation_id: RelationId,
+    note: Option<&str>,
+    confidence: Option<f32>,
+    sensitivity: Sensitivity,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE relations SET note = ?2, confidence = ?3, sensitivity = ?4
+         WHERE id = ?1 AND valid_until IS NULL AND epistemic_state <> 'STALE'",
+        params![
+            relation_id.to_string(),
+            note,
+            confidence,
+            sensitivity.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(
+                "CorrectRelation metadata update did not affect exactly one row - Relation missing or no longer active"
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}

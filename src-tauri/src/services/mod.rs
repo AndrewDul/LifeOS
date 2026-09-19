@@ -20,17 +20,17 @@ mod storage;
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
     AddMilestonePayload, AddRelationPayload, AddTaskPayload, ConfirmMemoryPayload,
-    ConfirmationClass, CorrectMemoryPayload, CreateGoalPayload, CreateProjectPayload,
-    EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload, LinkGoalsPayload, Provenance,
-    SourceRef, UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload,
-    UpdateProjectPayload, UpdateTaskPayload, ValidationError,
+    ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload, CreateGoalPayload,
+    CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload,
+    LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
+    UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
-    is_active_fact, Entity, EntityId, EpistemicState, Evidence, EvidenceId, Fact, FactId,
-    FactValue, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus, Milestone, MilestoneId,
-    MilestoneStatus, Project, ProjectId, Relation, RelationId, Sensitivity, Source, SourceId, Task,
-    TaskId, TaskStatus,
+    is_active_fact, is_active_relation, Entity, EntityId, EpistemicState, Evidence, EvidenceId,
+    Fact, FactId, FactValue, Goal, GoalId, GoalRelation, GoalRelationId, LifecycleStatus,
+    Milestone, MilestoneId, MilestoneStatus, Project, ProjectId, Relation, RelationId, Sensitivity,
+    Source, SourceId, Task, TaskId, TaskStatus,
 };
 use crate::security;
 use chrono::Utc;
@@ -2798,6 +2798,141 @@ pub(crate) fn add_relation(
 
     ActionOutcome::Success {
         value: relation,
+        confirmation_class: class,
+    }
+}
+
+/// `CorrectRelation` - the second production Personal Knowledge Relation
+/// mutation (M2 Personal Knowledge CorrectRelation, R027, 2026-09-19).
+/// "The semantic Relation edge is still the same edge, but some
+/// metadata attached to that assertion must be corrected" - an
+/// IN-PLACE metadata correction, never a successor row, never a change
+/// to the frozen `(from_entity_id, relation_type, to_entity_id)`
+/// identity triple (R025 §16). Mutates the SAME `Relation` row: exactly
+/// `note`/`confidence`/`sensitivity`, nothing else - there is
+/// deliberately no `relations.updated_at` to set (R025's post-freeze
+/// schema-scope addendum).
+///
+/// Execution order (matches the `CorrectMemory`/`AddRelation` safety
+/// boundary exactly): (1) pure structural validation
+/// (`actions::validate_correct_relation` - no SQL, includes the
+/// structural no-fields-to-correct rule); (2) `effective_class` computed
+/// against the `ImportantChange` floor; (3)/(4) the Personal-Knowledge
+/// inferred-confirmation overlay (`memory_action_requires_confirmation`,
+/// reused completely unmodified from the Fact family) - an inferred,
+/// unconfirmed correction returns `ConfirmationRequired` here, BEFORE
+/// the target Relation is ever fetched; (5) only once confirmation is
+/// satisfied does the target get read - a missing target returns
+/// `ActionOutcome::NotFound`; (6) `domain::is_active_relation` rejects
+/// an inactive target (`RelationNotActive`); (7) the mandatory
+/// `previous_snapshot` of the target's PRE-correction state is
+/// serialized (`serialize_required_snapshot`, never `.ok()`-downgraded)
+/// before (8) the atomic transaction opens.
+///
+/// `note`/`confidence` resolve from their `FieldPatch`
+/// (`Unchanged` -> retain, `Set(v)` -> `Some(v)`, `Clear` -> `None`);
+/// `sensitivity` resolves from `Option<Sensitivity>` (`None` -> retain,
+/// `Some(v)` -> replace - there is no `Clear` state for this `NOT NULL`
+/// column). `epistemic_state`/`from_entity_id`/`to_entity_id`/
+/// `relation_type`/`valid_from`/`valid_until`/`created_at` are all
+/// preserved byte-for-byte from the predecessor - `CorrectRelation`
+/// never touches epistemic state (that is `ConfirmRelation`'s exclusive
+/// job, not implemented this run) and never changes the Relation's
+/// identity.
+///
+/// Transaction order: the guarded `update_relation_metadata_if_active`
+/// update -> one `relation_audit_log` row for the same Relation ->
+/// `COMMIT`. Any failure rolls back the metadata update too - no
+/// partial correction. Creates/deletes/mutates no Entity/Source/
+/// Evidence/`relation_evidence` row, and never writes to `facts`/
+/// `fact_evidence`/`episodes`/`episode_evidence`/`episode_entities`.
+pub(crate) fn correct_relation(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: CorrectRelationPayload,
+) -> ActionOutcome<Relation> {
+    let normalized = match crate::actions::validate_correct_relation(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::ImportantChange, meta.provenance);
+    if memory_action_requires_confirmation(&meta, class) {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let target = match storage::personal_knowledge_repo::get_relation(conn, normalized.relation_id)
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if !is_active_relation(&target) {
+        return ActionOutcome::ValidationFailed(vec![ValidationError::RelationNotActive]);
+    }
+
+    let resolved_note = match &normalized.note {
+        FieldPatch::Unchanged => target.note.clone(),
+        FieldPatch::Set(v) => Some(v.clone()),
+        FieldPatch::Clear => None,
+    };
+    let resolved_confidence = match normalized.confidence {
+        FieldPatch::Unchanged => target.confidence,
+        FieldPatch::Set(c) => Some(c),
+        FieldPatch::Clear => None,
+    };
+    let resolved_sensitivity = normalized.sensitivity.unwrap_or(target.sensitivity);
+
+    let previous_snapshot = match serialize_required_snapshot(&target) {
+        Ok(s) => s,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if let Err(e) = storage::personal_knowledge_repo::update_relation_metadata_if_active(
+        &tx,
+        target.id,
+        resolved_note.as_deref(),
+        resolved_confidence,
+        resolved_sensitivity,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation_audit_log(
+        &tx,
+        target.id,
+        "CorrectRelation",
+        meta.actor,
+        meta.provenance,
+        class,
+        Some(previous_snapshot),
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    let corrected = Relation {
+        note: resolved_note,
+        confidence: resolved_confidence,
+        sensitivity: resolved_sensitivity,
+        ..target
+    };
+
+    ActionOutcome::Success {
+        value: corrected,
         confirmation_class: class,
     }
 }
