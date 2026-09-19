@@ -2599,11 +2599,20 @@ schema already covered `CorrectRelation`'s audit row. It reuses
 `memory_action_requires_confirmation`/`serialize_required_snapshot`
 completely unmodified for its `ImportantChange` floor's inferred-
 blocking overlay and mandatory previous-snapshot, matching
-`CorrectMemory`'s exact safety boundary. `ConfirmRelation`/
-`ForgetRelation` remain unimplemented; the recommended next step is R028
-`ConfirmRelation` (pure epistemic confirmation in place, mirroring
-`ConfirmMemory`'s exact shape), then R029 `ForgetRelation` (built with
-`TransactionBehavior::Immediate` from the start this time). `RecurringRule`
+`CorrectMemory`'s exact safety boundary (then further hardened the same
+day, R027 addendum, to open its own `TransactionBehavior::Immediate`
+transaction before the target read/snapshot, closing a read/snapshot/
+write race - see §10 below). **(2026-09-19, R028) `ConfirmRelation` -
+the third production Relation mutation - is now implemented and proven
+(514/514 tests)**: a pure epistemic confirmation in place
+(`INFERRED`/`OBSERVED`/`DISPUTED` -> `USER_CONFIRMED`, already-confirmed
+rejected as a no-op), mirroring `ConfirmMemory`'s exact shape - floor
+`ExplicitAdd`, no PK-specific overlay needed. Built with
+`TransactionBehavior::Immediate` from the start this time, applying
+R024's/R027's hardening lesson proactively rather than reproducing the
+same race a third time. `ForgetRelation` remains unimplemented; the
+recommended next step is R029 `ForgetRelation`, the last of the four
+frozen v0.1 Relation actions. `RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2802,6 +2811,44 @@ to proceed into implementation - see R016 §15 and R019 §23.
   unimplemented; no Tauri command wires any Relation action into the
   running app yet; Episode actions and retrieval/Context Pack remain
   entirely unstarted.
+- **RESOLVED (2026-09-19, R027 post-run transaction/snapshot-integrity
+  hardening addendum): `CorrectRelation` originally read its target and
+  serialized `previous_snapshot` before opening a plain `Deferred`
+  transaction, leaving a read/snapshot/write race a concurrent writer
+  could exploit for a stale snapshot and a lost update.** Fixed with a
+  new `begin_correct_relation_transaction` helper
+  (`TransactionBehavior::Immediate`, opened right after the confirmation
+  gate, before the target is ever read) - target lookup, the
+  active-state check, patch resolution, snapshot serialization, the
+  guarded update, and the audit insert all now happen inside one stable
+  write-locked transaction. Proven with a mandatory two-connection lock
+  test using the exact production helper, plus a target-row-specific
+  lost-update proof. 494/494 tests (492 + 2). No semantic contract
+  changed; V8 unchanged; no V9.
+- **RESOLVED (2026-09-19, M2 Personal Knowledge ConfirmRelation, R028
+  above): `ConfirmRelation` - the third production Relation mutation -
+  is real, implemented, and tested (514/514).** A pure epistemic
+  confirmation in place (`INFERRED`/`OBSERVED`/`DISPUTED` ->
+  `USER_CONFIRMED`, already-confirmed rejected via a new
+  `ValidationError::RelationAlreadyUserConfirmed` variant, never reused
+  from `FactAlreadyUserConfirmed`), mirroring `ConfirmMemory`'s exact
+  shape - floor `ExplicitAdd`, no PK-specific confirmation overlay
+  needed (the generic ladder already blocks `Inferred`). Built with
+  `TransactionBehavior::Immediate` from the start via a new
+  `begin_confirm_relation_transaction` helper, applying R024's/R027's
+  hardening lesson proactively instead of needing a later fix - target
+  lookup, the active/already-confirmed state checks, and mandatory
+  `previous_snapshot` serialization all happen inside that one
+  transaction, proven by a mandatory two-connection lock test plus a
+  target-row snapshot-stability proof. State-check ordering matches
+  `ConfirmMemory` exactly (active check before already-confirmed check).
+  Confirming a `DISPUTED` Relation resolves only that one edge - no
+  sibling Relation is ever read, searched, or changed, proven directly.
+  No schema change: V8's `action_type` CHECK already enumerated
+  `'ConfirmRelation'` (R026, forward-looking). `ForgetRelation` remains
+  unimplemented - the last of the four frozen v0.1 Relation actions; no
+  Tauri command wires any Relation action into the running app yet;
+  Episode actions and retrieval/Context Pack remain entirely unstarted.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -2961,5 +3008,6 @@ summaries - open the file for full reasoning.
 | R025 | M2 Personal Knowledge Relation Action-Family Architecture Freeze | `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md` |
 | R026 | M2 Personal Knowledge Relation Foundation and AddRelation | `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md` |
 | R027 | M2 Personal Knowledge CorrectRelation | `docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md` |
+| R028 | M2 Personal Knowledge ConfirmRelation | `docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md` |
 
-Next report allocated will be **R028**.
+Next report allocated will be **R029**.

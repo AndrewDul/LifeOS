@@ -8,9 +8,9 @@
 use super::*;
 use crate::actions::{
     ActionMeta, ActionOutcome, Actor, AddMemoryPayload, AddRelationPayload, ConfirmMemoryPayload,
-    ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload, EntityInputRef,
-    FactValueInput, FieldPatch, ForgetMemoryPayload, NewEntityData, NewEvidenceData, NewSourceData,
-    Provenance, SourceRef, ValidationError,
+    ConfirmRelationPayload, ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload,
+    EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload, NewEntityData,
+    NewEvidenceData, NewSourceData, Provenance, SourceRef, ValidationError,
 };
 use crate::core_error::CoreErrorKind;
 use crate::domain::{
@@ -18298,5 +18298,790 @@ fn req_cr_immediate_transaction_blocks_concurrent_relation_metadata_write() {
     assert!(
         unblocked_result.is_ok(),
         "[req_cr_lost_update] FAIL - after A's transaction is dropped, B should be able to write normally, got {unblocked_result:?}"
+    );
+}
+
+// =========================================================================
+// M2 Personal Knowledge ConfirmRelation (R028, 2026-09-19)
+//
+// Evidence for
+// `docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md`.
+// The third production Relation mutation - a pure epistemic confirmation
+// in place, never a metadata correction, never a new/successor Relation.
+// Built with `TransactionBehavior::Immediate` from the start (R027's
+// hardening lesson applied proactively, not reproduced then fixed).
+// Database-dependent behavior only - pure `validate_confirm_relation`
+// is trivial and has no dedicated test file split (mirrors
+// `validate_confirm_memory`'s own precedent).
+// =========================================================================
+
+fn mk_cf_payload(relation_id: RelationId) -> ConfirmRelationPayload {
+    ConfirmRelationPayload { relation_id }
+}
+
+// --- Direct repo guarded-update matrix (R028 §18-20 A-H) -----------------
+
+#[test]
+fn req_cf_repo_guarded_update_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_repo_matrix.db");
+    let conn = bootstrap_db_at(&path, &key).unwrap();
+
+    // A/B/C: INFERRED/OBSERVED/DISPUTED + active -> success, USER_CONFIRMED.
+    for state in [
+        EpistemicState::Inferred,
+        EpistemicState::Observed,
+        EpistemicState::Disputed,
+    ] {
+        let relation = mk_cr_active_relation(&conn, state);
+        let result =
+            storage::personal_knowledge_repo::confirm_relation_epistemic_state(&conn, relation.id);
+        assert!(
+            result.is_ok(),
+            "[req_cf_repo_abc] FAIL - {state:?}: {result:?}"
+        );
+        let after = get_relation(&conn, relation.id).unwrap().unwrap();
+        assert_eq!(after.epistemic_state, EpistemicState::UserConfirmed);
+    }
+
+    // D: USER_CONFIRMED + active -> Err, zero mutation.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::UserConfirmed);
+        let before = relation.clone();
+        let result =
+            storage::personal_knowledge_repo::confirm_relation_epistemic_state(&conn, relation.id);
+        assert!(
+            result.is_err(),
+            "[req_cf_repo_d] FAIL - expected Err for already-confirmed"
+        );
+        assert_eq!(get_relation(&conn, relation.id).unwrap().unwrap(), before);
+    }
+
+    // E: STALE + valid_until NULL -> Err, zero mutation.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+        raw_set_relation_valid_until_and_state(&conn, relation.id, None, EpistemicState::Stale);
+        let before = get_relation(&conn, relation.id).unwrap().unwrap();
+        let result =
+            storage::personal_knowledge_repo::confirm_relation_epistemic_state(&conn, relation.id);
+        assert!(
+            result.is_err(),
+            "[req_cf_repo_e] FAIL - expected Err for STALE target"
+        );
+        assert_eq!(get_relation(&conn, relation.id).unwrap().unwrap(), before);
+    }
+
+    // F: non-STALE + valid_until Some -> Err, zero mutation.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Observed);
+        raw_set_relation_valid_until_and_state(
+            &conn,
+            relation.id,
+            Some(Utc::now()),
+            EpistemicState::Observed,
+        );
+        let before = get_relation(&conn, relation.id).unwrap().unwrap();
+        let result =
+            storage::personal_knowledge_repo::confirm_relation_epistemic_state(&conn, relation.id);
+        assert!(
+            result.is_err(),
+            "[req_cf_repo_f] FAIL - expected Err for closed target"
+        );
+        assert_eq!(get_relation(&conn, relation.id).unwrap().unwrap(), before);
+    }
+
+    // G: STALE + valid_until Some -> Err, zero mutation.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+        raw_set_relation_valid_until_and_state(
+            &conn,
+            relation.id,
+            Some(Utc::now()),
+            EpistemicState::Stale,
+        );
+        let before = get_relation(&conn, relation.id).unwrap().unwrap();
+        let result =
+            storage::personal_knowledge_repo::confirm_relation_epistemic_state(&conn, relation.id);
+        assert!(
+            result.is_err(),
+            "[req_cf_repo_g] FAIL - expected Err for stale+closed target"
+        );
+        assert_eq!(get_relation(&conn, relation.id).unwrap().unwrap(), before);
+    }
+
+    // H: nonexistent RelationId -> Err, never silent Ok.
+    {
+        let result = storage::personal_knowledge_repo::confirm_relation_epistemic_state(
+            &conn,
+            RelationId::new(),
+        );
+        assert!(
+            result.is_err(),
+            "[req_cf_repo_h] FAIL - nonexistent id must be a real Err, never silent Ok"
+        );
+    }
+}
+
+// --- Service valid-transition / rejection matrices (R028 §21/§22) -------
+
+#[test]
+fn req_cf_service_valid_transitions_produce_user_confirmed_and_one_audit_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_valid_transitions.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    for state in [
+        EpistemicState::Inferred,
+        EpistemicState::Observed,
+        EpistemicState::Disputed,
+    ] {
+        let relation = mk_cr_active_relation(&conn, state);
+        match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+            ActionOutcome::Success { value, .. } => {
+                assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed)
+            }
+            other => {
+                panic!("[req_cf_valid_transitions] FAIL - {state:?} should succeed, got {other:?}")
+            }
+        }
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ConfirmRelation'",
+                rusqlite::params![relation.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1, "[req_cf_valid_transitions] FAIL - exactly one ConfirmRelation audit row expected for {state:?}");
+    }
+}
+
+#[test]
+fn req_cf_service_rejection_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_rejection_matrix.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    // USER_CONFIRMED + active -> RelationAlreadyUserConfirmed.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::UserConfirmed);
+        match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+            ActionOutcome::ValidationFailed(errors) => {
+                assert!(errors.contains(&ValidationError::RelationAlreadyUserConfirmed))
+            }
+            other => panic!(
+                "[req_cf_reject_a] FAIL - expected RelationAlreadyUserConfirmed, got {other:?}"
+            ),
+        }
+    }
+
+    // STALE + valid_until None -> RelationNotActive.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+        raw_set_relation_valid_until_and_state(&conn, relation.id, None, EpistemicState::Stale);
+        match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+            ActionOutcome::ValidationFailed(errors) => {
+                assert!(errors.contains(&ValidationError::RelationNotActive))
+            }
+            other => panic!("[req_cf_reject_b] FAIL - expected RelationNotActive, got {other:?}"),
+        }
+    }
+
+    // non-STALE + valid_until Some -> RelationNotActive.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Observed);
+        raw_set_relation_valid_until_and_state(
+            &conn,
+            relation.id,
+            Some(Utc::now()),
+            EpistemicState::Observed,
+        );
+        match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+            ActionOutcome::ValidationFailed(errors) => {
+                assert!(errors.contains(&ValidationError::RelationNotActive))
+            }
+            other => panic!("[req_cf_reject_c] FAIL - expected RelationNotActive, got {other:?}"),
+        }
+    }
+
+    // STALE + valid_until Some -> RelationNotActive.
+    {
+        let relation = mk_cr_active_relation(&conn, EpistemicState::Disputed);
+        raw_set_relation_valid_until_and_state(
+            &conn,
+            relation.id,
+            Some(Utc::now()),
+            EpistemicState::Stale,
+        );
+        match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+            ActionOutcome::ValidationFailed(errors) => {
+                assert!(errors.contains(&ValidationError::RelationNotActive))
+            }
+            other => panic!("[req_cf_reject_d] FAIL - expected RelationNotActive, got {other:?}"),
+        }
+    }
+
+    // Missing RelationId after gate satisfied -> NotFound.
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(RelationId::new())) {
+        ActionOutcome::NotFound => {}
+        other => panic!("[req_cf_reject_e] FAIL - expected NotFound, got {other:?}"),
+    }
+
+    assert_eq!(
+        relation_audit_row_count(&conn),
+        0,
+        "[req_cf_rejection_matrix] FAIL - zero audit writes expected across every rejection"
+    );
+}
+
+/// State-check ordering (R028 §23): for a Relation that is BOTH closed
+/// AND already `USER_CONFIRMED`, inactive wins - `RelationNotActive`,
+/// never `RelationAlreadyUserConfirmed` - matching `ConfirmMemory`'s
+/// established ordering (active check before already-confirmed check).
+#[test]
+fn req_cf_inactive_and_already_confirmed_ordering_inactive_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_ordering.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let relation = mk_cr_active_relation(&conn, EpistemicState::UserConfirmed);
+    raw_set_relation_valid_until_and_state(
+        &conn,
+        relation.id,
+        Some(Utc::now()),
+        EpistemicState::UserConfirmed,
+    );
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+        ActionOutcome::ValidationFailed(errors) => {
+            assert!(
+                errors.contains(&ValidationError::RelationNotActive),
+                "[req_cf_ordering] FAIL - a closed AND already-confirmed Relation must report RelationNotActive, not RelationAlreadyUserConfirmed, got {errors:?}"
+            );
+            assert!(!errors.contains(&ValidationError::RelationAlreadyUserConfirmed));
+        }
+        other => panic!("[req_cf_ordering] FAIL - expected ValidationFailed, got {other:?}"),
+    }
+}
+
+// --- Confirmation matrix / gate-before-transaction-and-lookup (R028 §6/§32) --
+
+#[test]
+fn req_cf_conf_a_explicit_unconfirmed_executes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_conf_a.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let relation = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd),
+        other => panic!("[req_cf_conf_a] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+#[test]
+fn req_cf_conf_b_explicit_confirmed_true_succeeds_same_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_conf_b.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let relation = mk_cr_active_relation(&conn, EpistemicState::Observed);
+    let mut meta = ui_explicit();
+    meta.confirmed = true;
+    match confirm_relation(&mut conn, meta, mk_cf_payload(relation.id)) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => assert_eq!(confirmation_class, ConfirmationClass::ExplicitAdd),
+        other => panic!("[req_cf_conf_b] FAIL - expected Success, got {other:?}"),
+    }
+}
+
+/// MANDATORY ordering proof (R028 §6): a nonexistent `RelationId` with
+/// `Inferred`+unconfirmed must return `ConfirmationRequired`, never
+/// `NotFound` - proving the gate precedes BOTH the Immediate transaction
+/// open and the target lookup.
+#[test]
+fn req_cf_conf_c_inferred_unconfirmed_blocks_gate_precedes_transaction_and_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_conf_c.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    match confirm_relation(&mut conn, meta, mk_cf_payload(RelationId::new())) {
+        ActionOutcome::ConfirmationRequired { confirmation_class } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange)
+        }
+        other => panic!(
+            "[req_cf_conf_c] FAIL - expected ConfirmationRequired (gate must precede transaction open and Relation lookup, not NotFound), got {other:?}"
+        ),
+    }
+    assert_eq!(relation_audit_row_count(&conn), 0);
+}
+
+#[test]
+fn req_cf_conf_d_inferred_confirmed_succeeds_audit_provenance_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_conf_d.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let relation = mk_cr_active_relation(&conn, EpistemicState::Disputed);
+    let mut meta = ActionMeta::now(Actor::CloudLlm, Provenance::Inferred);
+    meta.confirmed = true;
+    match confirm_relation(&mut conn, meta, mk_cf_payload(relation.id)) {
+        ActionOutcome::Success {
+            value,
+            confirmation_class,
+        } => {
+            assert_eq!(confirmation_class, ConfirmationClass::InferredChange);
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed);
+        }
+        other => panic!("[req_cf_conf_d] FAIL - expected Success, got {other:?}"),
+    }
+    let provenance: String = conn
+        .query_row(
+            "SELECT provenance FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ConfirmRelation'",
+            rusqlite::params![relation.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance, "Inferred",
+        "[req_cf_conf_d] FAIL - audit provenance must remain Inferred, never rewritten to Explicit"
+    );
+}
+
+// --- Audit exactness (R028 §24-26) ---------------------------------------
+
+#[test]
+fn req_cf_audit_exact_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_audit_explicit.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = mk_cr_active_relation(&conn, EpistemicState::Observed);
+    let fixed = chrono::DateTime::parse_from_rfc3339("2026-03-10T14:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Explicit,
+        requested_at: fixed,
+        confirmed: false,
+    };
+    match confirm_relation(&mut conn, meta, mk_cf_payload(before.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cf_audit_explicit] FAIL - expected Success, got {other:?}"),
+    }
+    let (relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT relation_id, action_type, actor, provenance, confirmation_class, previous_snapshot, occurred_at FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ConfirmRelation'",
+            rusqlite::params![before.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap();
+    assert_eq!(relation_id, before.id.to_string());
+    assert_eq!(action_type, "ConfirmRelation");
+    assert_eq!(actor, "CloudLLM");
+    assert_eq!(provenance, "Explicit");
+    assert_eq!(confirmation_class, "EXPLICIT_ADD");
+    let snapshot: Relation = serde_json::from_str(&previous_snapshot.unwrap()).unwrap();
+    assert_eq!(snapshot, before);
+    assert_eq!(occurred_at, fixed.to_rfc3339());
+}
+
+#[test]
+fn req_cf_audit_exact_inferred_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_audit_inferred.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+    let fixed = chrono::DateTime::parse_from_rfc3339("2026-03-11T15:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let meta = ActionMeta {
+        actor: Actor::CloudLlm,
+        provenance: Provenance::Inferred,
+        requested_at: fixed,
+        confirmed: true,
+    };
+    match confirm_relation(&mut conn, meta, mk_cf_payload(before.id)) {
+        ActionOutcome::Success {
+            confirmation_class, ..
+        } => assert_eq!(confirmation_class, ConfirmationClass::InferredChange),
+        other => panic!("[req_cf_audit_inferred] FAIL - expected Success, got {other:?}"),
+    }
+    let (provenance, confirmation_class): (String, String) = conn
+        .query_row(
+            "SELECT provenance, confirmation_class FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ConfirmRelation'",
+            rusqlite::params![before.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(provenance, "Inferred");
+    assert_eq!(confirmation_class, "INFERRED_CHANGE");
+}
+
+// --- Snapshot exactness (R028 §31) ---------------------------------------
+
+#[test]
+fn req_cf_snapshot_deserializes_exactly_to_pre_confirmation_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_snapshot.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = mk_cr_active_relation(&conn, EpistemicState::Observed);
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(before.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cf_snapshot] FAIL - expected Success, got {other:?}"),
+    }
+    let snapshot_json: String = conn
+        .query_row(
+            "SELECT previous_snapshot FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ConfirmRelation'",
+            rusqlite::params![before.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let deserialized: Relation = serde_json::from_str(&snapshot_json).unwrap();
+    assert_eq!(
+        deserialized, before,
+        "[req_cf_snapshot] FAIL - previous_snapshot must deserialize to EXACTLY the PRE-confirmation Relation"
+    );
+}
+
+// --- Immediate-transaction concurrency proofs (R028 §27/§28, MANDATORY) --
+
+/// MANDATORY: proves `confirm_relation`'s OWN transaction helper -
+/// `begin_confirm_relation_transaction`, the exact helper/path
+/// production code uses - genuinely uses `TransactionBehavior::
+/// Immediate`. Same two-connection mechanism as `ForgetMemory`'s and
+/// `CorrectRelation`'s own precedent.
+#[test]
+fn req_cf_uses_immediate_transaction_blocking_concurrent_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_immediate_lock.db");
+    let mut conn_a = bootstrap_db_at(&path, &key).unwrap();
+    let conn_b = bootstrap_db_at(&path, &key).unwrap();
+    conn_b
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+
+    let tx_a = begin_confirm_relation_transaction(&mut conn_a).unwrap();
+
+    let harmless_write = || {
+        conn_b.execute(
+            "INSERT INTO sources (id, source_type, sensitivity, captured_at, created_at)
+             VALUES (?1, 'conversation', 'INTERNAL', ?2, ?2)",
+            rusqlite::params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+        )
+    };
+
+    let blocked_result = harmless_write();
+    match &blocked_result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert!(
+                matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "[req_cf_immediate_lock] FAIL - expected SQLITE_BUSY/LOCKED, got {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_cf_immediate_lock] FAIL - a concurrent writer must be blocked while ConfirmRelation's IMMEDIATE transaction holds the write lock, got {other:?}"
+        ),
+    }
+
+    drop(tx_a);
+
+    let unblocked_result = harmless_write();
+    assert!(
+        unblocked_result.is_ok(),
+        "[req_cf_immediate_lock] FAIL - after A's transaction is dropped/rolled back, B should be able to write normally, got {unblocked_result:?}"
+    );
+}
+
+/// The target-row snapshot-stability proof: a second connection cannot
+/// mutate the TARGET Relation's own metadata/epistemic_state while
+/// Connection A's `ConfirmRelation` transaction holds the write
+/// reservation, having already read that exact target through `&tx`.
+#[test]
+fn req_cf_immediate_transaction_blocks_concurrent_relation_metadata_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_lost_update.db");
+    let mut conn_a = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cr_active_relation(&conn_a, EpistemicState::Inferred);
+
+    let conn_b = bootstrap_db_at(&path, &key).unwrap();
+    conn_b
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+
+    let tx_a = begin_confirm_relation_transaction(&mut conn_a).unwrap();
+    let read_through_tx = get_relation(&tx_a, target.id).unwrap().unwrap();
+    assert_eq!(
+        read_through_tx, target,
+        "[req_cf_lost_update] FAIL - the transaction-read Relation must be the one the snapshot is built from"
+    );
+
+    let concurrent_write = || {
+        conn_b.execute(
+            "UPDATE relations SET epistemic_state = 'DISPUTED' WHERE id = ?1",
+            rusqlite::params![target.id.to_string()],
+        )
+    };
+
+    let blocked_result = concurrent_write();
+    match &blocked_result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert!(
+                matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "[req_cf_lost_update] FAIL - expected SQLITE_BUSY/LOCKED, got {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_cf_lost_update] FAIL - a second writer must be blocked from mutating the TARGET Relation while A's IMMEDIATE transaction holds it, got {other:?}"
+        ),
+    }
+
+    drop(tx_a);
+
+    let unblocked_result = concurrent_write();
+    assert!(
+        unblocked_result.is_ok(),
+        "[req_cf_lost_update] FAIL - after A's transaction is dropped, B should be able to write normally, got {unblocked_result:?}"
+    );
+}
+
+// --- Forced rollback proof (R028 §30, MANDATORY) -------------------------
+
+#[test]
+fn req_cf_forced_audit_failure_rolls_back_epistemic_update_then_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_rollback.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+
+    install_relation_audit_failure_trigger(&conn);
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(before.id)) {
+        ActionOutcome::StorageError(_) => {}
+        other => panic!("[req_cf_rollback] FAIL - expected StorageError, got {other:?}"),
+    }
+    remove_relation_audit_failure_trigger(&conn);
+
+    let after = get_relation(&conn, before.id).unwrap().unwrap();
+    assert_eq!(
+        after, before,
+        "[req_cf_rollback] FAIL - forced audit failure must roll back the epistemic UPDATE too"
+    );
+    assert_eq!(
+        after.epistemic_state,
+        EpistemicState::Inferred,
+        "[req_cf_rollback] FAIL - epistemic_state must NOT have changed"
+    );
+    assert_eq!(
+        relation_audit_row_count(&conn),
+        0,
+        "[req_cf_rollback] FAIL - no ConfirmRelation audit row should exist"
+    );
+
+    // Recovery: connection remains usable and a genuine call now succeeds.
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(before.id)) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed)
+        }
+        other => panic!("[req_cf_rollback] FAIL - connection unusable after rollback: {other:?}"),
+    }
+}
+
+// --- Same-row / immutable fields / row count (R028 §33-36) --------------
+
+#[test]
+fn req_cf_only_epistemic_state_changes_everything_else_immutable_row_count_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_immutable.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before_count = relation_row_count(&conn);
+    let before_relation_evidence = relation_evidence_row_count(&conn);
+    let before = mk_cr_active_relation(&conn, EpistemicState::Observed);
+    assert_eq!(relation_row_count(&conn), before_count + 1);
+
+    let returned = match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(before.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cf_immutable] FAIL - expected Success, got {other:?}"),
+    };
+
+    assert_eq!(returned.id, before.id);
+    assert_eq!(returned.from_entity_id, before.from_entity_id);
+    assert_eq!(returned.to_entity_id, before.to_entity_id);
+    assert_eq!(returned.relation_type, before.relation_type);
+    assert_eq!(
+        returned.note, before.note,
+        "[req_cf_immutable] FAIL - note must be unchanged"
+    );
+    assert_eq!(
+        returned.confidence, before.confidence,
+        "[req_cf_immutable] FAIL - confidence must be unchanged"
+    );
+    assert_eq!(
+        returned.sensitivity, before.sensitivity,
+        "[req_cf_immutable] FAIL - sensitivity must be unchanged"
+    );
+    assert_eq!(returned.valid_from, before.valid_from);
+    assert_eq!(returned.valid_until, before.valid_until);
+    assert_eq!(returned.created_at, before.created_at);
+    assert_eq!(returned.epistemic_state, EpistemicState::UserConfirmed);
+
+    assert_eq!(
+        relation_row_count(&conn),
+        before_count + 1,
+        "[req_cf_immutable] FAIL - ConfirmRelation must never create a new relations row"
+    );
+    assert_eq!(relation_evidence_row_count(&conn), before_relation_evidence);
+}
+
+// --- Sibling / Entity/Source/Evidence / Fact/Episode non-interference (R028 §37-39) --
+
+/// Confirming a `DISPUTED` target must never touch a sibling Relation
+/// sharing the same endpoints - no contradiction resolution.
+#[test]
+fn req_cf_sibling_relation_non_interference_when_confirming_disputed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_sibling.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+
+    let from = mk_pk_entity("person", "Sibling From", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &from).unwrap();
+    let to = mk_pk_entity("project", "Sibling To", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &to).unwrap();
+
+    let target = mk_pk_relation(
+        from.id,
+        to.id,
+        "works_on",
+        EpistemicState::Disputed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_relation(&conn, &target).unwrap();
+    let sibling = mk_pk_relation(
+        from.id,
+        to.id,
+        "works_on",
+        EpistemicState::Disputed,
+        Sensitivity::Internal,
+    );
+    storage::personal_knowledge_repo::insert_relation(&conn, &sibling).unwrap();
+
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => {
+            assert_eq!(value.epistemic_state, EpistemicState::UserConfirmed)
+        }
+        other => panic!("[req_cf_sibling] FAIL - expected Success, got {other:?}"),
+    }
+
+    let sibling_after = get_relation(&conn, sibling.id).unwrap().unwrap();
+    assert_eq!(
+        sibling_after, sibling,
+        "[req_cf_sibling] FAIL - a sibling DISPUTED Relation must remain byte-for-byte unchanged - no contradiction resolution"
+    );
+}
+
+#[test]
+fn req_cf_entity_source_evidence_non_interference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_non_interference.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let before_entities = entity_row_count(&conn);
+    let before_sources = am_source_row_count(&conn);
+    let before_evidence = am_evidence_row_count(&conn);
+    let before_relation_evidence = relation_evidence_row_count(&conn);
+
+    let relation = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cf_non_interference] FAIL - expected Success, got {other:?}"),
+    }
+
+    assert_eq!(
+        entity_row_count(&conn),
+        before_entities + 2,
+        "[req_cf_non_interference] FAIL - only the two fixture Entities should exist, ConfirmRelation creates none"
+    );
+    assert_eq!(am_source_row_count(&conn), before_sources);
+    assert_eq!(am_evidence_row_count(&conn), before_evidence);
+    assert_eq!(relation_evidence_row_count(&conn), before_relation_evidence);
+}
+
+#[test]
+fn req_cf_fact_episode_non_interference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_fact_episode.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let relation = mk_cr_active_relation(&conn, EpistemicState::Observed);
+    let before = relation_episode_side_effect_counts(&conn);
+    let before_facts = am_fact_row_count(&conn);
+    let before_fact_evidence = am_fact_evidence_row_count(&conn);
+
+    match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(relation.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_cf_fact_episode] FAIL - expected Success, got {other:?}"),
+    }
+
+    let after = relation_episode_side_effect_counts(&conn);
+    assert_eq!(
+        after.0, before.0,
+        "[req_cf_fact_episode] FAIL - relations row count must be unchanged (same row)"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "[req_cf_fact_episode] FAIL - episodes must be untouched"
+    );
+    assert_eq!(
+        after.2, before.2,
+        "[req_cf_fact_episode] FAIL - relation_evidence must be untouched"
+    );
+    assert_eq!(
+        after.3, before.3,
+        "[req_cf_fact_episode] FAIL - episode_evidence must be untouched"
+    );
+    assert_eq!(
+        after.4, before.4,
+        "[req_cf_fact_episode] FAIL - episode_entities must be untouched"
+    );
+    assert_eq!(
+        am_fact_row_count(&conn),
+        before_facts,
+        "[req_cf_fact_episode] FAIL - facts must be untouched"
+    );
+    assert_eq!(
+        am_fact_evidence_row_count(&conn),
+        before_fact_evidence,
+        "[req_cf_fact_episode] FAIL - fact_evidence must be untouched"
+    );
+}
+
+// --- Output readback (R028 §40) ------------------------------------------
+
+#[test]
+fn req_cf_output_matches_get_relation_readback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cf_readback.db");
+    let mut conn = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cr_active_relation(&conn, EpistemicState::Inferred);
+
+    let returned = match confirm_relation(&mut conn, ui_explicit(), mk_cf_payload(target.id)) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("[req_cf_readback] FAIL - expected Success, got {other:?}"),
+    };
+
+    let readback = get_relation(&conn, target.id)
+        .unwrap()
+        .expect("[req_cf_readback] FAIL - target not found via get_relation");
+    assert_eq!(
+        returned, readback,
+        "[req_cf_readback] FAIL - returned Relation must exactly equal get_relation's read-back, no stale in-memory result"
     );
 }

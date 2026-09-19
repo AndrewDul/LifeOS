@@ -158,8 +158,20 @@ existing R026 shape already covered it. Reuses
 completely unmodified, matching `CorrectMemory`'s exact safety boundary,
 plus one new narrow guarded-update repo function
 (`update_relation_metadata_if_active`) and one new
-`ValidationError::RelationNotActive` variant. `ConfirmRelation`/
-`ForgetRelation` remain unimplemented. Episode
+`ValidationError::RelationNotActive` variant - then further hardened the
+same day (R027 addendum) to open its own `TransactionBehavior::Immediate`
+transaction before the target read/snapshot, closing a read/snapshot/
+write race (494/494 tests, +2). **(2026-09-19, R028)** `ConfirmRelation`
+- the third production Relation mutation - is real, implemented, and
+tested (514/514 tests): a pure epistemic confirmation in place
+(`INFERRED`/`OBSERVED`/`DISPUTED` → `USER_CONFIRMED`, already-confirmed
+rejected via a new `ValidationError::RelationAlreadyUserConfirmed`
+variant), mirroring `ConfirmMemory`'s exact shape - floor `ExplicitAdd`,
+no PK-specific overlay needed. Built with `TransactionBehavior::Immediate`
+from the start via a new `begin_confirm_relation_transaction` helper,
+applying R024's/R027's hardening lesson proactively rather than needing
+a later fix. `ForgetRelation` remains unimplemented - the last of the
+four frozen v0.1 Relation actions. Episode
 actions and
 retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
 §4o-§4v and §10,
@@ -174,14 +186,15 @@ and
 `docs/reports/R024_M2_PERSONAL_KNOWLEDGE_FORGETMEMORY_SLICE_E_2026-09-18.md`,
 `docs/reports/R025_M2_PERSONAL_KNOWLEDGE_RELATION_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`,
-`docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`.
+`docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`,
+`docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
 *architecture*, only partially code so far (Goal, Project, GoalRelation,
 Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E plus
-the Relation Foundation/`AddRelation` slice (R026), and `CorrectRelation`
-(R027)).
+the Relation Foundation/`AddRelation` slice (R026), `CorrectRelation`
+(R027), and `ConfirmRelation` (R028)).
 
 ---
 
@@ -988,9 +1001,46 @@ blocking overlay and mandatory previous-snapshot, matching
 `CorrectMemory`'s exact safety boundary — proven directly with a
 nonexistent-`RelationId` gate-precedes-lookup test. One new
 `ValidationError::RelationNotActive` variant (never reused from
-`FactNotActive`). 492/492 tests pass (461 prior + 31 new). `ConfirmRelation`/
-`ForgetRelation` remain unimplemented — see
-`docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`.
+`FactNotActive`). 492/492 tests pass (461 prior + 31 new). Further
+hardened the same day (R027 addendum): a review found the target read
+and mandatory `previous_snapshot` serialization happened BEFORE a plain
+`Deferred` transaction opened, leaving a read/snapshot/write race a
+concurrent writer could exploit; fixed with `begin_correct_relation_transaction`
+(`TransactionBehavior::Immediate`, opened right after the confirmation
+gate, before the target is ever read) — target lookup, state checks,
+patch resolution, snapshot serialization, the guarded update, and the
+audit insert all now happen inside one stable write-locked transaction,
+proven with a mandatory two-connection lock test plus a target-row
+lost-update proof. 494/494 tests (492 + 2).
+
+**As of 2026-09-19 (R028), `ConfirmRelation` is also real, implemented
+code.** `services::confirm_relation` mutates the SAME `Relation` row in
+place — exactly `epistemic_state` (`INFERRED`/`OBSERVED`/`DISPUTED` →
+`USER_CONFIRMED`) via a new narrow guarded-update repo function
+(`confirm_relation_epistemic_state`,
+`WHERE id = ? AND valid_until IS NULL AND epistemic_state IN ('INFERRED','OBSERVED','DISPUTED')`,
+runtime `changed != 1` enforcement, never `debug_assert!`) — mirroring
+`ConfirmMemory`'s exact shape, floor `ExplicitAdd`, no PK-specific
+overlay needed (the generic ladder already blocks `Inferred`). Unlike
+`CorrectMemory`/`CorrectRelation` (both originally shipped `Deferred`
+and needed a later hardening pass), `ConfirmRelation` opens its own
+`TransactionBehavior::Immediate` transaction
+(`begin_confirm_relation_transaction`) from the start — target lookup,
+the active/already-confirmed state checks, and mandatory
+`previous_snapshot` serialization all happen inside that one
+transaction, proven with the same mandatory two-connection lock test
+plus target-row snapshot-stability proof pattern R027's hardening
+established. State-check ordering matches `ConfirmMemory` exactly
+(active check before already-confirmed check, using a new
+`ValidationError::RelationAlreadyUserConfirmed` variant, never reused
+from `FactAlreadyUserConfirmed`). Confirming a `DISPUTED` Relation
+resolves only that one edge — no sibling Relation sharing the same
+endpoints is ever read, searched, or changed, proven directly. No V9
+was needed: V8's `action_type` CHECK already enumerated
+`'ConfirmRelation'` (R026, forward-looking). 514/514 tests pass
+(494 prior + 20 new). `ForgetRelation` remains unimplemented — the last
+of the four frozen v0.1 Relation actions — see
+`docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md`.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a

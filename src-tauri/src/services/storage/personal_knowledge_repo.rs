@@ -932,3 +932,46 @@ pub(in crate::services) fn update_relation_metadata_if_active(
     }
     Ok(())
 }
+
+/// `ConfirmRelation`'s ONLY mutation path (M2 Personal Knowledge
+/// ConfirmRelation, R028, 2026-09-19) - the same narrow-storage-function
+/// discipline `update_relation_metadata_if_active`/
+/// `confirm_fact_epistemic_state` established: its SQL touches exactly
+/// `epistemic_state` (a literal `'USER_CONFIRMED'`, not a parameter -
+/// this function has exactly one purpose and it is always this
+/// transition). `id`/`from_entity_id`/`to_entity_id`/`relation_type`/
+/// `note`/`confidence`/`sensitivity`/`valid_from`/`valid_until`/
+/// `created_at` are structurally impossible to touch through this
+/// function's parameter list - there is deliberately no
+/// `relations.updated_at` to set either.
+///
+/// The `WHERE` clause re-checks, at mutation time, both preconditions
+/// `services::confirm_relation` already checked at preflight - active
+/// (`valid_until IS NULL AND epistemic_state <> 'STALE'`) and confirmable
+/// (`epistemic_state IN ('INFERRED', 'OBSERVED', 'DISPUTED')`, which
+/// already excludes both `STALE` and `USER_CONFIRMED`) - as
+/// defense-in-depth, matching `confirm_fact_epistemic_state`'s exact
+/// precedent. `changed != 1` (0 rows: missing id, inactive, or already
+/// confirmed; >1 structurally impossible against a primary key) is a
+/// real runtime error in every build profile, never a `debug_assert!`.
+/// The diagnostic is fixed and carries no Relation content.
+pub(in crate::services) fn confirm_relation_epistemic_state(
+    conn: &Connection,
+    relation_id: RelationId,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE relations SET epistemic_state = 'USER_CONFIRMED'
+         WHERE id = ?1 AND valid_until IS NULL AND epistemic_state IN ('INFERRED', 'OBSERVED', 'DISPUTED')",
+        params![relation_id.to_string()],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(
+                "ConfirmRelation update did not affect exactly one row - Relation missing, no longer active, or already confirmed"
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}

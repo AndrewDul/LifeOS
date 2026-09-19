@@ -20,10 +20,11 @@ mod storage;
 use crate::actions::{
     blocks_until_confirmed, effective_class, ActionMeta, ActionOutcome, AddMemoryPayload,
     AddMilestonePayload, AddRelationPayload, AddTaskPayload, ConfirmMemoryPayload,
-    ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload, CreateGoalPayload,
-    CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch, ForgetMemoryPayload,
-    LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload, UpdateMilestonePayload,
-    UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload, ValidationError,
+    ConfirmRelationPayload, ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload,
+    CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch,
+    ForgetMemoryPayload, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload,
+    UpdateMilestonePayload, UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload,
+    ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
@@ -2965,6 +2966,165 @@ fn begin_correct_relation_transaction(
     conn: &mut Connection,
 ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// Opens `ConfirmRelation`'s own transaction with `TransactionBehavior::
+/// Immediate` (M2 Personal Knowledge ConfirmRelation, R028, 2026-09-19) -
+/// built this way from the start, applying the exact lesson R027's own
+/// post-run hardening pass learned for `CorrectRelation` (and R024's
+/// hardening pass learned for `ForgetMemory`) rather than reproducing
+/// the same read/snapshot/write race a second time. `ConfirmRelation`
+/// reads the target Relation and serializes a mandatory
+/// `previous_snapshot` from that exact read; a plain `conn.
+/// transaction()` (`Deferred`) would reserve no lock until the first
+/// write, letting a concurrent writer change the same row between the
+/// read and `ConfirmRelation`'s own guarded `UPDATE`. `Immediate`
+/// reserves the write lock at `BEGIN`, before `confirm_relation`
+/// performs `get_relation` through this same transaction. Scoped to
+/// `ConfirmRelation` only - `begin_correct_relation_transaction` above
+/// is untouched, not renamed, not generalized into shared
+/// infrastructure.
+fn begin_confirm_relation_transaction(
+    conn: &mut Connection,
+) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// `ConfirmRelation` - the third production Personal Knowledge Relation
+/// mutation (M2 Personal Knowledge ConfirmRelation, R028, 2026-09-19).
+/// "The user confirms that this existing Personal Knowledge Relation
+/// should be treated as USER_CONFIRMED knowledge" - a pure EPISTEMIC
+/// confirmation, never a metadata correction, never a new/successor
+/// Relation, never a contradiction-resolution workflow. Mutates the SAME
+/// `Relation` row in place: exactly `epistemic_state` (always to
+/// `USER_CONFIRMED`) - there is deliberately no `relations.updated_at`
+/// to set.
+///
+/// Execution order (matches `ConfirmMemory`'s safety boundary, with the
+/// transaction itself opened `Immediate` from the start per R027's
+/// hardening lesson - see `begin_confirm_relation_transaction` above):
+/// (1) pure structural validation (`actions::validate_confirm_relation` -
+/// trivial, the payload is one `RelationId`); (2) `effective_class`
+/// computed against the `ExplicitAdd` floor; (3) the confirmation gate -
+/// **no Personal-Knowledge-specific overlay is needed here** (unlike
+/// `CorrectRelation`'s `ImportantChange` floor): the generic
+/// `effective_class(ExplicitAdd, Inferred) = InferredChange` already
+/// dominates and `blocks_until_confirmed` already returns `true` for
+/// it, the same reason `AddRelation`/`ConfirmMemory` needed no overlay;
+/// (4) only once confirmation is satisfied does the Immediate
+/// transaction open, and only THROUGH that transaction does the target
+/// Relation get read - a missing target returns `ActionOutcome::
+/// NotFound`, never reached while unconfirmed; (5) `domain::
+/// is_active_relation` rejects an inactive target (`RelationNotActive`,
+/// reused unchanged from `CorrectRelation`) - checked BEFORE the
+/// already-confirmed check, matching `ConfirmMemory`'s exact ordering,
+/// so a closed-AND-already-confirmed Relation reports `RelationNotActive`,
+/// never `RelationAlreadyUserConfirmed`; an active target already
+/// `USER_CONFIRMED` is rejected as a no-op (`RelationAlreadyUserConfirmed`)
+/// rather than silently returning `Success` with zero writes; (6) the
+/// mandatory `previous_snapshot` of the target's PRE-confirmation state
+/// is serialized (`serialize_required_snapshot`, never `.ok()`-
+/// downgraded) from that SAME transaction-read target, before (7) the
+/// guarded epistemic update and audit insert run inside the same
+/// transaction.
+///
+/// `DISPUTED` is confirmable (R025 §13, mirroring `ConfirmMemory`'s own
+/// `DISPUTED`-confirmable precedent, R018) - confirming a `DISPUTED`
+/// Relation resolves only that ONE targeted Relation; no sibling
+/// Relation sharing the same endpoints/`relation_type` is ever read,
+/// searched, changed, or globally "resolved" - `ConfirmRelation`
+/// confirms exactly one edge, never a contradiction set.
+///
+/// `provenance` in the audit row is never rewritten - a confirmed
+/// `Inferred` proposal's audit row keeps `provenance = "Inferred"` while
+/// the Relation's own `epistemic_state` becomes `USER_CONFIRMED`
+/// (confirmation and provenance remain distinct concepts, matching
+/// `AddRelation`/`CorrectRelation`/`ConfirmMemory`'s identical
+/// guarantee).
+///
+/// Transaction order: `BEGIN IMMEDIATE` -> `get_relation(&tx)` -> state
+/// checks -> serialize `previous_snapshot` -> the guarded
+/// `confirm_relation_epistemic_state` update -> one `relation_audit_log`
+/// row for the same Relation -> `COMMIT`. Any failure rolls back the
+/// epistemic update too - no partial confirmation. Creates no Entity/
+/// Source/Evidence/`relation_evidence` row, and never writes to
+/// `facts`/`fact_evidence`/`episodes`/`episode_evidence`/
+/// `episode_entities`.
+pub(crate) fn confirm_relation(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: ConfirmRelationPayload,
+) -> ActionOutcome<Relation> {
+    let normalized = match crate::actions::validate_confirm_relation(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::ExplicitAdd, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let tx = match begin_confirm_relation_transaction(conn) {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    let target = match storage::personal_knowledge_repo::get_relation(&tx, normalized.relation_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    if !is_active_relation(&target) {
+        return ActionOutcome::ValidationFailed(vec![ValidationError::RelationNotActive]);
+    }
+    if target.epistemic_state == EpistemicState::UserConfirmed {
+        return ActionOutcome::ValidationFailed(vec![
+            ValidationError::RelationAlreadyUserConfirmed,
+        ]);
+    }
+
+    let previous_snapshot = match serialize_required_snapshot(&target) {
+        Ok(s) => s,
+        Err(e) => return ActionOutcome::StorageError(e),
+    };
+
+    if let Err(e) =
+        storage::personal_knowledge_repo::confirm_relation_epistemic_state(&tx, target.id)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation_audit_log(
+        &tx,
+        target.id,
+        "ConfirmRelation",
+        meta.actor,
+        meta.provenance,
+        class,
+        Some(previous_snapshot),
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    let confirmed = Relation {
+        epistemic_state: EpistemicState::UserConfirmed,
+        ..target
+    };
+
+    ActionOutcome::Success {
+        value: confirmed,
+        confirmation_class: class,
+    }
 }
 
 #[cfg(test)]

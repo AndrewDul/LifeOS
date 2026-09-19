@@ -377,6 +377,16 @@ pub(crate) enum ValidationError {
     /// identical in shape. `CorrectRelation` never revives a historical
     /// Relation.
     RelationNotActive,
+    /// `ConfirmRelation`'s target `Relation` is active but already
+    /// `epistemic_state = USER_CONFIRMED` - confirming it again is a
+    /// no-op, rejected explicitly rather than silently returning
+    /// `Success` with zero writes (M2 Personal Knowledge ConfirmRelation,
+    /// R028, 2026-09-19). Needs a database read, so `services::
+    /// confirm_relation` performs it and reports it here. Deliberately
+    /// its own variant, never `FactAlreadyUserConfirmed` - `Relation`
+    /// and `Fact` are distinct domain types, even though the semantic
+    /// shape is identical to `ConfirmMemory`'s equivalent check.
+    RelationAlreadyUserConfirmed,
 }
 
 #[derive(Debug, Clone)]
@@ -1859,6 +1869,58 @@ pub(crate) fn validate_correct_relation(
         note: payload.note.clone(),
         confidence: payload.confidence.clone(),
         sensitivity: payload.sensitivity,
+    })
+}
+
+// --- Personal Knowledge: ConfirmRelation (M2 Personal Knowledge
+// ConfirmRelation, R028, 2026-09-19) ---------------------------------------
+//
+// "The user confirms that this existing Personal Knowledge Relation
+// should be treated as USER_CONFIRMED knowledge" - a pure EPISTEMIC
+// confirmation, never a metadata correction (that is `CorrectRelation`'s
+// job), never Relation creation/deletion, never contradiction
+// resolution, never an Evidence/Source mutation. Mutates the SAME
+// `Relation` row in place: exactly `epistemic_state` (always to
+// `USER_CONFIRMED`), nothing else - mirrors `ConfirmMemory`'s exact
+// shape (R018/R023).
+//
+// Type floor is `ExplicitAdd` - the same floor `AddMemory`/`AddRelation`/
+// `ConfirmMemory` have, and for the same reason its generic
+// `effective_class` formula alone already blocks `Provenance::Inferred`
+// (`InferredChange`, severity 2, dominates `ExplicitAdd`, severity 1) -
+// no Personal-Knowledge-specific overlay is needed here (unlike
+// `CorrectRelation`'s `ImportantChange` floor).
+
+/// The frozen `ConfirmRelation` payload - a single typed `RelationId`,
+/// nothing else. No `epistemic_state`/`note`/`confidence`/`sensitivity`/
+/// `Source`/`Evidence`/timestamp field exists - Core decides the one
+/// permitted state transition unconditionally (`USER_CONFIRMED`); there
+/// is nothing else for a caller to supply.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConfirmRelationPayload {
+    pub relation_id: RelationId,
+}
+
+/// `validate_confirm_relation`'s success output - identical shape to
+/// `ConfirmRelationPayload` (there is nothing to normalize: a
+/// `RelationId` is already a validated typed value by construction).
+/// Kept as its own type only for consistency with every other action's
+/// validate/normalize split.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NormalizedConfirmRelation {
+    pub relation_id: RelationId,
+}
+
+/// Pure structural validation for `ConfirmRelation` - trivial, same
+/// reasoning as `validate_confirm_memory`: no database read (target
+/// existence, the active-Relation check, and the already-confirmed
+/// no-op check all need one, so `services::confirm_relation` performs
+/// them, never here).
+pub(crate) fn validate_confirm_relation(
+    payload: &ConfirmRelationPayload,
+) -> Result<NormalizedConfirmRelation, Vec<ValidationError>> {
+    Ok(NormalizedConfirmRelation {
+        relation_id: payload.relation_id,
     })
 }
 

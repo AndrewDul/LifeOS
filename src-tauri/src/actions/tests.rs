@@ -2352,3 +2352,23 @@ fn correct_relation_confidence_clear_always_valid_regardless_of_numeric_bounds()
     };
     assert!(validate_correct_relation(&payload).is_ok());
 }
+
+// --- ConfirmRelation (M2 Personal Knowledge ConfirmRelation, R028,
+// 2026-09-19) -------------------------------------------------------------
+//
+// `ConfirmRelationPayload` carries a single typed `RelationId` and
+// nothing else - `validate_confirm_relation` is intentionally trivial
+// (no database read, no structural rule to invent), mirroring
+// `validate_confirm_memory`'s own precedent exactly. Database-dependent
+// behavior (target existence/activeness/already-confirmed checks,
+// confirmation-gate wiring, mutation, audit, rollback, concurrency) is
+// covered by `services::tests` instead.
+
+#[test]
+fn confirm_relation_payload_validates_trivially_and_passes_relation_id_through() {
+    let relation_id = RelationId::new();
+    let payload = ConfirmRelationPayload { relation_id };
+    let normalized =
+        validate_confirm_relation(&payload).expect("ConfirmRelationPayload should always validate");
+    assert_eq!(normalized.relation_id, relation_id);
+}
