@@ -2372,3 +2372,23 @@ fn confirm_relation_payload_validates_trivially_and_passes_relation_id_through()
         validate_confirm_relation(&payload).expect("ConfirmRelationPayload should always validate");
     assert_eq!(normalized.relation_id, relation_id);
 }
+
+// --- ForgetRelation (M2 Personal Knowledge ForgetRelation, R029,
+// 2026-09-19) -------------------------------------------------------------
+//
+// `ForgetRelationPayload` carries a single typed `RelationId` and
+// nothing else - `validate_forget_relation` is intentionally trivial (no
+// database read, no structural rule to invent, no active-state check),
+// mirroring `validate_forget_memory`'s own precedent exactly. Database-
+// dependent behavior (target existence, deletion-set collection,
+// confirmation-gate wiring, mutation, audit, rollback, concurrency) is
+// covered by `services::tests` instead.
+
+#[test]
+fn forget_relation_payload_validates_trivially_and_passes_relation_id_through() {
+    let relation_id = RelationId::new();
+    let payload = ForgetRelationPayload { relation_id };
+    let normalized =
+        validate_forget_relation(&payload).expect("ForgetRelationPayload should always validate");
+    assert_eq!(normalized.relation_id, relation_id);
+}

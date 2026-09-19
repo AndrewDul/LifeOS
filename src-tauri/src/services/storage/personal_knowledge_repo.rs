@@ -975,3 +975,110 @@ pub(in crate::services) fn confirm_relation_epistemic_state(
     }
     Ok(())
 }
+
+// --- ForgetRelation (M2 Personal Knowledge ForgetRelation, R029,
+// 2026-09-19) --------------------------------------------------------------
+//
+// `services::forget_relation` orchestrates these narrow, single-purpose
+// functions in the same privacy-safe order `ForgetMemory` established
+// (R019/R024), reusing `get_source_id_for_evidence`/
+// `delete_evidence_links_for_evidence`/`delete_evidence`/
+// `delete_source_if_orphan`/`delete_entity_if_orphan_non_self` above
+// completely UNCHANGED - all five were already generic over any
+// `EvidenceId`/`SourceId`/`EntityId`, not Fact-specific, so no
+// Relation-specific duplicates are needed for them. Only the four
+// functions below are new: `relation_audit_log`/`relation_evidence`/
+// `relations` are distinct tables from `fact_audit_log`/`fact_evidence`/
+// `facts`, so their own narrow accessors are required. There is
+// deliberately NO Relation equivalent of
+// `clear_inbound_supersession_refs` - Relation has no
+// `superseded_by_relation_id`, no supersession chain, nothing to clear
+// (R025 §16, R029 §33).
+
+/// Scrubs every `relation_audit_log.previous_snapshot` for the target
+/// Relation, covering payloads left by `CorrectRelation`/
+/// `ConfirmRelation` (or any future snapshot-bearing action) - the exact
+/// same predicate-based approach `scrub_fact_audit_snapshots` uses
+/// (`WHERE relation_id = ? AND previous_snapshot IS NOT NULL`, never
+/// `WHERE action_type IN (...)`, so any future payload-bearing action is
+/// covered automatically). Touches ONLY `previous_snapshot`; every other
+/// audit column (`id`/`relation_id`/`action_type`/`actor`/`provenance`/
+/// `confirmation_class`/`occurred_at`) survives untouched - old audit
+/// rows become payload-free structural history, never deleted outright.
+/// May affect 0..N rows (a Relation with no snapshot-bearing prior audit
+/// row is a normal, not an error, case).
+pub(in crate::services) fn scrub_relation_audit_snapshots(
+    conn: &Connection,
+    relation_id: RelationId,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE relation_audit_log SET previous_snapshot = NULL WHERE relation_id = ?1 AND previous_snapshot IS NOT NULL",
+        params![relation_id.to_string()],
+    )
+}
+
+/// Every `EvidenceId` linked to the target Relation through
+/// `relation_evidence` - same reasoning as `list_evidence_ids_for_fact`
+/// (0..N is the normal case, no DB `CHECK` enforces "exactly one
+/// Evidence per Relation").
+pub(in crate::services) fn list_evidence_ids_for_relation(
+    conn: &Connection,
+    relation_id: RelationId,
+) -> rusqlite::Result<Vec<EvidenceId>> {
+    let mut stmt =
+        conn.prepare("SELECT evidence_id FROM relation_evidence WHERE relation_id = ?1")?;
+    let mut rows = stmt.query(params![relation_id.to_string()])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id_str: String = row.get(0)?;
+        ids.push(EvidenceId::parse(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?);
+    }
+    Ok(ids)
+}
+
+/// A defensive sweep deleting any remaining `relation_evidence` row for
+/// the target Relation - same reasoning as
+/// `delete_fact_evidence_links_for_fact`: normally a no-op in production
+/// (the per-`EvidenceId` `delete_evidence_links_for_evidence` calls
+/// already removed every link reachable through the Evidence ids
+/// collected via `list_evidence_ids_for_relation`), kept anyway as
+/// explicit defense-in-depth, never removed merely because it is
+/// redundant in the ordinary case.
+pub(in crate::services) fn delete_relation_evidence_links_for_relation(
+    conn: &Connection,
+    relation_id: RelationId,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM relation_evidence WHERE relation_id = ?1",
+        params![relation_id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// The ONLY hard-delete path for a `relations` row - same discipline as
+/// `delete_fact_forget_target`: `changed != 1` is a real runtime error
+/// in every build profile (never `debug_assert!`) - the target must
+/// already have been validated to exist by `services::forget_relation`'s
+/// own preflight `get_relation`, so any other outcome here means
+/// something changed unexpectedly between preflight and this statement.
+/// The diagnostic is fixed and carries no Relation content.
+pub(in crate::services) fn delete_relation_forget_target(
+    conn: &Connection,
+    relation_id: RelationId,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "DELETE FROM relations WHERE id = ?1",
+        params![relation_id.to_string()],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(
+                "ForgetRelation target Relation delete did not affect exactly one row".to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}

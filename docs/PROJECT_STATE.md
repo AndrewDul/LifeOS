@@ -2610,9 +2610,30 @@ rejected as a no-op), mirroring `ConfirmMemory`'s exact shape - floor
 `ExplicitAdd`, no PK-specific overlay needed. Built with
 `TransactionBehavior::Immediate` from the start this time, applying
 R024's/R027's hardening lesson proactively rather than reproducing the
-same race a third time. `ForgetRelation` remains unimplemented; the
-recommended next step is R029 `ForgetRelation`, the last of the four
-frozen v0.1 Relation actions. `RecurringRule`
+same race a third time. **(2026-09-19, R029) `ForgetRelation` - the
+fourth and final production Relation mutation, and the first Relation
+HARD-DELETE action - is now implemented and proven (543/543 tests)**:
+reuses `ForgetMemory`'s exact privacy-first deletion algorithm shape
+(R019/R024), with the one frozen difference that there is no Relation
+equivalent of clearing inbound supersession references (Relation has no
+`superseded_by_relation_id` - nothing to clear). Built with
+`TransactionBehavior::Immediate` from the start via a new
+`begin_forget_relation_transaction` helper, applying the R024/R027
+hardening lesson proactively a third time. `ActionOutcome<RelationId>`,
+never `ActionOutcome<Relation>`. `Delete` confirmation floor blocks
+every unconfirmed call regardless of provenance. Deliberately never
+calls `is_active_relation` - forgetting is a privacy right applying to
+active AND historical Relations alike. Four of five Evidence/Source/
+Entity cleanup helpers were already fully generic and reused completely
+unchanged from the Fact family; only four new narrow Relation-specific
+storage functions were needed. **All four frozen v0.1 Relation actions
+now exist: `AddRelation`, `CorrectRelation`, `ConfirmRelation`,
+`ForgetRelation`.** No Tauri command wires any of them into the running
+app yet. Episode actions and retrieval/Context Pack remain entirely
+unstarted - the recommended next step is R030, an Episode Action-Family
+Architecture Freeze (documentation/architecture only, mirroring R017-
+R019/R025's own freeze discipline before any Episode code is written).
+`RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2849,6 +2870,42 @@ to proceed into implementation - see R016 §15 and R019 §23.
   unimplemented - the last of the four frozen v0.1 Relation actions; no
   Tauri command wires any Relation action into the running app yet;
   Episode actions and retrieval/Context Pack remain entirely unstarted.
+- **RESOLVED (2026-09-19, M2 Personal Knowledge ForgetRelation, R029
+  above): `ForgetRelation` - the fourth and final production Relation
+  mutation, and the first Relation HARD-DELETE action - is real,
+  implemented, and tested (543/543).** Reuses `ForgetMemory`'s exact
+  privacy-first deletion algorithm shape (R019/R024): target lookup,
+  candidate endpoint Entity capture, Evidence collection, Source
+  collection, audit-snapshot scrub (predicate-based, covering any prior
+  `CorrectRelation`/`ConfirmRelation` payload), privacy-first Evidence
+  deletion (even when shared with a retained Fact/Relation/Episode),
+  orphan Source cleanup, a defensive `relation_evidence` sweep, the hard
+  target delete (`changed == 1` enforced in every build profile), and
+  candidate endpoint Entity orphan cleanup (SELF never deleted,
+  `domain_ref` alone never retains an orphan) - reusing
+  `delete_entity_if_orphan_non_self` completely unchanged, since it
+  already covered `relations.from_entity_id`/`to_entity_id` since R024.
+  The one frozen, deliberate difference from `ForgetMemory`: **there is
+  no Relation equivalent of clearing inbound supersession
+  references** - Relation has no `superseded_by_relation_id`, nothing to
+  clear (R025 §16). `ActionOutcome<RelationId>`, never
+  `ActionOutcome<Relation>`. `Delete` floor blocks every unconfirmed
+  call regardless of provenance, no overlay needed. Deliberately never
+  calls `is_active_relation` - forgetting is a privacy right applying to
+  active AND historical Relations alike (`USER_CONFIRMED`/`INFERRED`/
+  `OBSERVED`/`DISPUTED`/`STALE`, `valid_until` `None` or `Some`, all
+  forgettable). Built with `TransactionBehavior::Immediate` from the
+  start via a new `begin_forget_relation_transaction` helper - proven
+  with a mandatory two-connection lock test plus a deletion-set-
+  stability proof. No sibling/inverse/duplicate Relation is ever
+  cascaded, proven directly. No schema change: V8's `action_type` CHECK
+  already enumerated `'ForgetRelation'` (R026, forward-looking).
+  **All four frozen v0.1 Relation actions now exist: `AddRelation`,
+  `CorrectRelation`, `ConfirmRelation`, `ForgetRelation`.** No Tauri
+  command wires any of them into the running app yet; Episode actions
+  and retrieval/Context Pack remain entirely unstarted - recommended
+  next step is R030, an Episode Action-Family Architecture Freeze
+  (documentation/architecture only).
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -3009,5 +3066,6 @@ summaries - open the file for full reasoning.
 | R026 | M2 Personal Knowledge Relation Foundation and AddRelation | `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md` |
 | R027 | M2 Personal Knowledge CorrectRelation | `docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md` |
 | R028 | M2 Personal Knowledge ConfirmRelation | `docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md` |
+| R029 | M2 Personal Knowledge ForgetRelation | `docs/reports/R029_M2_PERSONAL_KNOWLEDGE_FORGETRELATION_2026-09-19.md` |
 
-Next report allocated will be **R029**.
+Next report allocated will be **R030**.

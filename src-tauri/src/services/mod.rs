@@ -22,9 +22,9 @@ use crate::actions::{
     AddMilestonePayload, AddRelationPayload, AddTaskPayload, ConfirmMemoryPayload,
     ConfirmRelationPayload, ConfirmationClass, CorrectMemoryPayload, CorrectRelationPayload,
     CreateGoalPayload, CreateProjectPayload, EntityInputRef, FactValueInput, FieldPatch,
-    ForgetMemoryPayload, LinkGoalsPayload, Provenance, SourceRef, UpdateGoalPayload,
-    UpdateMilestonePayload, UpdateProgressPayload, UpdateProjectPayload, UpdateTaskPayload,
-    ValidationError,
+    ForgetMemoryPayload, ForgetRelationPayload, LinkGoalsPayload, Provenance, SourceRef,
+    UpdateGoalPayload, UpdateMilestonePayload, UpdateProgressPayload, UpdateProjectPayload,
+    UpdateTaskPayload, ValidationError,
 };
 use crate::core_error::{CoreError, CoreErrorKind};
 use crate::domain::{
@@ -3123,6 +3123,246 @@ pub(crate) fn confirm_relation(
 
     ActionOutcome::Success {
         value: confirmed,
+        confirmation_class: class,
+    }
+}
+
+/// Opens `ForgetRelation`'s own transaction with `TransactionBehavior::
+/// Immediate` (M2 Personal Knowledge ForgetRelation, R029, 2026-09-19) -
+/// built this way from the start, applying `ForgetMemory`'s final,
+/// hardened shape (R024's post-run transaction-isolation hardening)
+/// directly rather than reproducing the race first and fixing it later.
+/// `ForgetRelation` computes a destructive deletion set (the target
+/// Relation, its candidate endpoint Entities, its linked Evidence, their
+/// Sources) from reads, then promises the FULL set is removed - a
+/// `Deferred` transaction would let another writer change those exact
+/// rows (e.g. link a new Evidence to the target) between the read and
+/// the write, producing a stale deletion set and a privacy hole.
+/// `Immediate` acquires the write lock immediately, before any of those
+/// reads run (see `forget_relation` below, which performs every
+/// deletion-set read through this same transaction). Scoped to
+/// `ForgetRelation` only - `begin_forget_transaction`/
+/// `begin_correct_relation_transaction`/`begin_confirm_relation_transaction`
+/// above are untouched.
+fn begin_forget_relation_transaction(
+    conn: &mut Connection,
+) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// `ForgetRelation` - the fourth and final production Personal Knowledge
+/// Relation mutation, and the first Relation HARD-DELETE action (M2
+/// Personal Knowledge ForgetRelation, R029, 2026-09-19). "The user wants
+/// this one exact Personal Knowledge Relation removed from LifeOS's
+/// canonical Personal Knowledge" - never a soft delete, never a `Stale`
+/// transition, never a correction, never a cascade to sibling/inverse/
+/// duplicate Relations. Reuses `ForgetMemory`'s exact privacy-first
+/// algorithm shape (R019/R024), with one deliberate, frozen difference:
+/// **there is no Relation equivalent of `ForgetMemory`'s step 6
+/// (`clear_inbound_supersession_refs`)** - Relation has no
+/// `superseded_by_relation_id`, no supersession chain, nothing to clear
+/// (R025 §16). Every other step maps directly.
+///
+/// Returns `ActionOutcome<RelationId>`, deliberately never
+/// `ActionOutcome<Relation>` - a success result must never hand back the
+/// semantic object that was just forgotten (R025 §8, identical rule to
+/// `ForgetMemory`).
+///
+/// Confirmation floor is `ConfirmationClass::Delete` (severity 4, the
+/// highest rung) - never dominated by either provenance-derived class in
+/// the generic ladder, so it blocks every unconfirmed call regardless of
+/// provenance with zero Personal-Knowledge-specific overlay needed,
+/// exactly like `ForgetMemory`.
+///
+/// Execution order: (1) pure structural validation
+/// (`actions::validate_forget_relation` - trivial, the payload is one
+/// `RelationId`); (2) `effective_class` computed against the `Delete`
+/// floor; (3) the confirmation gate - blocks BEFORE any database access
+/// whatsoever, proven directly with a nonexistent `RelationId` (both
+/// `Explicit`+unconfirmed and `Inferred`+unconfirmed return
+/// `ConfirmationRequired`, never `NotFound`); (4) only once confirmed
+/// does `begin_forget_relation_transaction` open, and only THROUGH that
+/// `Immediate` transaction does the target Relation get read, and does
+/// every subsequent deletion-set read (candidate Entities, linked
+/// Evidence, their Sources) happen - no other writer can change those
+/// rows for the rest of the call; (5) a missing target returns
+/// `ActionOutcome::NotFound`, transaction drops, zero writes.
+///
+/// **Deliberately does NOT call `domain::is_active_relation` anywhere**
+/// - forgetting is a privacy right, not a lifecycle validity check;
+/// `USER_CONFIRMED`/`INFERRED`/`OBSERVED`/`DISPUTED`/`STALE` Relations,
+/// and Relations with `valid_until` either `NULL` or `Some(...)`, are
+/// all equally forgettable provided the row exists (matching
+/// `ForgetMemory`'s R019 precedent exactly).
+///
+/// Privacy-first Evidence deletion (R018/R019's rule, reused unchanged
+/// via `delete_evidence_links_for_evidence`/`delete_evidence`, both
+/// already fully generic over any `EvidenceId`, not Fact-specific):
+/// every Evidence row linked to the target is deleted even if also
+/// linked to a retained Fact/Relation/Episode - the retained object
+/// survives, it merely loses that one piece of Evidence support. Source
+/// cleanup (`delete_source_if_orphan`, reused unchanged) and candidate
+/// endpoint Entity cleanup (`delete_entity_if_orphan_non_self`, reused
+/// unchanged - it already checks `relations.from_entity_id`/
+/// `to_entity_id` alongside `facts`/`episode_entities`, so no Relation-
+/// specific exception was ever needed) both mirror `ForgetMemory`
+/// exactly. SELF is never deleted (structural guard inside
+/// `delete_entity_if_orphan_non_self` itself); `domain_ref` alone never
+/// retains an orphan Entity.
+///
+/// `relation_audit_log.previous_snapshot` is scrubbed for every prior
+/// audit row referencing the target (`scrub_relation_audit_snapshots`,
+/// predicate-based - `WHERE relation_id = ? AND previous_snapshot IS
+/// NOT NULL`, covering any past `CorrectRelation`/`ConfirmRelation`
+/// snapshot automatically, never `WHERE action_type IN (...)`) before
+/// the target itself is deleted; every other audit column on those rows
+/// survives untouched - payload-free structural history, never deleted
+/// outright. The new `ForgetRelation` audit row's own
+/// `previous_snapshot` is unconditionally `None` -
+/// `serialize_required_snapshot` is never called here, since preserving
+/// the forgotten Relation's payload in a new audit row would defeat the
+/// entire purpose of a privacy delete.
+pub(crate) fn forget_relation(
+    conn: &mut Connection,
+    meta: ActionMeta,
+    payload: ForgetRelationPayload,
+) -> ActionOutcome<RelationId> {
+    let normalized = match crate::actions::validate_forget_relation(&payload) {
+        Ok(n) => n,
+        Err(errors) => return ActionOutcome::ValidationFailed(errors),
+    };
+
+    let class = effective_class(ConfirmationClass::Delete, meta.provenance);
+    if blocks_until_confirmed(class) && !meta.confirmed {
+        return ActionOutcome::ConfirmationRequired {
+            confirmation_class: class,
+        };
+    }
+
+    let now = meta.requested_at;
+
+    let tx = match begin_forget_relation_transaction(conn) {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    let target = match storage::personal_knowledge_repo::get_relation(&tx, normalized.relation_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ActionOutcome::NotFound,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    // Step 2: candidate from/to Entity ids, deduplicated (the DB CHECK
+    // already forbids from == to, but dedup defensively anyway - matches
+    // ForgetMemory's own precedent for a self-referencing candidate set).
+    let mut candidate_entity_ids = vec![target.from_entity_id];
+    if !candidate_entity_ids.contains(&target.to_entity_id) {
+        candidate_entity_ids.push(target.to_entity_id);
+    }
+
+    // Step 3: every Evidence id linked to the target - collected through
+    // the same transaction, so this set cannot go stale before the
+    // destructive steps below run.
+    let evidence_ids =
+        match storage::personal_knowledge_repo::list_evidence_ids_for_relation(&tx, target.id) {
+            Ok(ids) => ids,
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        };
+
+    // Step 4: the Source id for each collected Evidence row,
+    // deduplicated - likewise collected through the same transaction.
+    // Reuses `get_source_id_for_evidence` unchanged (already generic).
+    let mut source_ids: Vec<SourceId> = Vec::new();
+    for evidence_id in &evidence_ids {
+        match storage::personal_knowledge_repo::get_source_id_for_evidence(&tx, *evidence_id) {
+            Ok(Some(source_id)) => {
+                if !source_ids.contains(&source_id) {
+                    source_ids.push(source_id);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+        }
+    }
+
+    // Step 5: scrub prior payload-bearing relation_audit_log rows.
+    if let Err(e) = storage::personal_knowledge_repo::scrub_relation_audit_snapshots(&tx, target.id)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    // NOTE: unlike ForgetMemory, there is no step here to clear inbound
+    // supersession references - Relation has no superseded_by_relation_id
+    // (R025 §16, R029 §33).
+
+    // Steps 6-7: privacy-first Evidence link/row deletion, reusing
+    // ForgetMemory's exact generic helpers unchanged.
+    for evidence_id in &evidence_ids {
+        if let Err(e) =
+            storage::personal_knowledge_repo::delete_evidence_links_for_evidence(&tx, *evidence_id)
+        {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+    for evidence_id in &evidence_ids {
+        if let Err(e) = storage::personal_knowledge_repo::delete_evidence(&tx, *evidence_id) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    // Step 8: orphaned Source cleanup, reusing the generic helper
+    // unchanged.
+    for source_id in &source_ids {
+        if let Err(e) = storage::personal_knowledge_repo::delete_source_if_orphan(&tx, *source_id) {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    // Step 9: defensive sweep before the target hard-delete.
+    if let Err(e) = storage::personal_knowledge_repo::delete_relation_evidence_links_for_relation(
+        &tx, target.id,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    // Step 10: hard-delete the target Relation itself.
+    if let Err(e) = storage::personal_knowledge_repo::delete_relation_forget_target(&tx, target.id)
+    {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    // Step 11: candidate endpoint Entity orphan cleanup, reusing the
+    // generic helper unchanged (SELF never deleted, domain_ref alone
+    // never retains an orphan).
+    for entity_id in &candidate_entity_ids {
+        if let Err(e) =
+            storage::personal_knowledge_repo::delete_entity_if_orphan_non_self(&tx, *entity_id)
+        {
+            return ActionOutcome::StorageError(CoreError::from(e));
+        }
+    }
+
+    // Step 12: exactly one minimal, payload-free ForgetRelation audit
+    // marker.
+    if let Err(e) = storage::personal_knowledge_repo::insert_relation_audit_log(
+        &tx,
+        target.id,
+        "ForgetRelation",
+        meta.actor,
+        meta.provenance,
+        class,
+        None,
+        now,
+    ) {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    if let Err(e) = tx.commit() {
+        return ActionOutcome::StorageError(CoreError::from(e));
+    }
+
+    ActionOutcome::Success {
+        value: target.id,
         confirmation_class: class,
     }
 }

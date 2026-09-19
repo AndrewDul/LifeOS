@@ -1924,6 +1924,60 @@ pub(crate) fn validate_confirm_relation(
     })
 }
 
+// --- Personal Knowledge: ForgetRelation (M2 Personal Knowledge
+// ForgetRelation, R029, 2026-09-19) -----------------------------------------
+//
+// "The user wants this one exact Personal Knowledge Relation removed
+// from LifeOS's canonical Personal Knowledge" - the final action in the
+// frozen v0.1 Relation family, and the first Relation HARD-DELETE
+// action. Never a `Stale` transition, never soft closure, never a
+// metadata correction, never a confirmation, never a bulk/cascading
+// delete of sibling/inverse/duplicate Relations. Mirrors `ForgetMemory`'s
+// exact privacy-first shape (R019/R024) - see `services::
+// forget_relation`'s own doc comment for the full deletion algorithm and
+// its deliberate differences from `ForgetMemory` (no supersession chain
+// to clear; `is_active_relation` is deliberately never called, since
+// forgetting is a privacy right that applies to active AND historical
+// Relations alike).
+//
+// Type floor is `Delete` (severity 4, R025 §17) - never dominated by
+// either provenance-derived class in the generic ladder, so it blocks
+// every unconfirmed call regardless of provenance with zero override
+// code needed, exactly like `ForgetMemory`.
+
+/// The frozen `ForgetRelation` payload - a single typed `RelationId`,
+/// nothing else. No reason/cascade option/Source-Evidence selector/
+/// endpoint/`relation_type`/snapshot input/delete-mode field exists -
+/// there is exactly one way to forget exactly one Relation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForgetRelationPayload {
+    pub relation_id: RelationId,
+}
+
+/// `validate_forget_relation`'s success output - identical shape to
+/// `ForgetRelationPayload` (there is nothing to normalize: a
+/// `RelationId` is already a validated typed value by construction).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NormalizedForgetRelation {
+    pub relation_id: RelationId,
+}
+
+/// Pure structural validation for `ForgetRelation` - deliberately
+/// minimal, same reasoning as `validate_forget_memory`. There is no
+/// "already in the target state" check here at all, pure or otherwise:
+/// `ForgetRelation` does not care whether the target Relation is active
+/// or historical (the right to forget applies to historical knowledge
+/// too, matching `ForgetMemory`'s R019 precedent), so no
+/// `domain::is_active_relation` check exists anywhere in this action's
+/// validation path.
+pub(crate) fn validate_forget_relation(
+    payload: &ForgetRelationPayload,
+) -> Result<NormalizedForgetRelation, Vec<ValidationError>> {
+    Ok(NormalizedForgetRelation {
+        relation_id: payload.relation_id,
+    })
+}
+
 /// `LIFEOS_SPEC.md` §5.4 - never a persisted result, a bare string
 /// error, and a "confirmation required" response all mixed together;
 /// each is its own variant. `services` always writes an audit-log entry
