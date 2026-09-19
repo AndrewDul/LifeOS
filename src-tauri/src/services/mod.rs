@@ -2865,8 +2865,20 @@ pub(crate) fn correct_relation(
 
     let now = meta.requested_at;
 
-    let target = match storage::personal_knowledge_repo::get_relation(conn, normalized.relation_id)
-    {
+    // Post-run transaction/snapshot-integrity hardening (2026-09-19): the
+    // Immediate transaction opens here, AFTER the confirmation gate but
+    // BEFORE the target Relation is ever read - target lookup, the
+    // active-state check, patch resolution, and the mandatory
+    // previous_snapshot all now happen through this SAME write-locked
+    // transaction, closing the read/snapshot/write race a Deferred
+    // transaction opened only after these reads would have left open
+    // (see `begin_correct_relation_transaction`'s own doc comment).
+    let tx = match begin_correct_relation_transaction(conn) {
+        Ok(tx) => tx,
+        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
+    };
+
+    let target = match storage::personal_knowledge_repo::get_relation(&tx, normalized.relation_id) {
         Ok(Some(r)) => r,
         Ok(None) => return ActionOutcome::NotFound,
         Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
@@ -2891,11 +2903,6 @@ pub(crate) fn correct_relation(
     let previous_snapshot = match serialize_required_snapshot(&target) {
         Ok(s) => s,
         Err(e) => return ActionOutcome::StorageError(e),
-    };
-
-    let tx = match conn.transaction() {
-        Ok(tx) => tx,
-        Err(e) => return ActionOutcome::StorageError(CoreError::from(e)),
     };
 
     if let Err(e) = storage::personal_knowledge_repo::update_relation_metadata_if_active(
@@ -2935,6 +2942,29 @@ pub(crate) fn correct_relation(
         value: corrected,
         confirmation_class: class,
     }
+}
+
+/// Opens `CorrectRelation`'s own transaction with `TransactionBehavior::
+/// Immediate` (post-run transaction/snapshot-integrity hardening,
+/// 2026-09-19) - the same deliberately stronger boundary
+/// `begin_forget_transaction` already established for `ForgetMemory`,
+/// applied here for an analogous reason: `CorrectRelation` reads the
+/// target Relation, decides its active state, resolves its patches
+/// (including `FieldPatch::Unchanged`, which copies whatever is
+/// currently stored), and serializes the mandatory `previous_snapshot`
+/// - all from that ONE read. A plain `conn.transaction()` (`Deferred`)
+/// acquires no lock until the first actual write, so a concurrent writer
+/// could commit a metadata change to the same Relation between this read
+/// and `CorrectRelation`'s own guarded `UPDATE`, producing a stale
+/// `previous_snapshot` and a lost update. `Immediate` reserves the write
+/// lock at `BEGIN`, before `correct_relation` performs `get_relation`
+/// through this same transaction - no other writer can change the row
+/// for the rest of the call. Scoped to `CorrectRelation` only; no other
+/// action's transaction behavior changes.
+fn begin_correct_relation_transaction(
+    conn: &mut Connection,
+) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
 }
 
 #[cfg(test)]

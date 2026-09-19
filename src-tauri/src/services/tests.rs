@@ -18168,3 +18168,135 @@ fn req_cr_no_new_relation_row_same_id_and_output_matches_readback() {
         "[req_cr_row_count] FAIL - returned Relation must exactly equal get_relation's read-back, no stale in-memory result"
     );
 }
+
+// --- Post-run transaction/snapshot-integrity hardening (2026-09-19) -----
+//
+// The read/snapshot/write race: `correct_relation` used to read the
+// target Relation, resolve its patches, and serialize
+// `previous_snapshot` BEFORE opening a plain `Deferred` transaction - a
+// concurrent writer could commit a metadata change to the same Relation
+// in that window, producing a stale `previous_snapshot` and a lost
+// update. `begin_correct_relation_transaction` (mirroring
+// `begin_forget_transaction`'s exact precedent) now reserves the write
+// lock via `TransactionBehavior::Immediate` BEFORE the target is ever
+// read, closing the window entirely.
+
+/// MANDATORY: proves `correct_relation`'s OWN transaction helper -
+/// `begin_correct_relation_transaction`, the exact helper/path
+/// production code uses - genuinely uses `TransactionBehavior::
+/// Immediate`, not merely that some unrelated hand-written `BEGIN
+/// IMMEDIATE` string works. Same two-connection mechanism as
+/// `req_fm_uses_immediate_transaction_blocking_concurrent_writer`
+/// (`ForgetMemory`'s own precedent): Connection A holds the transaction
+/// open; Connection B, with `busy_timeout(0)`, must be rejected with
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` for a harmless, unrelated write while A
+/// holds the write reservation, then succeed once A's transaction is
+/// dropped. No sleeps, no production test hooks.
+#[test]
+fn req_cr_uses_immediate_transaction_blocking_concurrent_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cr_immediate_lock.db");
+    let mut conn_a = bootstrap_db_at(&path, &key).unwrap();
+    let conn_b = bootstrap_db_at(&path, &key).unwrap();
+    conn_b
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+
+    let tx_a = begin_correct_relation_transaction(&mut conn_a).unwrap();
+
+    let harmless_write = || {
+        conn_b.execute(
+            "INSERT INTO sources (id, source_type, sensitivity, captured_at, created_at)
+             VALUES (?1, 'conversation', 'INTERNAL', ?2, ?2)",
+            rusqlite::params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+        )
+    };
+
+    let blocked_result = harmless_write();
+    match &blocked_result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert!(
+                matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "[req_cr_immediate_lock] FAIL - expected SQLITE_BUSY/LOCKED, got {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_cr_immediate_lock] FAIL - a concurrent writer must be blocked while CorrectRelation's IMMEDIATE transaction holds the write lock, got {other:?}"
+        ),
+    }
+
+    drop(tx_a);
+
+    let unblocked_result = harmless_write();
+    assert!(
+        unblocked_result.is_ok(),
+        "[req_cr_immediate_lock] FAIL - after A's transaction is dropped/rolled back, B should be able to write normally, got {unblocked_result:?}"
+    );
+}
+
+/// The snapshot-stability / lost-update proof (R027 hardening §14): a
+/// second connection specifically cannot mutate the TARGET Relation's
+/// own metadata while Connection A's `CorrectRelation` transaction holds
+/// the write reservation, having already read that exact target through
+/// `&tx` - directly demonstrating the race this hardening closes, not
+/// merely an unrelated table write. Proves points 1-4 of R027 hardening
+/// §14: (1) the Immediate transaction opens before `get_relation`, (2)
+/// `get_relation` is called through `&tx`, (3) the read Relation is the
+/// one the snapshot would be built from, (4) a second writer cannot
+/// acquire the write lock to change that same row during the window.
+#[test]
+fn req_cr_immediate_transaction_blocks_concurrent_relation_metadata_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, key) = temp_db(&dir, "cr_lost_update.db");
+    let mut conn_a = bootstrap_db_at(&path, &key).unwrap();
+    let target = mk_cr_active_relation(&conn_a, EpistemicState::UserConfirmed);
+
+    let conn_b = bootstrap_db_at(&path, &key).unwrap();
+    conn_b
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+
+    let tx_a = begin_correct_relation_transaction(&mut conn_a).unwrap();
+    // Mirrors production `correct_relation`'s own read exactly - through
+    // `&tx`, proving points 1/2 directly (the transaction is open and
+    // the read goes through it, not the outer connection).
+    let read_through_tx = get_relation(&tx_a, target.id).unwrap().unwrap();
+    assert_eq!(
+        read_through_tx, target,
+        "[req_cr_lost_update] FAIL - the transaction-read Relation must be the one the snapshot is built from"
+    );
+
+    let concurrent_metadata_write = || {
+        conn_b.execute(
+            "UPDATE relations SET note = 'concurrent writer would overwrite this' WHERE id = ?1",
+            rusqlite::params![target.id.to_string()],
+        )
+    };
+
+    let blocked_result = concurrent_metadata_write();
+    match &blocked_result {
+        Err(rusqlite::Error::SqliteFailure(err, _)) => {
+            assert!(
+                matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ),
+                "[req_cr_lost_update] FAIL - expected SQLITE_BUSY/LOCKED, got {err:?}"
+            );
+        }
+        other => panic!(
+            "[req_cr_lost_update] FAIL - a second writer must be blocked from mutating the TARGET Relation's own metadata while A's IMMEDIATE transaction holds it, got {other:?}"
+        ),
+    }
+
+    drop(tx_a);
+
+    let unblocked_result = concurrent_metadata_write();
+    assert!(
+        unblocked_result.is_ok(),
+        "[req_cr_lost_update] FAIL - after A's transaction is dropped, B should be able to write normally, got {unblocked_result:?}"
+    );
+}

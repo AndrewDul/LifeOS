@@ -342,3 +342,109 @@ rejected as a no-op), mirroring `ConfirmMemory`'s exact shape — floor
 `InferredChange` in the generic ladder, same reasoning `AddRelation`/
 `ConfirmMemory` already established). Followed by R029 `ForgetRelation`,
 built with `TransactionBehavior::Immediate` from the start.
+
+---
+
+## Post-run transaction/snapshot-integrity hardening (2026-09-19)
+
+A review of R027 immediately after its own commit found a genuine
+read/snapshot/write race: `correct_relation` read the target Relation,
+resolved its patches (including `FieldPatch::Unchanged`, which copies
+whatever is currently stored), and serialized the mandatory
+`previous_snapshot` — all **before** opening its write transaction, and
+that transaction used the default `Deferred` behavior (no lock reserved
+until the first actual write). A concurrent writer could therefore
+commit a metadata change to the same Relation in the window between
+`correct_relation`'s read and its own guarded `UPDATE`: the guard's
+`WHERE` clause only re-checks `id`/`valid_until IS NULL`/
+`epistemic_state <> 'STALE'`, so the stale-snapshot write would still
+succeed, silently overwriting the newer metadata (lost update) while
+`relation_audit_log.previous_snapshot` recorded the OLD pre-state rather
+than the actual state immediately preceding the correction — violating
+the mandatory-snapshot contract's intended meaning. This is the exact
+class of gap R024's post-run hardening pass already found and fixed for
+`ForgetMemory`, now found and fixed for `CorrectRelation`.
+
+**Old transaction boundary:**
+
+```
+1. pure validation
+2. confirmation gate
+3. get_relation(target)              <- plain conn, no lock
+4. active check
+5. resolve corrected metadata
+6. serialize previous_snapshot       <- from the same stale read
+7. conn.transaction()                <- Deferred, lock reserved only on first write
+8. guarded UPDATE
+9. audit INSERT
+10. COMMIT
+```
+
+**New transaction boundary:**
+
+```
+1. pure validation
+2. confirmation gate
+3. begin_correct_relation_transaction(conn)   <- Immediate, lock reserved at BEGIN
+4. get_relation(&tx)                          <- through the same transaction
+5. missing -> NotFound, tx drops, zero writes
+6. active check (on the tx-read target)
+7. resolve corrected metadata (from the tx-read target)
+8. serialize previous_snapshot (from the tx-read target)
+9. guarded UPDATE (&tx)
+10. audit INSERT (&tx)
+11. COMMIT
+```
+
+**Fix:** a new narrow helper, `begin_correct_relation_transaction`,
+mirrors `begin_forget_transaction`'s exact precedent
+(`conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)`).
+It opens immediately after the confirmation gate — before the target
+Relation is ever read — so target lookup, the active-state check, patch
+resolution, `previous_snapshot` serialization, the guarded metadata
+`UPDATE`, and the audit `INSERT` all now happen inside ONE stable,
+write-locked transaction. A second writer cannot acquire the write lock
+to change the target Relation for the entire duration of that window.
+
+**Proofs added (2 new tests, both in `services::tests`):**
+
+- `req_cr_uses_immediate_transaction_blocking_concurrent_writer` —
+  MANDATORY two-connection lock proof, calling
+  `begin_correct_relation_transaction` directly (the exact helper/path
+  production `correct_relation` uses, not an unrelated hand-written
+  `BEGIN IMMEDIATE` string): Connection B, with `busy_timeout(0)`, is
+  rejected with `SQLITE_BUSY`/`SQLITE_LOCKED` for a harmless, unrelated
+  write while Connection A holds the transaction open, then succeeds
+  once A's transaction is dropped. No sleeps, no production test hooks.
+- `req_cr_immediate_transaction_blocks_concurrent_relation_metadata_write`
+  — the snapshot-stability / lost-update proof: Connection A opens the
+  transaction, reads the TARGET Relation through `&tx` (mirroring
+  production's own `get_relation(&tx, ...)` call and asserting the
+  read matches the fixture exactly), then Connection B specifically
+  attempts to `UPDATE` that same Relation's `note` — blocked
+  `SQLITE_BUSY`/`SQLITE_LOCKED` for the whole window, succeeding only
+  after A's transaction drops. This directly demonstrates (not merely
+  asserts) that the exact race described above is now closed.
+
+**Unchanged, verified by the existing R027 test suite remaining green
+under the new boundary:** the guarded `UPDATE`'s `WHERE` clause and
+`changed != 1` runtime enforcement (still defense-in-depth); every audit
+field/shape; `NoFieldsToUpdate`; note/confidence/sensitivity patch
+semantics; the `ImportantChange` floor and its inferred-blocking
+overlay (`req_cr_conf_c_inferred_unconfirmed_blocks_gate_precedes_relation_lookup`
+still passes unchanged — the gate still precedes even the transaction
+open, let alone the lookup); `RelationNotActive`; same-row/no-successor
+correction; identity/epistemic/temporal immutability; and, critically,
+`req_cr_forced_audit_failure_rolls_back_metadata_update` — the existing
+mandatory rollback proof — remains green under the `Immediate`
+transaction with no modification, confirming the forced-audit-failure
+rollback behavior is unaffected by the stronger transaction boundary.
+
+**Confirmed:** `V8` unchanged; no `V9`; no schema/migration touched.
+`ConfirmRelation`/`ForgetRelation` remain unimplemented; Episode/
+retrieval remain unstarted. This pass changed exactly two files
+(`src-tauri/src/services/mod.rs`, `src-tauri/src/services/tests.rs`) —
+no payload, validation, or storage-guard SQL changed. The historical
+R027 count (461 → 492, +31) is unchanged above; this hardening pass adds
+2 more tests on top: **492 → 494 (+2)**. The next substantial report
+remains **R028**.
