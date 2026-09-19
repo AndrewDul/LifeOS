@@ -2623,7 +2623,7 @@ hardening lesson proactively a third time. `ActionOutcome<RelationId>`,
 never `ActionOutcome<Relation>`. `Delete` confirmation floor blocks
 every unconfirmed call regardless of provenance. Deliberately never
 calls `is_active_relation` - forgetting is a privacy right applying to
-active AND historical Relations alike. Four of five Evidence/Source/
+active AND historical Relations alike. All five Evidence/Source/
 Entity cleanup helpers were already fully generic and reused completely
 unchanged from the Fact family; only four new narrow Relation-specific
 storage functions were needed. **All four frozen v0.1 Relation actions

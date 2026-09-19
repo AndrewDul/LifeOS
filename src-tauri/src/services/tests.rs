@@ -20154,14 +20154,24 @@ fn req_fr_entity_retention_matrix_self_and_orphan_cases() {
     let mut conn = bootstrap_db_at(&path, &key).unwrap();
     let self_id = self_entity_id(&conn);
 
-    // A: SELF as one endpoint - SELF survives.
+    // A: SELF as one endpoint - SELF survives BYTE-FOR-BYTE, not merely
+    // "still exists" (R029 post-run acceptance-proof hardening,
+    // 2026-09-19 - the original proof only checked `.is_some()`).
+    let self_before = get_entity(&conn, self_id)
+        .unwrap()
+        .expect("SELF must exist before forgetting");
     let target_a = mk_fr_target(&mut conn);
     match forget_relation(&mut conn, confirmed_explicit(), mk_fr_payload(target_a.id)) {
         ActionOutcome::Success { .. } => {}
         other => panic!("[req_fr_entity_1] FAIL case A, got {other:?}"),
     }
-    let self_after = get_entity(&conn, self_id).unwrap();
-    assert!(self_after.is_some(), "case A: SELF must survive");
+    let self_after = get_entity(&conn, self_id)
+        .unwrap()
+        .expect("case A: SELF must still exist");
+    assert_eq!(
+        self_after, self_before,
+        "case A: SELF must survive byte-for-byte, not merely exist"
+    );
 
     // B: non-SELF orphan endpoint (only referenced by target) - deleted.
     let to_entity = mk_pk_entity("project", "Case B Orphan", Sensitivity::Internal);
@@ -20279,7 +20289,7 @@ fn req_fr_entity_retention_matrix_shared_reference_cases() {
         "case B: Entity retained via a Fact object reference must survive"
     );
 
-    // C/D: retained via another Relation's from/to reference.
+    // C: retained via another Relation's FROM reference.
     let shared_c = mk_pk_entity("person", "Shared C", Sensitivity::Internal);
     storage::personal_knowledge_repo::insert_entity(&conn, &shared_c).unwrap();
     let payload_c = AddRelationPayload {
@@ -20294,10 +20304,10 @@ fn req_fr_entity_retention_matrix_shared_reference_cases() {
         from: EntityInputRef::Existing(shared_c.id),
         ..mk_ar_payload()
     };
-    match add_relation(&mut conn, ui_explicit(), retaining_relation_payload_c) {
-        ActionOutcome::Success { .. } => {}
+    let retainer_c = match add_relation(&mut conn, ui_explicit(), retaining_relation_payload_c) {
+        ActionOutcome::Success { value, .. } => value,
         other => panic!("setup retaining Relation C failed: {other:?}"),
-    }
+    };
     match forget_relation(&mut conn, confirmed_explicit(), mk_fr_payload(target_c.id)) {
         ActionOutcome::Success { .. } => {}
         other => panic!("[req_fr_entity_2] FAIL case C, got {other:?}"),
@@ -20305,6 +20315,49 @@ fn req_fr_entity_retention_matrix_shared_reference_cases() {
     assert!(
         get_entity(&conn, shared_c.id).unwrap().is_some(),
         "case C: Entity retained via another Relation's from reference must survive"
+    );
+    assert!(
+        get_relation(&conn, retainer_c.id).unwrap().is_some(),
+        "case C: the retaining Relation itself must also survive (not cascaded)"
+    );
+
+    // D: retained via another Relation's TO reference (R029 post-run
+    // acceptance-proof hardening, 2026-09-19 - case C alone only proved
+    // `relations.from_entity_id` retention; this proves
+    // `relations.to_entity_id` retention independently).
+    let shared_d = mk_pk_entity("person", "Shared D", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &shared_d).unwrap();
+    let payload_d = AddRelationPayload {
+        to: EntityInputRef::Existing(shared_d.id),
+        ..mk_ar_payload()
+    };
+    let target_d = match add_relation(&mut conn, ui_explicit(), payload_d) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case D failed: {other:?}"),
+    };
+    let other_endpoint_d =
+        mk_pk_entity("project", "Shared D Other Endpoint", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &other_endpoint_d).unwrap();
+    let retaining_relation_payload_d = AddRelationPayload {
+        from: EntityInputRef::Existing(other_endpoint_d.id),
+        to: EntityInputRef::Existing(shared_d.id),
+        ..mk_ar_payload()
+    };
+    let retainer_d = match add_relation(&mut conn, ui_explicit(), retaining_relation_payload_d) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup retaining Relation D failed: {other:?}"),
+    };
+    match forget_relation(&mut conn, confirmed_explicit(), mk_fr_payload(target_d.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fr_entity_2] FAIL case D, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, shared_d.id).unwrap().is_some(),
+        "case D: Entity retained via another Relation's to reference must survive"
+    );
+    assert!(
+        get_relation(&conn, retainer_d.id).unwrap().is_some(),
+        "case D: the retaining Relation itself must also survive (not cascaded)"
     );
 
     // E: retained via episode_entities.
@@ -20373,6 +20426,51 @@ fn req_fr_entity_retention_matrix_shared_reference_cases() {
     assert!(
         get_entity(&conn, orphan_f.id).unwrap().is_none(),
         "case F: to-endpoint with no surviving reference must be deleted"
+    );
+
+    // G (reverse of F): FROM orphan / TO retained - proves candidate
+    // cleanup is independent per endpoint and does not depend on
+    // endpoint position (R029 post-run acceptance-proof hardening,
+    // 2026-09-19 - the original matrix only covered retained-FROM/
+    // orphan-TO, never the reverse).
+    let orphan_g = mk_pk_entity("person", "Orphan G", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &orphan_g).unwrap();
+    let retained_g = mk_pk_entity("project", "Retained G", Sensitivity::Internal);
+    storage::personal_knowledge_repo::insert_entity(&conn, &retained_g).unwrap();
+    let target_g = match add_relation(
+        &mut conn,
+        ui_explicit(),
+        AddRelationPayload {
+            from: EntityInputRef::Existing(orphan_g.id),
+            to: EntityInputRef::Existing(retained_g.id),
+            ..mk_ar_payload()
+        },
+    ) {
+        ActionOutcome::Success { value, .. } => value,
+        other => panic!("setup case G failed: {other:?}"),
+    };
+    match add_relation(
+        &mut conn,
+        ui_explicit(),
+        AddRelationPayload {
+            to: EntityInputRef::Existing(retained_g.id),
+            ..mk_ar_payload()
+        },
+    ) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup retaining Relation for G failed: {other:?}"),
+    }
+    match forget_relation(&mut conn, confirmed_explicit(), mk_fr_payload(target_g.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fr_entity_2] FAIL case G, got {other:?}"),
+    }
+    assert!(
+        get_entity(&conn, orphan_g.id).unwrap().is_none(),
+        "case G: from-endpoint with no surviving reference must be deleted"
+    );
+    assert!(
+        get_entity(&conn, retained_g.id).unwrap().is_some(),
+        "case G: to-endpoint retained by a second Relation must survive"
     );
 }
 
@@ -20644,18 +20742,108 @@ fn req_fr_rollback_forced_final_audit_failure_restores_everything() {
     }
 }
 
+/// Raw read of an `Evidence` row's exact identifying fields - test-only,
+/// mirrors `read_source_fields`'s precedent exactly. No production
+/// `get_evidence` exists (nothing besides existence/content needs one in
+/// production code), so exactness proofs read the row directly, same
+/// convention as `read_source_fields`.
+fn read_evidence_fields(
+    conn: &Connection,
+    id: &str,
+) -> (String, Option<String>, Option<String>, String, String) {
+    conn.query_row(
+        "SELECT source_id, content, locator, sensitivity, created_at FROM evidence WHERE id = ?1",
+        rusqlite::params![id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )
+    .unwrap()
+}
+
+/// Strengthened (R029 post-run acceptance-proof hardening, 2026-09-19):
+/// the original version of this test only proved `relations` row count
+/// and global `evidence` row count were restored, plus that the target
+/// Relation itself still existed - it did not directly prove that EVERY
+/// destructive step performed earlier in the same transaction (audit
+/// snapshot scrub, `relation_evidence` link deletion, Source deletion)
+/// actually rolled back, as opposed to merely leaving row counts
+/// coincidentally correct. This version builds a richer pre-state (a
+/// prior `CorrectRelation` audit snapshot, exact endpoint Entities, and
+/// exact Evidence/Source identity) and asserts every one of those
+/// specific rows/values individually after the forced mid-transaction
+/// failure - target/relation_evidence/Evidence/Source/prior-snapshot/
+/// endpoint-Entities/no-forget-marker/connection-usability all proven
+/// directly, not inferred from aggregate counts alone.
 #[test]
 fn req_fr_rollback_mid_step_forced_relation_delete_failure() {
     let dir = tempfile::tempdir().unwrap();
     let (path, key) = temp_db(&dir, "fr_rollback2.db");
     let mut conn = bootstrap_db_at(&path, &key).unwrap();
 
+    // A: target Relation with normal fresh Evidence + Source.
     let target = mk_fr_target(&mut conn);
+    let from_entity_before = get_entity(&conn, target.from_entity_id).unwrap().unwrap();
+    let to_entity_before = get_entity(&conn, target.to_entity_id).unwrap().unwrap();
+
+    // B: run CorrectRelation first so relation_audit_log carries a
+    // NON-NULL previous_snapshot that the forced failure must prove
+    // survives (the scrub itself must roll back).
+    match correct_relation(&mut conn, ui_explicit(), mk_cr_payload(target.id)) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("setup CorrectRelation failed: {other:?}"),
+    }
+
+    // C: capture exact PRE state.
     let target_before = get_relation(&conn, target.id).unwrap().unwrap();
+    let correct_snapshot_before: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'CorrectRelation'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        correct_snapshot_before.is_some(),
+        "setup: CorrectRelation snapshot must be non-NULL before forgetting"
+    );
+    let (link_relation_id_before, link_evidence_id_before, link_created_at_before): (
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT relation_id, evidence_id, created_at FROM relation_evidence WHERE relation_id = ?1",
+            rusqlite::params![target.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let evidence_fields_before = read_evidence_fields(&conn, &link_evidence_id_before);
+    let source_id_before = evidence_fields_before.0.clone();
+    let source_fields_before =
+        read_source_fields(&conn, SourceId::parse(&source_id_before).unwrap());
     let relations_before = relation_row_count(&conn);
+    let relation_evidence_before = relation_evidence_row_count(&conn);
     let evidence_count_before: i64 = conn
         .query_row("SELECT count(*) FROM evidence", [], |r| r.get(0))
         .unwrap();
+    let source_count_before: i64 = conn
+        .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
+        .unwrap();
+    let forget_marker_count_before: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ForgetRelation'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(forget_marker_count_before, 0);
 
     install_relation_delete_failure_trigger(&conn);
     match forget_relation(&mut conn, confirmed_explicit(), mk_fr_payload(target.id)) {
@@ -20664,19 +20852,93 @@ fn req_fr_rollback_mid_step_forced_relation_delete_failure() {
     }
     remove_relation_delete_failure_trigger(&conn);
 
-    assert_eq!(
-        relation_row_count(&conn),
-        relations_before,
-        "[req_fr_rollback2] FAIL - relations count must be restored, including the already-performed audit scrub and Evidence/Source deletion that happened before the later DELETE failed"
-    );
-    let evidence_count_after: i64 = conn
-        .query_row("SELECT count(*) FROM evidence", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(evidence_count_after, evidence_count_before, "[req_fr_rollback2] FAIL - Evidence deleted earlier in the same transaction must be restored");
+    // 1: target Relation - exact PRE Relation.
     let target_after = get_relation(&conn, target.id).unwrap();
     assert_eq!(
         target_after,
         Some(target_before),
-        "[req_fr_rollback2] FAIL - target Relation must still exist"
+        "[req_fr_rollback2] FAIL - target Relation must be exactly the PRE-forget state"
     );
+    assert_eq!(relation_row_count(&conn), relations_before);
+
+    // 2: prior CorrectRelation audit snapshot restored (proves the
+    // scrub itself rolled back, not merely that the row count matched).
+    let correct_snapshot_after: Option<String> = conn
+        .query_row(
+            "SELECT previous_snapshot FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'CorrectRelation'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        correct_snapshot_after, correct_snapshot_before,
+        "[req_fr_rollback2] FAIL - the prior CorrectRelation audit snapshot must be restored to its exact original non-NULL value (scrub rolled back)"
+    );
+
+    // 3: relation_evidence - the exact target link exists again,
+    // pointing to the same EvidenceId with the same created_at.
+    let (link_relation_id_after, link_evidence_id_after, link_created_at_after): (
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT relation_id, evidence_id, created_at FROM relation_evidence WHERE relation_id = ?1",
+            rusqlite::params![target.id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(link_relation_id_after, link_relation_id_before);
+    assert_eq!(link_evidence_id_after, link_evidence_id_before);
+    assert_eq!(link_created_at_after, link_created_at_before);
+    assert_eq!(relation_evidence_row_count(&conn), relation_evidence_before);
+
+    // 4: Evidence - the same Evidence row exists again, exact fields.
+    let evidence_fields_after = read_evidence_fields(&conn, &link_evidence_id_before);
+    assert_eq!(
+        evidence_fields_after, evidence_fields_before,
+        "[req_fr_rollback2] FAIL - the deleted-then-rolled-back Evidence row must be restored exactly"
+    );
+    let evidence_count_after: i64 = conn
+        .query_row("SELECT count(*) FROM evidence", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(evidence_count_after, evidence_count_before);
+
+    // 5: Source - the same Source row exists again, exact fields (not
+    // merely a matching global count).
+    let source_fields_after =
+        read_source_fields(&conn, SourceId::parse(&source_id_before).unwrap());
+    assert_eq!(
+        source_fields_after, source_fields_before,
+        "[req_fr_rollback2] FAIL - the orphan-deleted-then-rolled-back Source row must be restored exactly"
+    );
+    let source_count_after: i64 = conn
+        .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(source_count_after, source_count_before);
+
+    // 6: endpoint Entities - exact PRE rows still exist unchanged.
+    let from_entity_after = get_entity(&conn, target.from_entity_id).unwrap();
+    assert_eq!(from_entity_after, Some(from_entity_before));
+    let to_entity_after = get_entity(&conn, target.to_entity_id).unwrap();
+    assert_eq!(to_entity_after, Some(to_entity_before));
+
+    // 7: no ForgetRelation audit marker exists.
+    let forget_marker_count_after: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relation_audit_log WHERE relation_id = ?1 AND action_type = 'ForgetRelation'",
+            rusqlite::params![target.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        forget_marker_count_after, 0,
+        "[req_fr_rollback2] FAIL - no ForgetRelation audit marker must exist"
+    );
+
+    // 8: connection remains usable after removing the trigger.
+    match add_relation(&mut conn, ui_explicit(), mk_ar_payload()) {
+        ActionOutcome::Success { .. } => {}
+        other => panic!("[req_fr_rollback2] FAIL - connection should remain usable after rollback, got {other:?}"),
+    }
 }

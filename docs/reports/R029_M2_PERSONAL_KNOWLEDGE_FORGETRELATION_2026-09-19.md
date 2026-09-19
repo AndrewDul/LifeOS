@@ -113,7 +113,7 @@ One `Immediate` transaction, after the confirmation gate:
 The only structural difference: **there is no step equivalent to
 `ForgetMemory`'s `clear_inbound_supersession_refs`.** Relation has no
 `superseded_by_relation_id`, no supersession chain — nothing to clear
-(R025 §16). Every other step maps directly, and four of the five
+(R025 §16). Every other step maps directly, and all five
 Evidence/Source/Entity helper functions
 (`get_source_id_for_evidence`, `delete_evidence_links_for_evidence`,
 `delete_evidence`, `delete_source_if_orphan`, `delete_entity_if_orphan_non_self`)
@@ -377,3 +377,85 @@ complete Personal Knowledge substrate — Facts, Relations, and Episodes —
 so Episode's own action family needs the same R017-R019/R025-style
 freeze pass Fact and Relation each received before any Episode code is
 written.
+
+---
+
+## Post-run acceptance-proof hardening (2026-09-19)
+
+A review of this report's own claims against the actual test assertions
+found no production `ForgetRelation` defect — the deletion algorithm
+itself was never in question — but found three proof/claim gaps where
+the report's wording asserted more than the tests actually checked:
+
+1. **SELF existence vs byte-for-byte.** §15 claimed SELF "survives
+   byte-for-byte," but the original test
+   (`req_fr_entity_retention_matrix_self_and_orphan_cases`, case A) only
+   asserted `get_entity(SELF).is_some()` — existence, not exact field
+   equality. Fixed: the test now captures the full SELF `Entity` before
+   forgetting and asserts full struct equality after.
+2. **Incomplete `relations.from`/`to` + reverse-asymmetric Entity-
+   retention coverage.** §14/§21's Entity retention matrix proved
+   retention via a retaining Relation's `from_entity_id` (case C) and
+   the retained-FROM/orphan-TO asymmetric direction (case F), but never
+   independently proved retention via a retaining Relation's
+   `to_entity_id`, and never proved the REVERSE asymmetric direction
+   (orphan-FROM/retained-TO). Fixed:
+   `req_fr_entity_retention_matrix_shared_reference_cases` gained case D
+   (retention via another Relation's `to_entity_id`, with the retaining
+   Relation itself also asserted to survive) and case G (orphan-FROM/
+   retained-TO, the exact reverse of case F) — proving candidate cleanup
+   is genuinely independent per endpoint, not dependent on endpoint
+   position.
+3. **Mid-delete rollback under-proved.** §22's mid-step rollback test
+   (`req_fr_rollback_mid_step_forced_relation_delete_failure`) only
+   asserted aggregate `relations`/`evidence` row counts and that the
+   target Relation still existed — it never directly proved that the
+   SPECIFIC destructive steps performed earlier in the same transaction
+   (the prior `CorrectRelation` audit-snapshot scrub, the target's
+   `relation_evidence` link, the exact Evidence row, the exact Source
+   row, the endpoint Entities) actually rolled back, as opposed to row
+   counts merely coming out coincidentally correct. Fixed: the test now
+   builds a richer pre-state (runs `CorrectRelation` on the target first
+   so a non-`NULL` prior audit snapshot exists to prove restored) and,
+   after the forced failure, asserts eight things individually: (1) the
+   target Relation is exactly the PRE-forget state; (2) the prior
+   `CorrectRelation` snapshot is restored to its exact original
+   non-`NULL` value; (3) the exact `relation_evidence` link (same
+   `relation_id`/`evidence_id`/`created_at`) exists again; (4) the exact
+   Evidence row (same `source_id`/`content`/`locator`/`sensitivity`/
+   `created_at`, via a new test-only `read_evidence_fields` helper
+   mirroring `read_source_fields`'s existing precedent) is restored;
+   (5) the exact Source row is restored (not merely a matching global
+   count); (6) both endpoint Entities are unchanged; (7) zero
+   `ForgetRelation` audit markers exist; (8) the connection remains
+   usable for a subsequent successful call.
+
+A small documentation-arithmetic error was also found and corrected:
+§8 above and the equivalent `PROJECT_STATE.md` paragraph both said "four
+of the five" Evidence/Source/Entity helper functions were reused
+unchanged, while actually listing and reusing all five
+(`get_source_id_for_evidence`, `delete_evidence_links_for_evidence`,
+`delete_evidence`, `delete_source_if_orphan`,
+`delete_entity_if_orphan_non_self`) — corrected to "all five" in both
+places. `LIFEOS_SPEC.md`'s equivalent paragraph never stated a fraction
+and needed no correction.
+
+**No production Rust changed.** Every strengthened proof passed on its
+first real run — no defect was found or needed fixing;
+`src-tauri/src/services/mod.rs`,
+`src-tauri/src/services/storage/personal_knowledge_repo.rs`, and
+`src-tauri/src/actions/mod.rs` are all untouched by this pass. Only
+`src-tauri/src/services/tests.rs` changed (three existing tests
+strengthened — no new `#[test]` functions were added, since the new
+assertions were added as additional cases inside the same three
+existing test functions). `V8` unchanged; no `V9`; no migration touched.
+
+**Test count:** the original R029 historical count (514 → 543, +29)
+remains unchanged above. This hardening pass strengthened 3 existing
+tests and added 0 new ones: **previous = 543, new = 0, modified = 3,
+final = 543, failed = 0.**
+
+All four frozen v0.1 Relation actions (`AddRelation`, `CorrectRelation`,
+`ConfirmRelation`, `ForgetRelation`) remain complete, with no behavioral
+change from this pass. Episode/retrieval remain unstarted. The next
+substantial report remains **R030**.
