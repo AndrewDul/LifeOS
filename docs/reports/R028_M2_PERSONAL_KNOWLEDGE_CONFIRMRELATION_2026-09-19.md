@@ -267,13 +267,18 @@ in-memory result.
   Entity/Source/Evidence non-interference, Fact/Episode non-
   interference, and the output/readback proof.
 
-One pre-existing test-ordering bug was found and fixed during this run:
-`req_cf_fact_episode_non_interference` originally captured its "before"
-row-count snapshot BEFORE creating the fixture Relation, so the
-post-confirmation count legitimately differed by the fixture's own
-creation, not by any real `ConfirmRelation` side effect — a test bug,
-not a production bug. Fixed by moving the snapshot to after fixture
-creation; the full suite is green.
+One setup/order bug in a newly-added R028 test was found and fixed
+during this run — not a pre-existing repository bug, not a production
+bug, not a regression in any existing test. `req_cf_fact_episode_non_interference`
+is itself one of R028's new tests (§28 above); its first draft captured
+the "before" row-count snapshot BEFORE creating its own fixture
+Relation, so the post-confirmation count legitimately differed by the
+fixture's own creation, not by any real `ConfirmRelation` side effect.
+The first full-suite run correctly caught this: **513 passed, 1
+failed**. The test was corrected (the snapshot moved to after fixture
+creation) before final validation; production `ConfirmRelation`
+behavior was never implicated. The final, corrected run is the one
+reported throughout this document: **514 passed, 0 failed**.
 
 ## 29. Exact final test count
 
