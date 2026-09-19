@@ -409,3 +409,49 @@ floor overlay. Followed by R028 `ConfirmRelation`, then R029
 `ForgetRelation` (built with `TransactionBehavior::Immediate` from the
 start this time, per the lesson from `ForgetMemory`'s own hardening
 pass).
+
+---
+
+## Post-run explicit frontend-build verification (2026-09-19)
+
+Post-run review of R026 found that §28's measured results recorded
+`npm run tauri build`'s success (which internally runs
+`beforeBuildCommand` → the frontend `build` script → then bundles), but
+never separately recorded a standalone, explicit run of the frontend
+acceptance command itself (`npm.cmd run build`) independent of Tauri
+packaging. This is a validation-completeness/acceptance-proof gap in
+how R026 was recorded, not a suspected code defect — nothing about the
+Rust/schema work is in question.
+
+**Measured result:** `npm.cmd run build` was run explicitly, standalone,
+from the repository root, with `cargo` on `PATH` (unrelated to this
+script but kept consistent with how prior runs invoked npm in this
+environment). Exit code **0**.
+
+```
+> lifeos@0.1.0 build
+> tsc && vite build
+
+vite v8.3.0 building client environment for production...
+transforming...
+✓ 27 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.48 kB │ gzip:  0.31 kB
+dist/assets/index-B2qJi2oL.css   13.85 kB │ gzip:  3.53 kB
+dist/assets/index-BXGuczAb.js   231.60 kB │ gzip: 72.51 kB
+
+✓ built in 130ms
+```
+
+`tsc` (TypeScript project-wide typecheck) and `vite build` both
+succeeded. Verified on disk: `dist/index.html`, `dist/assets/index-B2qJi2oL.css`,
+`dist/assets/index-BXGuczAb.js` all present with a fresh timestamp
+matching this run.
+
+**No production code, schema, or tests changed by this verification
+pass** — it is a documentation-only addendum to this report. Test count
+remains **461/461**. `V8` (`relation_audit_log` only) is unchanged.
+`CorrectRelation`/`ConfirmRelation`/`ForgetRelation` remain
+unimplemented; Episode/retrieval remain unstarted. The next substantial
+report remains **R027**.
