@@ -2629,11 +2629,30 @@ unchanged from the Fact family; only four new narrow Relation-specific
 storage functions were needed. **All four frozen v0.1 Relation actions
 now exist: `AddRelation`, `CorrectRelation`, `ConfirmRelation`,
 `ForgetRelation`.** No Tauri command wires any of them into the running
-app yet. Episode actions and retrieval/Context Pack remain entirely
-unstarted - the recommended next step is R030, an Episode Action-Family
-Architecture Freeze (documentation/architecture only, mirroring R017-
-R019/R025's own freeze discipline before any Episode code is written).
-`RecurringRule`
+app yet. **(2026-09-19, R030) the Episode action-family architecture is
+now CLOSED for v0.1 implementation** - `AddEpisode`/`UpdateEpisode`/
+`ForgetEpisode` (deliberately three actions, not four: `ConfirmEpisode`
+was evaluated and rejected as semantically wrong, since Episode gets no
+`epistemic_state`/`confidence` field in v0.1 - a recorded event, not a
+disputable proposition) - names, payloads, confirmation floors,
+temporal-validation rules, and privacy/deletion semantics are all fixed.
+`UpdateEpisode` (never `CorrectEpisode` - event completion/refinement is
+normal lifecycle progression, not error-correction) mutates the SAME row
+in place with no identity/metadata split (unlike `Relation`, every
+Episode field except `id`/`created_at` is mutable). `started_at`/
+`ended_at` are deliberately CALLER-supplied (the opposite of Fact/
+Relation's Core-generated, non-backdatable `valid_from`) since Episode's
+whole purpose is recording real-world event time Core cannot infer;
+future-dated Episodes are rejected (the exact boundary against the
+still-undesigned CalendarEvent). Docs-only - no schema/code/tests
+changed. V7 was found insufficient by exactly one narrow gap (no
+`episode_audit_log`, matching the now-unbroken eight-table audit
+precedent) - V9's exact scope is frozen as `episode_audit_log` ONLY, not
+created this run. Entity-association roles and post-creation entity-
+link/Evidence-attachment mutation are explicitly DEFERRED, not
+implementation-blocking. Recommended next step is R031 (V9 +
+`Episode` domain struct/read-side + `AddEpisode`, combined), then R032
+`UpdateEpisode`, then R033 `ForgetEpisode`. `RecurringRule`
 remains deliberately deferred (§4j), still needing its own design/
 freeze pass before any code. M2's storage/security foundation is safe
 to proceed into implementation - see R016 §15 and R019 §23.
@@ -2906,6 +2925,44 @@ to proceed into implementation - see R016 §15 and R019 §23.
   and retrieval/Context Pack remain entirely unstarted - recommended
   next step is R030, an Episode Action-Family Architecture Freeze
   (documentation/architecture only).
+- **RESOLVED (2026-09-19, M2 Personal Knowledge Episode Action-Family
+  Architecture Freeze, R030 above): the Episode action family is now
+  CLOSED for v0.1 implementation - no code, schema, or tests
+  changed.** Live V7 `episodes` (already has `updated_at`, unlike
+  `relations`) / `episode_evidence` / `episode_entities` were verified
+  directly against the migration. Final v0.1 action family: exactly
+  `AddEpisode`/`UpdateEpisode`/`ForgetEpisode` - `ConfirmEpisode` was
+  evaluated and explicitly rejected (Episode gets no `epistemic_state`
+  in v0.1, so there is no state for a confirmation action to transition;
+  the confirmation gate + audit provenance + Evidence/Source already
+  make unconfirmed `Inferred` Episodes safe without one). `confidence`
+  was likewise evaluated and excluded for v0.1 - Episode is a recorded
+  event backed by Evidence, not a probabilistic proposition. `UpdateEpisode`
+  (never `CorrectEpisode`) mutates the SAME row in place - Episode has
+  no identity/metadata split the way `Relation` does; every field except
+  `id`/`created_at` is mutable, since setting `ended_at` on an ongoing
+  event is normal lifecycle progression, not error-correction.
+  `started_at`/`ended_at` are the one deliberate divergence from Fact/
+  Relation's Core-generated `valid_from`: they are CALLER-supplied and
+  backdating is the expected normal case (Episode records real-world
+  event time Core cannot infer), while future-dated Episodes are
+  rejected outright - the explicit boundary against the still-undesigned
+  `CalendarEvent`. `AddEpisode` requires exactly one fresh Evidence row
+  (never zero, never reused), matching `AddMemory`/`AddRelation`'s
+  mandatory-Evidence precedent; entity associations may be empty, SELF
+  is never implicit, and exact-id duplicates are silently deduplicated
+  rather than rejected. `ForgetEpisode` reuses `ForgetMemory`/
+  `ForgetRelation`'s exact privacy-first deletion shape (shared Evidence
+  always deleted, orphan Source/Entity cleanup reusing
+  `delete_entity_if_orphan_non_self` completely unchanged) with no
+  active-state eligibility check. Schema verdict: V7 sufficient for
+  row storage; a narrow additive V9 (`episode_audit_log` ONLY, mirroring
+  the now-unbroken eight-table audit precedent) is required before
+  implementation - not created this run. Entity-association roles and
+  post-creation entity-link/Evidence-attachment mutation are explicitly
+  DEFERRED, not implementation-blocking. Recommended next step is R031
+  (V9 + `Episode` domain struct/read-side + `AddEpisode`, combined),
+  then R032 `UpdateEpisode`, then R033 `ForgetEpisode`.
 - **`target_date` still has no content validation beyond being a
   well-formed `DateTime<Utc>`** (e.g. nothing rejects a date far in the
   past) — pre-existing gap, unchanged again this run.
@@ -3067,5 +3124,6 @@ summaries - open the file for full reasoning.
 | R027 | M2 Personal Knowledge CorrectRelation | `docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md` |
 | R028 | M2 Personal Knowledge ConfirmRelation | `docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md` |
 | R029 | M2 Personal Knowledge ForgetRelation | `docs/reports/R029_M2_PERSONAL_KNOWLEDGE_FORGETRELATION_2026-09-19.md` |
+| R030 | M2 Personal Knowledge Episode Action-Family Architecture Freeze | `docs/reports/R030_M2_PERSONAL_KNOWLEDGE_EPISODE_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-19.md` |
 
-Next report allocated will be **R030**.
+Next report allocated will be **R031**.

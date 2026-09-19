@@ -184,9 +184,25 @@ Relations alike); built with `TransactionBehavior::Immediate` from the
 start via a new `begin_forget_relation_transaction` helper. **All four
 frozen v0.1 Relation actions now exist: `AddRelation`, `CorrectRelation`,
 `ConfirmRelation`, `ForgetRelation`.** No Tauri command wires any of
-them into the running app yet. Episode
+them into the running app yet. **(2026-09-19, R030)** the Episode
+action-family architecture is now CLOSED for v0.1 implementation,
+documentation only — no code/schema/tests changed. Final family: exactly
+`AddEpisode`/`UpdateEpisode`/`ForgetEpisode` — `ConfirmEpisode` was
+evaluated and rejected (Episode has no `epistemic_state` in v0.1, so
+there is no state to confirm); `confidence` was likewise excluded
+(Episode is Evidence-backed, not a probabilistic proposition).
+`UpdateEpisode` (never `CorrectEpisode`) mutates the same row in place
+with no identity/metadata split. `started_at`/`ended_at` are
+deliberately CALLER-supplied and backdatable (the opposite of Fact/
+Relation's Core-generated `valid_from`), with future-dated Episodes
+rejected as the explicit boundary against the still-undesigned
+`CalendarEvent`. `ForgetEpisode` reuses `ForgetMemory`/`ForgetRelation`'s
+exact privacy-first shape. V7 is sufficient for row storage; a narrow
+additive V9 (`episode_audit_log` only) is required before
+implementation, not created this run. Episode
 actions and
-retrieval/Context Pack remain entirely unstarted. See `PROJECT_STATE.md`
+retrieval/Context Pack remain entirely unstarted (implementation, that
+is — the architecture is now frozen). See `PROJECT_STATE.md`
 §4o-§4v and §10,
 `docs/reports/R017_M2_PERSONAL_KNOWLEDGE_LAYER_ARCHITECTURE_FREEZE_2026-09-18.md`,
 `docs/reports/R018_M2_PERSONAL_KNOWLEDGE_ARCHITECTURE_CONSISTENCY_HARDENING_2026-09-18.md`,
@@ -201,7 +217,8 @@ and
 `docs/reports/R026_M2_PERSONAL_KNOWLEDGE_RELATION_FOUNDATION_AND_ADDRELATION_2026-09-18.md`,
 `docs/reports/R027_M2_PERSONAL_KNOWLEDGE_CORRECTRELATION_2026-09-19.md`,
 `docs/reports/R028_M2_PERSONAL_KNOWLEDGE_CONFIRMRELATION_2026-09-19.md`,
-`docs/reports/R029_M2_PERSONAL_KNOWLEDGE_FORGETRELATION_2026-09-19.md`.
+`docs/reports/R029_M2_PERSONAL_KNOWLEDGE_FORGETRELATION_2026-09-19.md`,
+`docs/reports/R030_M2_PERSONAL_KNOWLEDGE_EPISODE_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-19.md`.
 M3 is not started. See `PROJECT_STATE.md` for exactly what exists; most
 of this document still describes design targets for later milestones,
 not built functionality — §5.1-§5.6 in particular are a frozen
@@ -209,7 +226,8 @@ not built functionality — §5.1-§5.6 in particular are a frozen
 Milestone, Task, and now the Personal Knowledge Slices A/B/C/D/E plus
 the complete Relation action family: `AddRelation` (R026),
 `CorrectRelation` (R027), `ConfirmRelation` (R028), and `ForgetRelation`
-(R029)).
+(R029); the Episode action family remains architecture-only, frozen by
+R030, not yet implemented).
 
 ---
 
@@ -1098,6 +1116,50 @@ the deletion-set collection is in progress). No V9 was needed: V8's
 forward-looking). 543/543 tests pass (514 prior + 29 new). **All four
 frozen v0.1 Relation actions now exist** — see
 `docs/reports/R029_M2_PERSONAL_KNOWLEDGE_FORGETRELATION_2026-09-19.md`.
+
+**As of 2026-09-19 (R030), the Episode action-family architecture is
+CLOSED for v0.1 implementation — documentation only, no code/schema/
+tests changed.** Live V7 `episodes`/`episode_evidence`/`episode_entities`
+were verified directly against the migration (`episodes` already has
+`updated_at`, unlike `relations`; no `epistemic_state`/`confidence`/
+supersession pointer; `episode_entities` is generic membership only, no
+role column). Final v0.1 action family: exactly `AddEpisode`/
+`UpdateEpisode`/`ForgetEpisode` — `ConfirmEpisode` was evaluated and
+explicitly rejected (no `epistemic_state` exists for it to transition;
+the confirmation gate + audit provenance + Evidence/Source already make
+an unconfirmed `Inferred` Episode safe without one); `confidence` was
+likewise excluded — an Episode is a recorded, Evidence-backed event, not
+a probabilistic proposition the way a Fact/Relation assertion is.
+`UpdateEpisode` (never `CorrectEpisode`) mutates the SAME row in place
+with **no identity/metadata split** the way `Relation` has — every
+field except `id`/`created_at` is mutable, since setting `ended_at` on
+an ongoing event is normal lifecycle progression, not error-correction.
+`started_at`/`ended_at` are the one deliberate temporal divergence from
+Fact/Relation: they are **caller-supplied and backdatable** (Episode's
+whole purpose is recording real-world event time Core cannot infer),
+while future-dated Episodes are rejected outright — the explicit
+type-level boundary against the still-undesigned `CalendarEvent`
+(LIFEOS_SPEC.md §6/§9.5). No `is_active_episode` predicate exists or was
+invented — `ended_at` describes event time, never row-lifecycle
+validity. `AddEpisode` requires exactly one fresh Evidence row (never
+zero, never reused), matching `AddMemory`/`AddRelation`'s mandatory-
+Evidence precedent exactly; entity associations may be empty, SELF is
+never implicit, and exact-id duplicates are silently deduplicated by
+resolved `EntityId` rather than rejected (a genuine, justified
+divergence from `AddRelation`'s self-edge rejection, since Episode's
+entity list is an unordered set with no structural pairing constraint).
+`ForgetEpisode` reuses `ForgetMemory`/`ForgetRelation`'s exact
+privacy-first deletion shape — shared Evidence always deleted even when
+linked to a retained Fact/Relation/Episode, orphan Source/Entity cleanup
+reusing `delete_source_if_orphan`/`delete_entity_if_orphan_non_self`
+completely unchanged — with no active-state eligibility check (any
+Episode is forgettable regardless of `ended_at`). Schema verdict: V7 is
+sufficient for row storage; the only required addition is a narrow,
+additive V9 (`episode_audit_log` ONLY, mirroring the now-unbroken
+eight-table audit precedent), not created this run. Entity-association
+roles and post-creation entity-link/Evidence-attachment mutation are
+explicitly DEFERRED, not implementation-blocking — see
+`docs/reports/R030_M2_PERSONAL_KNOWLEDGE_EPISODE_ACTION_FAMILY_ARCHITECTURE_FREEZE_2026-09-19.md`.
 
 This directly extends the "scored memory mirrored to a human-readable
 form" pattern noted in §5.1 — the mirror should be legible enough that a
